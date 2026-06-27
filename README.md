@@ -102,3 +102,88 @@ Hành vi thống kê của luồng mạng bao nhiêu gói, tốc độ, thời g
 | **Khả năng scale**     | ❌ Kém               | ✅ Mạnh           |
 | **Độ trễ**             | ⚠️ Realtime          | ✅ Near-realtime  |
 | **Quyền riêng tư**     | ❌ Rủi ro cao        | ✅ An toàn        |
+
+## Features & Tool
+
+**Source:** https://github.com/ahlashkari/CICFlowMeter
+
+Để mô hình Học máy có thể phân tích được các tín hiệu điện tử thô trên đường truyền, toàn bộ lưu lượng mạng cần được chuyển đổi thành một cấu trúc dữ liệu dạng bảng. Bảng dưới đây trình bày Từ điển đặc trưng lưu lượng mạng được sử dụng làm đầu vào cho mô hình. Bộ đặc trưng này được ánh xạ trực tiếp từ tiêu chuẩn trích xuất của công cụ CICFlowMeter, mô tả một "Luồng mạng 5-Tuple". Các biến số này được chia làm hai cột cấu trúc: Feature và Description.
+
+| **Feature**                | **Description**                                                      |
+| -------------------------- | -------------------------------------------------------------------- |
+| Flow duration              | Duration of the flow in microseconds                                 |
+| Total Fwd Packet           | Total packets in the forward direction                               |
+| Total Bwd Packets          | Total packets in the backward direction                              |
+| Total Length of Fwd Packet | Total size of packets in the forward direction                       |
+| Total Length of Bwd Packet | Total size of packets in the backward direction                      |
+| Fwd Packet Length Min      | Minimum packet size in the forward direction                         |
+| Fwd Packet Length Max      | Maximum packet size in the forward direction                         |
+| Fwd Packet Length Mean     | Mean packet size in the forward direction                            |
+| Fwd Packet Length Std      | Standard deviation of packet size in the forward direction           |
+| Bwd Packet Length Min      | Minimum packet size in the backward direction                        |
+| Bwd Packet Length Max      | Maximum packet size in the backward direction                        |
+| Bwd Packet Length Mean     | Mean packet size in the backward direction                           |
+| Bwd Packet Length Std      | Standard deviation of packet size in the backward direction          |
+| Flow Bytes/s               | Number of flow bytes per second                                      |
+| Flow Packets/s             | Number of flow packets per second                                    |
+| Flow IAT Mean              | Mean inter-arrival time between packets in the flow                  |
+| Flow IAT Std               | Standard deviation of inter-arrival time between packets in the flow |
+| Flow IAT Max               | Maximum inter-arrival time between packets in the flow               |
+| Flow IAT Min               | Minimum inter-arrival time between packets in the flow               |
+| Fwd IAT Min                | Minimum inter-arrival time between forward packets                   |
+| Fwd IAT Max                | Maximum inter-arrival time between forward packets                   |
+| Fwd IAT Mean               | Mean inter-arrival time between forward packets                      |
+| Fwd IAT Std                | Standard deviation of inter-arrival time between forward packets     |
+| Fwd IAT Total              | Total inter-arrival time between forward packets                     |
+| Bwd IAT Min                | Minimum inter-arrival time between backward packets                  |
+| Bwd IAT Max                | Maximum inter-arrival time between backward packets                  |
+| Bwd IAT Mean               | Mean inter-arrival time between backward packets                     |
+| Bwd IAT Std                | Standard deviation of inter-arrival time between backward packets    |
+| Bwd IAT Total              | Total inter-arrival time between backward packets                    |
+| Fwd PSH Flags              | Number of PSH flags set in forward packets (0 for UDP)               |
+| Bwd PSH Flags              | Number of PSH flags set in backward packets (0 for UDP)              |
+| Fwd URG Flags              | Number of URG flags set in forward packets (0 for UDP)               |
+| Bwd URG Flags              | Number of URG flags set in backward packets (0 for UDP)              |
+| Fwd Header Length          | Total header bytes in the forward direction                          |
+| Bwd Header Length          | Total header bytes in the backward direction                         |
+| FWD Packets/s              | Number of forward packets per second                                 |
+| Bwd Packets/s              | Number of backward packets per second                                |
+| Packet Length Min          | Minimum packet length                                                |
+| Packet Length Max          | Maximum packet length                                                |
+| Packet Length Mean         | Mean packet length                                                   |
+| Packet Length Std          | Standard deviation of packet length                                  |
+| Packet Length Variance     | Variance of packet length                                            |
+| FIN Flag Count             | Number of packets with FIN flag                                      |
+| SYN Flag Count             | Number of packets with SYN flag                                      |
+| RST Flag Count             | Number of packets with RST flag                                      |
+| PSH Flag Count             | Number of packets with PSH flag                                      |
+| ACK Flag Count             | Number of packets with ACK flag                                      |
+| URG Flag Count             | Number of packets with URG flag                                      |
+| CWR Flag Count             | Number of packets with CWR flag                                      |
+| ECE Flag Count             | Number of packets with ECE flag                                      |
+| Down/Up Ratio              | Download-to-upload ratio                                             |
+| Average Packet Size        | Average packet size                                                  |
+| Fwd Segment Size Avg       | Average segment size in the forward direction                        |
+| Bwd Segment Size Avg       | Average segment size in the backward direction                       |
+| Fwd Bytes/Bulk Avg         | Average bulk bytes in the forward direction                          |
+| Fwd Packet/Bulk Avg        | Average bulk packets in the forward direction                        |
+| Fwd Bulk Rate Avg          | Average bulk rate in the forward direction                           |
+| Bwd Bytes/Bulk Avg         | Average bulk bytes in the backward direction                         |
+| Bwd Packet/Bulk Avg        | Average bulk packets in the backward direction                       |
+| Bwd Bulk Rate Avg          | Average bulk rate in the backward direction                          |
+| Subflow Fwd Packets        | Average number of packets in a forward subflow                       |
+| Subflow Fwd Bytes          | Average number of bytes in a forward subflow                         |
+| Subflow Bwd Packets        | Average number of packets in a backward subflow                      |
+| Subflow Bwd Bytes          | Average number of bytes in a backward subflow                        |
+| Fwd Init Win Bytes         | Total bytes sent in the initial forward TCP window                   |
+| Bwd Init Win Bytes         | Total bytes sent in the initial backward TCP window                  |
+| Fwd Act Data Pkts          | Number of forward packets containing at least 1 byte of TCP payload  |
+| Fwd Seg Size Min           | Minimum segment size in the forward direction                        |
+| Active Min                 | Minimum active time before a flow becomes idle                       |
+| Active Mean                | Mean active time before a flow becomes idle                          |
+| Active Max                 | Maximum active time before a flow becomes idle                       |
+| Active Std                 | Standard deviation of active time before a flow becomes idle         |
+| Idle Min                   | Minimum idle time before a flow becomes active                       |
+| Idle Mean                  | Mean idle time before a flow becomes active                          |
+| Idle Max                   | Maximum idle time before a flow becomes active                       |
+| Idle Std                   | Standard deviation of idle time before a flow becomes active         |
