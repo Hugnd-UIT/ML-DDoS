@@ -20,7 +20,7 @@ sudo apt-get install -y python3-pip python3-dev
 sudo pip3 install --upgrade pip
 sudo pip3 install nfstream google-cloud-storage requests numpy pandas scikit-learn imbalanced-learn xgboost joblib
 
-# 4. Tối ưu hóa cấu hình Linux Kernel (Bật IP Forward & Chống SYN Flood)
+# 4. Tối ưu hóa cấu hình Linux Kernel
 echo "[+] 4. Cấu hình Linux Kernel (sysctl)..."
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.all.rp_filter=1
@@ -28,7 +28,6 @@ sudo sysctl -w net.ipv4.conf.default.rp_filter=1
 sudo sysctl -w net.ipv4.tcp_syncookies=1
 sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65536
 
-# Lưu cấu hình sysctl
 cat << 'SYSCTL_EOF' | sudo tee /etc/sysctl.d/99-ddos-mitigation.conf
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=1
@@ -41,7 +40,9 @@ SYSCTL_EOF
 echo "[+] 5. Thiết lập luật định tuyến NAT..."
 
 sudo iptables -t nat -F
-sudo iptables -t nat -A PREROUTING -d 10.99.99.99 -j DNAT --to-destination 10.240.0.2
+VM1_INTERNAL_IP=$(ip -4 addr show ens4 | grep -oP '(?<=inet )\d+(\.\d+){3}')
+sudo iptables -t nat -A PREROUTING -d $VM1_INTERNAL_IP -p tcp --dport 80 -j DNAT --to-destination 10.240.0.2
+sudo iptables -t nat -A PREROUTING -d 10.99.99.99 -p tcp --dport 80 -j DNAT --to-destination 10.240.0.2
 sudo iptables -t nat -A POSTROUTING -d 10.240.0.2 -j MASQUERADE
 
 sudo netfilter-persistent save

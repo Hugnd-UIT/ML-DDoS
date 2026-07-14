@@ -8,3 +8,4 @@ nfstream
 google-cloud-storage
 streamlit
 requests
+matplotlib
