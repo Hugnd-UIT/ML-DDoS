@@ -63,8 +63,6 @@ def clean_data(folder, dataset="DATASET"):
     return pd.concat(data_frame_list, ignore_index=True)
 
 def save_data(df_train, df_test):
-    print("\n[*] Processing Labels...")
-
     # ! Binary
     print("[!] Encoding Binary labels...")
     df_train_bin = df_train.copy()
