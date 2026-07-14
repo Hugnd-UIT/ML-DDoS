@@ -66,7 +66,7 @@ def save_data(df_train, df_test):
     print("\n[*] Processing Labels...")
 
     # ! Binary
-    print("    -> Encoding Binary labels...")
+    print("[!] Encoding Binary labels...")
     df_train_bin = df_train.copy()
     df_test_bin = df_test.copy()
     
@@ -79,11 +79,11 @@ def save_data(df_train, df_test):
     df_train_bin.to_csv(train_bin_path, index=False)
     df_test_bin.to_csv(test_bin_path, index=False)
     
-    print(f"       [+] Saved: {train_bin_path}")
-    print(f"       [+] Saved: {test_bin_path}")
+    print(f"[+] Saved: {train_bin_path}")
+    print(f"[+] Saved: {test_bin_path}")
 
     # ! Multi-class
-    print("    -> Encoding Multi-class labels...")
+    print("[!] Encoding Multi-class labels...")
     df_train_multi = df_train.copy()
     df_test_multi = df_test.copy()
     
@@ -100,15 +100,11 @@ def save_data(df_train, df_test):
     df_train_multi.to_csv(train_multi_path, index=False)
     df_test_multi.to_csv(test_multi_path, index=False)
 
-    print(f"       [+] Saved: {train_multi_path}")
-    print(f"       [+] Saved: {test_multi_path}")
+    print(f"[+] Saved: {train_multi_path}")
+    print(f"[+] Saved: {test_multi_path}")
 
     path = os.path.join(MODELS_DIR, 'label.pkl')
     joblib.dump(label, path)
-    
-    print("\n[+] Multi-class mapping dictionary:")
-    for idx, name in enumerate(label.classes_):
-        print(f"    ID {idx:02d} : {name}")
 
 def main():
     print("="*60)
@@ -120,7 +116,7 @@ def main():
         return
 
     # Quét folder testing
-    df_test = clean_data(TEST_DIR, "TESTING")
+    df_test = clean_data(TEST_DIR, "testing")
     if df_test is None:
         print("[-] Fatal Error: Testing data not found. Aborting.")
         return
