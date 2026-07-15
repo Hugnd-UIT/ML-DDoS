@@ -8,8 +8,8 @@ from xgboost import XGBClassifier
 
 def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    train_path = os.path.join(current_dir, '../data/CICDoS2019/training/train_binary.csv')
-    test_path = os.path.join(current_dir, '../data/CICDoS2019/testing/test_binary.csv')
+    train_path = os.path.join(current_dir, '../data/train_binary.csv')
+    test_path = os.path.join(current_dir, '../data/test_binary.csv')
     
     if not os.path.exists(train_path) or not os.path.exists(test_path):
         print("Error: Dataset not found. Please check paths:")
