@@ -1,1 +1,150 @@
+import os
+import time
+import argparse
+import warnings
+import numpy as np
+import pandas as pd
+import joblib
 
+try:
+    from nfstream import NFStreamer
+except ImportError:
+    print("[!] 'nfstream' library not found. Please install it: pip install nfstream")
+    NFStreamer = None
+
+# Disable warnings to keep terminal clean
+warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Gatekeeper - Inline IPS System using ML and nfstream")
+    parser.add_argument("-i", "--interface", default="eth0", help="Network interface to sniff on (default: eth0)")
+    parser.add_argument("-m", "--model", default="./models/binary.pkl", help="Path to the trained XGBoost model")
+    return parser.parse_args()
+
+def map_nfstream_to_cic(flow):
+    """
+    Extract and convert attributes from the `flow` object (nfstream)
+    into a dictionary/DataFrame containing CICDDoS2019 features.
+    Safely fill with 0 or NaN if attributes are missing.
+    """
+    
+    # Safe calculation to avoid Division by Zero
+    duration_ms = getattr(flow, 'bidirectional_duration_ms', 0)
+    duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
+    
+    src2dst_bytes = getattr(flow, 'src2dst_bytes', 0)
+    dst2src_bytes = getattr(flow, 'dst2src_bytes', 0)
+    
+    # Map features
+    features = {
+        'Flow Duration': duration_ms * 1000,
+        'Flow Bytes/s': getattr(flow, 'bidirectional_bytes', 0) / duration_s,
+        'Flow Packets/s': getattr(flow, 'bidirectional_packets', 0) / duration_s,
+        'Total Fwd Packets': getattr(flow, 'src2dst_packets', 0),
+        'Total Backward Packets': getattr(flow, 'dst2src_packets', 0),
+        'Down/Up Ratio': dst2src_bytes / src2dst_bytes if src2dst_bytes > 0 else 0,
+        'Total Length of Fwd Packets': src2dst_bytes,
+        'Total Length of Bwd Packets': dst2src_bytes,
+        'Fwd Packet Length Max': getattr(flow, 'src2dst_max_bytes', 0),
+        'Fwd Packet Length Min': getattr(flow, 'src2dst_min_bytes', 0),
+        'Fwd Packet Length Mean': getattr(flow, 'src2dst_mean_bytes', 0),
+        'Bwd Packet Length Mean': getattr(flow, 'dst2src_mean_bytes', 0),
+        'Flow IAT Mean': getattr(flow, 'bidirectional_mean_ms', 0) * 1000,
+        'Flow IAT Std': getattr(flow, 'bidirectional_stddev_ms', 0) * 1000,
+        'Fwd IAT Total': getattr(flow, 'src2dst_duration_ms', 0) * 1000,
+        'Protocol': getattr(flow, 'protocol', 0),
+        'SYN Flag Count': getattr(flow, 'bidirectional_syn_packets', 0),
+        'ACK Flag Count': getattr(flow, 'bidirectional_ack_packets', 0),
+        'Init_Win_bytes_forward': getattr(flow, 'src2dst_init_win_bytes', 0)
+    }
+    
+    feature_columns = [
+        'Flow Duration', 'Flow Bytes/s', 'Flow Packets/s', 'Total Fwd Packets', 
+        'Total Backward Packets', 'Down/Up Ratio', 'Total Length of Fwd Packets', 
+        'Total Length of Bwd Packets', 'Fwd Packet Length Max', 'Fwd Packet Length Min', 
+        'Fwd Packet Length Mean', 'Bwd Packet Length Mean', 'Flow IAT Mean', 'Flow IAT Std', 
+        'Fwd IAT Total', 'Protocol', 'SYN Flag Count', 'ACK Flag Count', 'Init_Win_bytes_forward'
+    ]
+    
+    # Return DataFrame (single row)
+    df = pd.DataFrame([features], columns=feature_columns)
+    
+    # Fill NaN/Inf values (if any) with 0 to prevent inference errors on live traffic
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(0, inplace=True)
+    
+    return df
+
+def print_banner():
+    banner = """
+   _____       _       _                     
+  / ____|     | |     | |                    
+ | |  __  __ _| |_ ___| | _____  ___ _ __   ___ _ __ 
+ | | |_ |/ _` | __/ _ \ |/ / _ \/ _ \ '_ \ / _ \ '__|
+ | |__| | (_| | ||  __/   <  __/  __/ |_) |  __/ |   
+  \_____|\__,_|\__\___|_|\_\___|\___| .__/ \___|_|   
+                                    | |              
+                                    |_|              
+======================================================
+    Inline IPS eBPF - Realtime DDoS Detection Engine
+======================================================
+    """
+    print(banner)
+
+def main():
+    print_banner()
+    args = get_args()
+    
+    # 1. Load XGBoost Model
+    model_path = args.model
+    try:
+        print(f"[*] Loading model from: {model_path} ...")
+        # Handle path based on where script is run
+        if not os.path.exists(model_path):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            alt_path = os.path.join(base_dir, '..', 'models', 'binary.pkl')
+            if os.path.exists(alt_path):
+                model_path = alt_path
+            
+        model = joblib.load(model_path)
+        print("[+] Model loaded successfully!")
+    except Exception as e:
+        print(f"[-] Critical Error: Could not load the ML model. Reason: {e}")
+        return
+
+    if NFStreamer is None:
+        return
+
+    print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
+    print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
+    
+    # 2. Event Loop to capture Live Traffic
+    try:
+        # Optimize stream capture: active_timeout/idle_timeout to push flows faster
+        streamer = NFStreamer(source=args.interface, active_timeout=10, idle_timeout=10)
+        for flow in streamer:
+            # 3. Extract Feature Map
+            df_features = map_nfstream_to_cic(flow)
+            
+            # 4. Inference
+            prediction = model.predict(df_features)[0]
+            
+            # 5. Stateless Extraction & eBPF interaction
+            if prediction == 1:
+                protocol = getattr(flow, 'protocol', 0)
+                dst_port = getattr(flow, 'dst_port', 0)
+                max_len = getattr(flow, 'src2dst_max_bytes', 0)
+                
+                # Print specific format for eBPF to read
+                print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
+                
+    except KeyboardInterrupt:
+        print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
+    except PermissionError:
+        print("\n[-] Permission Denied. Please run the script as Root/Administrator to sniff packets.")
+    except Exception as e:
+        print(f"\n[-] Unexpected error occurred: {e}")
+
+if __name__ == "__main__":
+    main()

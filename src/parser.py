@@ -13,7 +13,6 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', 'models')
 os.makedirs(MODELS_DIR, exist_ok=True) 
 
-# ! Các features cần lọc
 FEATURES = [
     'Flow Duration', 'Flow Bytes/s', 'Flow Packets/s', 'Total Fwd Packets', 'Total Backward Packets', 'Down/Up Ratio',
     'Total Length of Fwd Packets', 'Total Length of Bwd Packets', 'Fwd Packet Length Max', 'Fwd Packet Length Min', 'Fwd Packet Length Mean', 'Bwd Packet Length Mean',
@@ -44,7 +43,6 @@ def clean_data(folder, dataset="DATASET"):
                 
             df_chunk = chunk[FEATURES].copy()
             
-            # ! Ép kiểu numeric cho các cột dễ lỗi
             cols_numeric = ['Flow Bytes/s', 'Flow Packets/s']
             for col in cols_numeric:
                 if col in df_chunk.columns:
