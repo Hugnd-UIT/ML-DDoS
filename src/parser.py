@@ -50,6 +50,7 @@ def clean_data(folder, dataset="DATASET"):
 
             df_chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
             df_chunk.dropna(inplace=True)
+            df_chunk.drop_duplicates(inplace=True)
             
             if not df_chunk.empty:
                 data_frame_list.append(df_chunk)
@@ -110,12 +111,14 @@ def main():
     if df_train is None:
         print("[-] Fatal Error: Training data not found. Aborting.")
         return
+    df_train.drop_duplicates(inplace=True)
 
     # Quét folder testing
     df_test = clean_data(TEST_DIR, "testing")
     if df_test is None:
         print("[-] Fatal Error: Testing data not found. Aborting.")
         return
+    df_test.drop_duplicates(inplace=True)
 
     print(f"\n[*] Raw Training samples: {len(df_train):,}")
     print(f"[*] Raw Testing samples : {len(df_test):,}")
