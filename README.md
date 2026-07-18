@@ -375,37 +375,41 @@ ML-DDoS/
 ├── .gitignore                    
 ├── Dockerfile                    # Dockerfile cho SOC Dashboard (Cloud Run)
 ├── README.md                     
-├── requirements.txt              # Danh sách thư viện
+├── requirements.txt              # Danh sách thư viện Python
 │
 ├── data/                         # Chứa dataset CICDDoS2019 lúc test local
 │   └── .gitkeep
 │
-├── models/                       # Nơi chứa file model sau khi train hoặc pull từ GCS về
+├── models/                       # Nơi chứa file model (.pkl) sau khi train hoặc pull từ GCS về
+│   └── .gitkeep
+│
+├── logs/                         # Thư mục buffer chứa log .csv tạm thời trước khi đẩy lên GCS
 │   └── .gitkeep
 │
 ├── scripts/                      # Các script tiện ích hỗ trợ
-│   ├── setup.sh                  # Script cài ipset, iptables, python trên VM1
-│   └── simulate_attack.sh        # Script chạy hping3 để test trên VM (Attacker)
+│   ├── setup.sh                  # Script cài python, nfstream, bpfcc-tools, linux-headers 
+│   └── simulate_attack.sh        # Script chạy hping3/MHDDoS 
 │
 └── src/                          # Code lõi của hệ thống
     ├── __init__.py             
-    ├── config.py                 # Chứa API Key Telegram, GCS Bucket Name, Active Timeout
+    ├── config.py                 # Chứa API Key Telegram, GCS Bucket Name, Active Timeout, Ngưỡng PPS
     │
     ├── # --- NHÓM MODULE AI & PROCESSING ---
-    ├── parser.py                 # Tiền xử lý dữ liệu, chuẩn hóa Features
-    ├── trainer.py                # Train mô hình Binary & Multiclass
+    ├── parser.py                 # Tiền xử lý dữ liệu, chuẩn hóa 20 Features cốt lõi
+    ├── trainer.py                # Train mô hình Binary (Tuyến đầu) & Multiclass (Dashboard)
     │
-    ├── # --- NHÓM MODULE TUYẾN ĐẦU (CHẠY TRÊN VM1) ---
-    ├── collector.py              # Lắng nghe card mạng bằng NFStream
-    ├── enforcer.py               # Thực thi lệnh iptables / ipset DROP
-    ├── notifier.py               # Gửi tin nhắn cảnh báo qua Telegram
-    ├── gcs_utility.py            # Upload log bẩn lên Cloud Storage
-    ├── gatekeeper.py             # File chạy chính cho VM1 (Nối collector + enforcer + notifier)
+    ├── # --- NHÓM MODULE TUYẾN ĐẦU
+    ├── collector.py              # Lắng nghe card mạng bằng NFStream, trích xuất metadata luồng
+    ├── gatekeeper.py             # Bộ não AI Control Plane (Nhận luồng -> XGBoost đoán -> Gọi enforcer/notifier)
+    ├── enforcer.py               # Sĩ quan điều phối BCC (Ghi Chữ ký tấn công + Token Bucket vào BPF Map)
+    ├── xdp_filter.c              # Máy chém eBPF/XDP Data Plane (Chạy dưới Driver NIC, tra cứu BPF Map & DROP)
+    ├── notifier.py               # Bắn tin nhắn cảnh báo khẩn cấp qua Telegram Webhook
+    ├── gcs_utility.py            # Gom log bẩn định kỳ 5 phút upload lên Google Cloud Storage
     │
-    └── dashboard/                # Chứa code Web SOC Dashboard (Chạy trên Cloud Run)
-        ├── app.py                # Web Server (Flask/FastAPI/Streamlit)
+    └── dashboard/                # Chứa code Web SOC Dashboard
+        ├── app.py                # Web Server Streamlit
         ├── static/               # CSS, JS, Images cho Dashboard
-        └── templates/            # HTML Templates
+        └── templates/            # HTML Templates 
 ```
 
 ## Rủi ro và hạn chế
