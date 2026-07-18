@@ -52,18 +52,27 @@ def map_nfstream_to_cic(flow):
     Safely fill with 0 or NaN if attributes are missing.
     """
     
-    # Safe calculation to avoid Division by Zero
+    # Safe calculation to avoid Division by Zero and Mathematical Flaws
     duration_ms = getattr(flow, 'bidirectional_duration_ms', 0)
-    duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
+    bidirectional_bytes = getattr(flow, 'bidirectional_bytes', 0)
+    bidirectional_packets = getattr(flow, 'bidirectional_packets', 0)
     
+    if duration_ms == 0:
+        flow_bytes_s = 0.0
+        flow_packets_s = 0.0
+    else:
+        duration_s = duration_ms / 1000.0
+        flow_bytes_s = bidirectional_bytes / duration_s
+        flow_packets_s = bidirectional_packets / duration_s
+
     src2dst_bytes = getattr(flow, 'src2dst_bytes', 0)
     dst2src_bytes = getattr(flow, 'dst2src_bytes', 0)
     
     # Map features
     features = {
         'Flow Duration': duration_ms * 1000,
-        'Flow Bytes/s': getattr(flow, 'bidirectional_bytes', 0) / duration_s,
-        'Flow Packets/s': getattr(flow, 'bidirectional_packets', 0) / duration_s,
+        'Flow Bytes/s': flow_bytes_s,
+        'Flow Packets/s': flow_packets_s,
         'Total Fwd Packets': getattr(flow, 'src2dst_packets', 0),
         'Total Backward Packets': getattr(flow, 'dst2src_packets', 0),
         'Down/Up Ratio': dst2src_bytes / src2dst_bytes if src2dst_bytes > 0 else 0,
@@ -146,8 +155,8 @@ def main():
     
     # 2. Event Loop to capture Live Traffic
     try:
-        # Optimize stream capture: active_timeout/idle_timeout to push flows faster
-        streamer = NFStreamer(source=args.interface, active_timeout=10, idle_timeout=10)
+        # Optimize stream capture: Push flows almost instantly for Real-time IPS
+        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=2)
         for flow in streamer:
             # 3. Extract Feature Map
             df_features = map_nfstream_to_cic(flow)
@@ -157,6 +166,10 @@ def main():
             
             # 5. Stateless Extraction & eBPF interaction
             if prediction == 1:
+                # Sanity check: Ignore if flow has too few packets (background noise)
+                if getattr(flow, 'bidirectional_packets', 0) < 10:
+                    continue
+                    
                 protocol = getattr(flow, 'protocol', 0)
                 dst_port = getattr(flow, 'dst_port', 0)
                 max_len = getattr(flow, 'src2dst_max_bytes', 0)
