@@ -5,6 +5,29 @@ import warnings
 import numpy as np
 import pandas as pd
 import joblib
+from collections import defaultdict
+
+class AlertAggregator:
+    def __init__(self, interval=2.0):
+        self.interval = interval
+        self.last_flush = time.time()
+        self.drop_stats = defaultdict(int)
+
+    def log_drop(self, proto, port):
+        self.drop_stats[(proto, port)] += 1
+        current_time = time.time()
+        if current_time - self.last_flush >= self.interval:
+            self.flush()
+            self.last_flush = current_time
+
+    def flush(self):
+        if not self.drop_stats:
+            return
+        print(f"\n[+] === GATEKEEPER ALERT ({time.strftime('%H:%M:%S')}) ===")
+        for (proto, port), count in self.drop_stats.items():
+            print(f"[!] DROPPED {count} packets => PROTO:{proto} | DST_PORT:{port}")
+        print("[+] =========================================\n")
+        self.drop_stats.clear()
 
 try:
     from nfstream import NFStreamer
@@ -119,6 +142,8 @@ def main():
     print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
     print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
     
+    aggregator = AlertAggregator(interval=2.0)
+    
     # 2. Event Loop to capture Live Traffic
     try:
         # Optimize stream capture: active_timeout/idle_timeout to push flows faster
@@ -137,7 +162,7 @@ def main():
                 max_len = getattr(flow, 'src2dst_max_bytes', 0)
                 
                 # Print specific format for eBPF to read
-                print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
+                aggregator.log_drop(proto=protocol, port=dst_port)
                 
     except KeyboardInterrupt:
         print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
