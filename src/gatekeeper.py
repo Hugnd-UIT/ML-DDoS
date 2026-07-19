@@ -118,9 +118,11 @@ def main():
     print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
     print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
     
+    blocked_rules = set()
+    
     # 2. Event Loop to capture Live Traffic
     try:
-        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1)
+        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1, statistical_analysis=True)
         for flow in streamer:
             # 3. Extract Feature Map
             df_features = map_nfstream_to_cic(flow)
@@ -133,8 +135,12 @@ def main():
                 protocol = getattr(flow, 'protocol', 0)
                 dst_port = getattr(flow, 'dst_port', 0)
                 max_len = getattr(flow, 'src2dst_max_ps', 0) 
-                print(f"[!] REAL-TIME ALERT: Malicious flow detected => PROTO:{protocol} | DST_PORT:{dst_port}")
-                print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
+                
+                rule_key = (protocol, dst_port)
+                if rule_key not in blocked_rules:
+                    print(f"[!] REAL-TIME ALERT: Malicious flow detected => PROTO:{protocol} | DST_PORT:{dst_port}")
+                    print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
+                    blocked_rules.add(rule_key)
                 
     except KeyboardInterrupt:
         print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
