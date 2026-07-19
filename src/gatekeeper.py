@@ -1,33 +1,9 @@
 import os
-import time
 import argparse
 import warnings
 import numpy as np
 import pandas as pd
 import joblib
-from collections import defaultdict
-
-class AlertAggregator:
-    def __init__(self, interval=2.0):
-        self.interval = interval
-        self.last_flush = time.time()
-        self.drop_stats = defaultdict(int)
-
-    def log_drop(self, proto, port):
-        self.drop_stats[(proto, port)] += 1
-        current_time = time.time()
-        if current_time - self.last_flush >= self.interval:
-            self.flush()
-            self.last_flush = current_time
-
-    def flush(self):
-        if not self.drop_stats:
-            return
-        print(f"\n[+] === GATEKEEPER ALERT ({time.strftime('%H:%M:%S')}) ===")
-        for (proto, port), count in self.drop_stats.items():
-            print(f"[!] DROPPED {count} packets => PROTO:{proto} | DST_PORT:{port}")
-        print("[+] =========================================\n")
-        self.drop_stats.clear()
 
 try:
     from nfstream import NFStreamer
@@ -52,38 +28,29 @@ def map_nfstream_to_cic(flow):
     Safely fill with 0 or NaN if attributes are missing.
     """
     
-    # Safe calculation to avoid Division by Zero and Mathematical Flaws
+    # Safe calculation to avoid Division by Zero
     duration_ms = getattr(flow, 'bidirectional_duration_ms', 0)
-    bidirectional_bytes = getattr(flow, 'bidirectional_bytes', 0)
-    bidirectional_packets = getattr(flow, 'bidirectional_packets', 0)
+    duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
     
-    if duration_ms == 0:
-        flow_bytes_s = 0.0
-        flow_packets_s = 0.0
-    else:
-        duration_s = duration_ms / 1000.0
-        flow_bytes_s = bidirectional_bytes / duration_s
-        flow_packets_s = bidirectional_packets / duration_s
-
     src2dst_bytes = getattr(flow, 'src2dst_bytes', 0)
     dst2src_bytes = getattr(flow, 'dst2src_bytes', 0)
     
     # Map features
     features = {
         'Flow Duration': duration_ms * 1000,
-        'Flow Bytes/s': flow_bytes_s,
-        'Flow Packets/s': flow_packets_s,
+        'Flow Bytes/s': getattr(flow, 'bidirectional_bytes', 0) / duration_s,
+        'Flow Packets/s': getattr(flow, 'bidirectional_packets', 0) / duration_s,
         'Total Fwd Packets': getattr(flow, 'src2dst_packets', 0),
         'Total Backward Packets': getattr(flow, 'dst2src_packets', 0),
         'Down/Up Ratio': dst2src_bytes / src2dst_bytes if src2dst_bytes > 0 else 0,
         'Total Length of Fwd Packets': src2dst_bytes,
         'Total Length of Bwd Packets': dst2src_bytes,
-        'Fwd Packet Length Max': getattr(flow, 'src2dst_max_bytes', 0),
-        'Fwd Packet Length Min': getattr(flow, 'src2dst_min_bytes', 0),
-        'Fwd Packet Length Mean': getattr(flow, 'src2dst_mean_bytes', 0),
-        'Bwd Packet Length Mean': getattr(flow, 'dst2src_mean_bytes', 0),
-        'Flow IAT Mean': getattr(flow, 'bidirectional_mean_ms', 0) * 1000,
-        'Flow IAT Std': getattr(flow, 'bidirectional_stddev_ms', 0) * 1000,
+        'Fwd Packet Length Max': getattr(flow, 'src2dst_max_ps', 0),
+        'Fwd Packet Length Min': getattr(flow, 'src2dst_min_ps', 0),
+        'Fwd Packet Length Mean': getattr(flow, 'src2dst_mean_ps', 0),
+        'Bwd Packet Length Mean': getattr(flow, 'dst2src_mean_ps', 0),
+        'Flow IAT Mean': getattr(flow, 'bidirectional_mean_piat_ms', 0) * 1000,
+        'Flow IAT Std': getattr(flow, 'bidirectional_stddev_piat_ms', 0) * 1000,
         'Fwd IAT Total': getattr(flow, 'src2dst_duration_ms', 0) * 1000,
         'Protocol': getattr(flow, 'protocol', 0),
         'SYN Flag Count': getattr(flow, 'bidirectional_syn_packets', 0),
@@ -151,12 +118,9 @@ def main():
     print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
     print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
     
-    aggregator = AlertAggregator(interval=2.0)
-    
     # 2. Event Loop to capture Live Traffic
     try:
-        # Optimize stream capture: Push flows almost instantly for Real-time IPS
-        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=2)
+        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1)
         for flow in streamer:
             # 3. Extract Feature Map
             df_features = map_nfstream_to_cic(flow)
@@ -166,16 +130,11 @@ def main():
             
             # 5. Stateless Extraction & eBPF interaction
             if prediction == 1:
-                # Sanity check: Ignore if flow has too few packets (background noise)
-                if getattr(flow, 'bidirectional_packets', 0) < 10:
-                    continue
-                    
                 protocol = getattr(flow, 'protocol', 0)
                 dst_port = getattr(flow, 'dst_port', 0)
-                max_len = getattr(flow, 'src2dst_max_bytes', 0)
-                
-                # Print specific format for eBPF to read
-                aggregator.log_drop(proto=protocol, port=dst_port)
+                max_len = getattr(flow, 'src2dst_max_ps', 0) 
+                print(f"[!] REAL-TIME ALERT: Malicious flow detected => PROTO:{protocol} | DST_PORT:{dst_port}")
+                print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
                 
     except KeyboardInterrupt:
         print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
