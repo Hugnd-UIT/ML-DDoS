@@ -4,6 +4,8 @@ import warnings
 import numpy as np
 import pandas as pd
 import joblib
+import time
+from enforcer import TokenBucketEnforcer
 
 try:
     from nfstream import NFStreamer
@@ -11,7 +13,6 @@ except ImportError:
     print("[!] 'nfstream' library not found. Please install it: pip install nfstream")
     NFStreamer = None
 
-# Disable warnings to keep terminal clean
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -22,20 +23,12 @@ def get_args():
     return parser.parse_args()
 
 def map_nfstream_to_cic(flow):
-    """
-    Extract and convert attributes from the `flow` object (nfstream)
-    into a dictionary/DataFrame containing CICDDoS2019 features.
-    Safely fill with 0 or NaN if attributes are missing.
-    """
-    
-    # Safe calculation to avoid Division by Zero
     duration_ms = getattr(flow, 'bidirectional_duration_ms', 0)
     duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
     
     src2dst_bytes = getattr(flow, 'src2dst_bytes', 0)
     dst2src_bytes = getattr(flow, 'dst2src_bytes', 0)
     
-    # Map features
     features = {
         'Flow Duration': duration_ms * 1000,
         'Flow Bytes/s': getattr(flow, 'bidirectional_bytes', 0) / duration_s,
@@ -66,13 +59,9 @@ def map_nfstream_to_cic(flow):
         'Fwd IAT Total', 'Protocol', 'SYN Flag Count', 'ACK Flag Count', 'Init_Win_bytes_forward'
     ]
     
-    # Return DataFrame (single row)
     df = pd.DataFrame([features], columns=feature_columns)
-    
-    # Fill NaN/Inf values (if any) with 0 to prevent inference errors on live traffic
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0, inplace=True)
-    
     return df
 
 def print_banner():
@@ -95,11 +84,9 @@ def main():
     print_banner()
     args = get_args()
     
-    # 1. Load XGBoost Model
     model_path = args.model
     try:
         print(f"[*] Loading model from: {model_path} ...")
-        # Handle path based on where script is run
         if not os.path.exists(model_path):
             base_dir = os.path.dirname(os.path.abspath(__file__))
             alt_path = os.path.join(base_dir, '..', 'models', 'binary.pkl')
@@ -119,28 +106,38 @@ def main():
     print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
     
     blocked_rules = set()
-    
-    # 2. Event Loop to capture Live Traffic
+    enforcer = TokenBucketEnforcer(max_pps_threshold=100.0, burst_capacity=150.0)
+    start_time = time.time()
     try:
         streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1, statistical_analysis=True)
         for flow in streamer:
-            # 3. Extract Feature Map
             df_features = map_nfstream_to_cic(flow)
-            
-            # 4. Inference
             prediction = model.predict(df_features)[0]
             
-            # 5. Stateless Extraction & eBPF interaction
             if prediction == 1:
-                protocol = getattr(flow, 'protocol', 0)
-                dst_port = getattr(flow, 'dst_port', 0)
-                max_len = getattr(flow, 'src2dst_max_ps', 0) 
+                protocol = str(getattr(flow, 'protocol', 'TCP'))
+                dst_port = int(getattr(flow, 'dst_port', 0))
+                fwd_len_mean = float(getattr(flow, 'src2dst_mean_ps', 0.0))
                 
-                rule_key = (protocol, dst_port)
-                if rule_key not in blocked_rules:
-                    print(f"[!] REAL-TIME ALERT: Malicious flow detected => PROTO:{protocol} | DST_PORT:{dst_port}")
-                    print(f"RULE_DROP => PROTO:{protocol} | DST_PORT:{dst_port} | MAX_LEN:{max_len}")
-                    blocked_rules.add(rule_key)
+                duration_ms = float(getattr(flow, 'bidirectional_duration_ms', 0))
+                duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
+                total_pkts = float(getattr(flow, 'bidirectional_packets', 1))
+                
+                # Tính chuẩn tốc độ gói tin/giây (PPS) để không bị block oan các cổng ngầm
+                result = enforcer.evaluate_traffic(
+                    ai_label=prediction,
+                    protocol=protocol,
+                    dst_port=dst_port,
+                    fwd_len_mean=fwd_len_mean,
+                    packet_count=total_pkts
+                )
+                
+                if result.action == "DROP_RATE_LIMIT_EXCEEDED":
+                    rule_key = (protocol, dst_port)
+                    if rule_key not in blocked_rules:
+                        print(f"[!] REAL-TIME ALERT: DDoS Rate Limit Exceeded => {result.signature_key}")
+                        print(f"RULE_DROP => {result.signature_key}")
+                        blocked_rules.add(rule_key)
                 
     except KeyboardInterrupt:
         print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
