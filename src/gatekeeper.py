@@ -16,6 +16,16 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Sau tung nay giay, cho phep bao dong lai cho cung 1 rule (thay vi im
+# lang vinh vien sau lan bao dau tien)
+ALERT_COOLDOWN_SECONDS = 300  # 5 phut
+
+# Neu so luong flow can chay qua pipeline ML trong 1 giay vuot qua muc
+# nay, he thong tam thoi bo qua buoc tinh feature + model.predict (ton
+# CPU nhat) va coi nhu nghi ngo mac dinh, de tranh chinh he thong phong
+# thu tu ha guc CPU cua no truoc khi kip phan loai (self-DoS).
+MAX_ML_FLOWS_PER_SECOND = 200
+
 def get_args():
     parser = argparse.ArgumentParser(description="Gatekeeper - Inline IPS System using ML and nfstream")
     parser.add_argument("-i", "--interface", default="eth0", help="Network interface to sniff on (default: eth0)")
@@ -105,25 +115,40 @@ def main():
     print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
     print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
     
-    blocked_rules = set()
+    blocked_rules = {}  # rule_key -> thoi diem canh bao gan nhat (time.time())
     enforcer = TokenBucketEnforcer(max_pps_threshold=100.0, burst_capacity=150.0)
     start_time = time.time()
+
+    # Trang thai cho circuit breaker chong self-DoS CPU
+    ml_window_start = time.time()
+    ml_flows_in_window = 0
     try:
         streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1, statistical_analysis=True)
         for flow in streamer:
-            df_features = map_nfstream_to_cic(flow)
-            prediction = model.predict(df_features)[0]
-            
+            # --- Circuit breaker chong self-DoS CPU ---
+            # Neu so flow/giay dang can ML xu ly vuot qua nguong an toan,
+            # bo qua buoc tinh feature (map_nfstream_to_cic) + model.predict
+            # (2 buoc ton CPU nhat) va coi flow do la nghi ngo mac dinh
+            # (fail-safe: tha cho Token Bucket xu ly tiep, khong de ML
+            # inference lam nghen CPU cua chinh he thong phong thu).
+            now_ml = time.time()
+            if now_ml - ml_window_start >= 1.0:
+                ml_window_start = now_ml
+                ml_flows_in_window = 0
+            ml_flows_in_window += 1
+
+            if ml_flows_in_window > MAX_ML_FLOWS_PER_SECOND:
+                prediction = 1  # qua tai -> mac dinh nghi ngo, khong chay ML
+            else:
+                df_features = map_nfstream_to_cic(flow)
+                prediction = model.predict(df_features)[0]
+
             if prediction == 1:
                 protocol = str(getattr(flow, 'protocol', 'TCP'))
                 dst_port = int(getattr(flow, 'dst_port', 0))
                 fwd_len_mean = float(getattr(flow, 'src2dst_mean_ps', 0.0))
-                
-                duration_ms = float(getattr(flow, 'bidirectional_duration_ms', 0))
-                duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
                 total_pkts = float(getattr(flow, 'bidirectional_packets', 1))
-                
-                # Tính chuẩn tốc độ gói tin/giây (PPS) để không bị block oan các cổng ngầm
+
                 result = enforcer.evaluate_traffic(
                     ai_label=prediction,
                     protocol=protocol,
@@ -131,13 +156,19 @@ def main():
                     fwd_len_mean=fwd_len_mean,
                     packet_count=total_pkts
                 )
-                
+
                 if result.action == "DROP_RATE_LIMIT_EXCEEDED":
                     rule_key = (protocol, dst_port)
-                    if rule_key not in blocked_rules:
+                    now_alert = time.time()
+                    last_alert = blocked_rules.get(rule_key, 0)
+                    # Chi im lang trong khoang ALERT_COOLDOWN_SECONDS, sau do
+                    # bao dong lai neu rule van con bi drop (khong mu vinh vien)
+                    if now_alert - last_alert >= ALERT_COOLDOWN_SECONDS:
                         print(f"[!] REAL-TIME ALERT: DDoS Rate Limit Exceeded => {result.signature_key}")
                         print(f"RULE_DROP => {result.signature_key}")
-                        blocked_rules.add(rule_key)
+                        blocked_rules[rule_key] = now_alert
+                elif result.action == "PASS_SUSTAINED_LOW_AND_SLOW":
+                    print(f"[?] WARNING: Sustained low-and-slow pattern detected (van duoi nguong tuc thoi) => {result.signature_key}")
                 
     except KeyboardInterrupt:
         print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
