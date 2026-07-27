@@ -8,6 +8,7 @@ import threading
 import ipaddress
 import requests
 import ctypes
+import joblib
 import numpy as np
 import xgboost as xgb
 from collections import defaultdict
@@ -16,7 +17,8 @@ from cachetools import TTLCache
 from nfstream import NFStreamer
 
 # --- CẤU HÌNH HỆ THỐNG ---
-MODEL_FILE = "xgboost_model.json"  # File mô hình AI (đặt cùng thư mục với script)
+# binary.pkl: phân loại nhị phân DDoS/Benign
+MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "binary.pkl")
 
 # Ngưỡng Sliding Window: nếu tổng packet từ 1 src_ip vượt mức này
 # trong cửa sổ WINDOW_SECONDS giây → đưa vào ML phân tích ngay
@@ -126,14 +128,13 @@ def memory_manager(blacklist_map, ttl_cache, lock):
 
 def load_ai_model():
     """
-    Tải mô hình XGBoost từ file. Nếu file không tồn tại hoặc lỗi,
-    fallback sang MockAI dựa trên ngưỡng packet count để hệ thống
-    không sập hoàn toàn khi thiếu model (Graceful Degradation).
+    Tải mô hình từ binary.pkl (sklearn-compatible) bằng joblib.
+    Nếu load thất bại, fallback sang MockAI dựa trên ngưỡng packet count
+    để hệ thống không sập khi thiếu model (Graceful Degradation).
     """
     try:
-        model = xgb.Booster()
-        model.load_model(MODEL_FILE)
-        print(f"[+] Đã tải mô hình XGBoost từ {MODEL_FILE}.")
+        model = joblib.load(MODEL_FILE)
+        print(f"[+] Đã tải mô hình từ {MODEL_FILE} ({type(model).__name__}).")
         return model
     except Exception as e:
         print(f"[!] Không tải được {MODEL_FILE}: {e}")
@@ -142,9 +143,9 @@ def load_ai_model():
         class MockAI:
             def predict(self, features_matrix):
                 # features_matrix là numpy array shape (1, 19)
-                # features[0][1] = bidirectional_packets (index 1 trong extract_features)
+                # index 1 = bidirectional_packets (xem extract_features)
                 pkts = features_matrix[0][1]
-                return [1.0] if pkts > PACKET_WINDOW_THRESHOLD else [0.0]
+                return [1] if pkts > PACKET_WINDOW_THRESHOLD else [0]
 
         return MockAI()
 
@@ -252,11 +253,13 @@ def main():
     print("=" * 65 + "\n")
 
     try:
-        # statistical_analysis=True bắt buộc để có các feature min/mean/max packet size
-        streamer = NFStreamer(source=INTERFACE, active_timeout=1, statistical_analysis=True)
+        # active_timeout=1: xuất flow đang active sau 1 giây (bắt các luồng flood kéo dài)
+        # idle_timeout=1:   xuất flow idle sau 1 giây (bắt micro-flow 1 packet của hping3 rotating-port)
+        # statistical_analysis=True: bật tính toán min/mean/max packet size cho 19 features CIC-DDoS2019
+        streamer = NFStreamer(source=INTERFACE, active_timeout=1, idle_timeout=1, statistical_analysis=True)
 
         for flow in streamer:
-            print(f"[DEBUG] {flow.src_ip} -> {flow.dst_ip} | pkts={flow.bidirectional_packets} | duration_ms={flow.bidirectional_duration_ms}")
+
 
             # === Bọc toàn bộ xử lý của mỗi flow trong try-except riêng ===
             # Lỗi trên một flow không được phép crash hệ thống hay gỡ XDP.
@@ -286,11 +289,11 @@ def main():
                     print(f"[!] SLIDING WINDOW DETECT | {flow.src_ip} | {total_pkts_in_window} pkts/{WINDOW_SECONDS}s → XDP Blacklist!")
                     continue
 
-                # --- BƯỚC D: ML Inference (XGBoost) ---
+                # --- BƯỚC D: ML Inference ---
+                # binary.pkl là sklearn-compatible model → gọi predict() trực tiếp với numpy array
                 features = extract_features(flow)
-                dmatrix = xgb.DMatrix(features) if isinstance(ai_model, xgb.Booster) else features
-                prediction = ai_model.predict(dmatrix)
-                pred_val = float(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else float(prediction)
+                prediction = ai_model.predict(features)
+                pred_val = int(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else int(prediction)
 
                 if pred_val >= 0.5:
                     ban_ip(flow.src_ip, blacklist_map, ttl_cache, bpf_lock)
