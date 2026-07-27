@@ -17,9 +17,8 @@ struct bpf_lpm_trie_key_v4 {
 // - Mục đích: Lưu dải CIDR (Kim bài miễn tử cho GCP Console SSH, DNS nội bộ,...)
 // - Key: bpf_lpm_trie_key_v4 (chứa prefix length và IPv4)
 // - Value: u8 (Cờ đánh dấu PASS)
-// - Max entries: 1000
-// - Ghi chú: Dùng LPM Trie để hỗ trợ Longest Prefix Match (vd: block /24 nhưng allow /32 bên trong).
-BPF_LPM_TRIE(whitelist_map, struct bpf_lpm_trie_key_v4, u8, 1000);
+// - Max entries: 2000 (GCP IPv4 prefix list hiện tại ~1200 entries, để dư buffer)
+BPF_LPM_TRIE(whitelist_map, struct bpf_lpm_trie_key_v4, u8, 2000);
 
 // Map Blacklist (`blacklist_map`): BPF_MAP_TYPE_LRU_HASH
 // - Mục đích: Lưu trữ các IP Tấn công bị phát hiện bởi AI/Python.
