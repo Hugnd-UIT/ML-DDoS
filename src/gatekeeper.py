@@ -150,10 +150,17 @@ def main():
     try:
         b = BPF(src_file=XDP_FILE)
         fn = b.load_func("xdp_prog", BPF.XDP)
-        b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
-        print(f"[+] Attach XDP thành công ở tầng Kernel!")
+        try:
+            # Thử attach ở chế độ Native (Hardware/Driver level)
+            b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
+            print(f"[+] Attach XDP thành công ở chế độ Native (Driver Mode)!")
+        except Exception as e_native:
+            print(f"[*] Chế độ Native bị từ chối. Tự động chuyển sang chế độ Generic (SKB Mode)...")
+            # Cờ 2 tương đương với XDP_FLAGS_SKB_MODE (Chạy XDP ở tầng OS, tương thích với Card mạng ảo hóa như GCP)
+            b.attach_xdp(dev=INTERFACE, fn=fn, flags=2)
+            print(f"[+] Attach XDP thành công ở chế độ Generic (SKB Mode)!")
     except Exception as e:
-        print(f"[-] FATAL ERROR: Không thể tải eBPF ({e}). Script cần quyền root (sudo).")
+        print(f"[-] FATAL ERROR: Không thể tải eBPF ({e}). Vui lòng kiểm tra quyền Root.")
         return
 
     auto_load_gcp_whitelist(b)
@@ -209,8 +216,12 @@ def main():
     except Exception as e:
         print(f"\n[-] Xảy ra sự cố ngoại lệ (Fail-safe): {e}")
     finally:
+        # LUÔN LUÔN GỠ BỎ eBPF KHI THOÁT ĐỂ KHÔNG CHẶN NHẦM TRAFFIC CỦA HỆ THỐNG CŨ
         try:
-            b.remove_xdp(INTERFACE, flags=0)
+            try:
+                b.remove_xdp(INTERFACE, flags=0)
+            except Exception:
+                b.remove_xdp(INTERFACE, flags=2)
             print("[+] Đã gỡ bỏ an toàn XDP Filter khỏi Interface. Hệ thống trở lại bình thường.")
         except Exception:
             pass
