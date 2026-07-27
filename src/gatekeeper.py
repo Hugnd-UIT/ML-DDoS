@@ -54,25 +54,45 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_vm_ip(ifname):
+def get_all_local_ips(ifname):
     """
-    Trả về địa chỉ IPv4 gắn với interface `ifname` qua ioctl SIOCGIFADDR.
-    Dùng để lọc traffic Egress (do chính máy chủ chủ động gửi ra ngoài).
+    Trả về tập hợp tất cả địa chỉ IPv4 gắn với interface `ifname`,
+    bao gồm cả alias IP (vd: 10.99.99.99 bên cạnh primary 10.240.0.4).
+    Dùng để lọc Egress traffic: bỏ qua mọi flow đến từ bất kỳ IP nào của chính máy chủ.
     """
+    import subprocess
+    ips = set()
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            return socket.inet_ntoa(
-                fcntl.ioctl(
-                    s.fileno(),
-                    0x8915,  # SIOCGIFADDR
-                    struct.pack('256s', bytes(ifname[:15], 'utf-8'))
-                )[20:24]
-            )
-        finally:
-            s.close()
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", ifname],
+            capture_output=True, text=True, timeout=3
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("inet "):
+                ip = line.split()[1].split("/")[0]
+                ips.add(ip)
     except Exception:
-        return "127.0.0.1"
+        pass
+    # Fallback: dùng ioctl nếu ip command không khả dụng
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                ip = socket.inet_ntoa(
+                    fcntl.ioctl(
+                        s.fileno(),
+                        0x8915,  # SIOCGIFADDR
+                        struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+                    )[20:24]
+                )
+                ips.add(ip)
+            finally:
+                s.close()
+        except Exception:
+            pass
+    ips.add("127.0.0.1")
+    return ips
 
 
 def ip_to_int(ip_str):
@@ -322,10 +342,11 @@ def main():
     _banner("3/4  KHỞI TẠO AI ENGINE (XGBoost)")
     ai_model = load_ai_model()
 
-    # ── 5. Host IP (Egress Filter) ───────────────────────────────────────────
+    # ── 5. Thu thập tất cả IP của máy chủ (Egress Filter) ──────────────────
     _banner("4/4  CẤU HÌNH EGRESS FILTER")
-    vm_ip = get_vm_ip(INTERFACE)
-    print(f"  [+] Host IP: {vm_ip}  (traffic Egress từ địa chỉ này sẽ bị bỏ qua)")
+    local_ips = get_all_local_ips(INTERFACE)
+    print(f"  [+] Local IPs detected: {', '.join(sorted(local_ips))}")
+    print(f"  [+] Mọi flow từ các địa chỉ này sẽ bỏ qua (Egress + Alias filter)")
 
     # Sliding Window: { src_ip: [(timestamp, packet_count), ...] }
     packet_window = defaultdict(list)
@@ -354,8 +375,9 @@ def main():
                 if ":" in flow.src_ip:
                     continue
 
-                # B. Bỏ qua traffic Egress (do chính máy chủ gửi ra ngoài)
-                if flow.src_ip in (vm_ip, "127.0.0.1"):
+                # B. Bỏ qua Egress: flow từ bất kỳ IP nào của chính máy chủ
+                #    (primary IP, alias IP, loopback)
+                if flow.src_ip in local_ips:
                     continue
 
                 # C. Bỏ qua IP đã bị ban trong TTL 300s hiện tại
@@ -398,6 +420,11 @@ def main():
                     continue
 
                 # E. ML Inference — XGBClassifier phân loại luồng
+                # Chỉ chạy AI khi flow có ít nhất 10 packet: loại trừ single-packet
+                # scanner và health check (1-2 packets) để giảm false positive
+                if flow.bidirectional_packets < 10:
+                    continue
+
                 features   = extract_features(flow)
                 prediction = ai_model.predict(features)
                 pred_val   = int(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else int(prediction)
