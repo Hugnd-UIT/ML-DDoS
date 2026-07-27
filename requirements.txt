@@ -9,3 +9,4 @@ google-cloud-storage
 streamlit
 requests
 matplotlib
+cachetools
