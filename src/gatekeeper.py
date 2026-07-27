@@ -111,18 +111,20 @@ def auto_load_gcp_whitelist(bpf_instance):
         print(f"  [+] GCP cloud.json: {len(cloud_prefixes)} prefix.")
     except Exception as exc:
         print(f"  [!] Không tải được cloud.json: {exc}")
-
-
-
-
-    # RFC 1918 private ranges — bảo vệ mạng nội bộ VPC (DB, microservices, backends)
-    # Đảm bảo AI không bao giờ block traffic giữa các VM trong cùng VPC
-    private_ranges = [
-        "10.0.0.0/8",      # GCP VPC internal (10.128.0.0/9, 10.240.0.0/12, ...)
-        "172.16.0.0/12",   # Private class B
-        "192.168.0.0/16",  # Private class C
-    ]
-    cidrs += private_ranges
+    # Fetch Google LLC IP Ranges — bao gồm 142.250.x.x, 216.239.x.x
+    # Đây là các dải IP Google dùng cho health check, NTP, ops-agent ping vào VM
+    # KHÔNG phải người dùng YouTube/Search truy cập từ ngoài vào
+    try:
+        resp = requests.get("https://www.gstatic.com/ipranges/goog.json", timeout=10)
+        goog_prefixes = [
+            p["ipv4Prefix"]
+            for p in resp.json().get("prefixes", [])
+            if "ipv4Prefix" in p
+        ]
+        cidrs += goog_prefixes
+        print(f"  [+] GCP goog.json:  {len(goog_prefixes)} prefix.")
+    except Exception as exc:
+        print(f"  [!] Không tải được goog.json: {exc}")
 
     # Dải tĩnh bắt buộc — phải luôn có dù mọi fetch đều thất bại
     cidrs += [
@@ -132,6 +134,7 @@ def auto_load_gcp_whitelist(bpf_instance):
 
     # Loại bỏ duplicate trước khi nạp
     cidrs = list(dict.fromkeys(cidrs))
+
     print(f"  [*] Nạp {len(cidrs)} dải CIDR vào eBPF Whitelist (LPM Trie)...")
     py_whitelist, ok = [], 0
     for cidr in cidrs:
