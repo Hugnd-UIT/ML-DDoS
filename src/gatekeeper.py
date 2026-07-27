@@ -151,12 +151,10 @@ def main():
         b = BPF(src_file=XDP_FILE)
         fn = b.load_func("xdp_prog", BPF.XDP)
         try:
-            # Thử attach ở chế độ Native (Hardware/Driver level)
             b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
             print(f"[+] Attach XDP thành công ở chế độ Native (Driver Mode)!")
         except Exception as e_native:
             print(f"[*] Chế độ Native bị từ chối. Tự động chuyển sang chế độ Generic (SKB Mode)...")
-            # Cờ 2 tương đương với XDP_FLAGS_SKB_MODE (Chạy XDP ở tầng OS, tương thích với Card mạng ảo hóa như GCP)
             b.attach_xdp(dev=INTERFACE, fn=fn, flags=2)
             print(f"[+] Attach XDP thành công ở chế độ Generic (SKB Mode)!")
     except Exception as e:
@@ -186,6 +184,7 @@ def main():
         streamer = NFStreamer(source=INTERFACE, active_timeout=1, statistical_analysis=True)
         
         for flow in streamer:
+            print(f"[DEBUG] {flow.src_ip} -> {flow.dst_ip} | pkts={flow.bidirectional_packets} | duration_ms={flow.bidirectional_duration_ms}")
             # -------------------------------------------------------------
             # BƯỚC A: LỌC EGRESS BẮT BUỘC
             # Bỏ qua mọi traffic do nội tại máy chủ tự sinh ra (Ví dụ: 
@@ -217,7 +216,6 @@ def main():
     except Exception as e:
         print(f"\n[-] Xảy ra sự cố ngoại lệ (Fail-safe): {e}")
     finally:
-        # LUÔN LUÔN GỠ BỎ eBPF KHI THOÁT ĐỂ KHÔNG CHẶN NHẦM TRAFFIC CỦA HỆ THỐNG CŨ
         try:
             try:
                 b.remove_xdp(INTERFACE, flags=0)
