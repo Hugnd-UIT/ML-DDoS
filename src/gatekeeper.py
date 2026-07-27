@@ -182,7 +182,8 @@ def main():
     print("="*65 + "\n")
 
     try:
-        streamer = NFStreamer(source=INTERFACE, active_timeout=1)
+        # Khởi tạo NFStreamer với statistical_analysis=True để bật tính năng đo lường Packet Size & Inter-arrival Time
+        streamer = NFStreamer(source=INTERFACE, active_timeout=1, statistical_analysis=True)
         
         for flow in streamer:
             # -------------------------------------------------------------
