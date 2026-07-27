@@ -87,8 +87,9 @@ def int_to_ip(ip_int):
 
 def auto_load_gcp_whitelist(bpf_instance):
     """
-    Fetch danh sách dải IPv4 của Google Cloud từ endpoint public của Google,
-    bổ sung các dải tĩnh bắt buộc, rồi nạp tất cả xuống eBPF LPM_TRIE map.
+    Fetch danh sách dải IPv4 của Google Cloud (cloud.json + goog.json) từ endpoint
+    public của Google, bổ sung RFC 1918 private ranges và các dải tĩnh bắt buộc,
+    rồi nạp tất cả xuống eBPF LPM_TRIE map.
 
     Trả về list các IPv4Network để Control Plane Python tự kiểm tra trước
     khi ra lệnh ban — tránh tình trạng AI phán nhầm và ban nhầm IP hợp lệ.
@@ -97,24 +98,40 @@ def auto_load_gcp_whitelist(bpf_instance):
     whitelist_map = bpf_instance.get_table("whitelist_map")
 
     cidrs = []
+
+    # Fetch GCP Cloud IP Ranges (các dải IP của GCP infrastructure)
     try:
         resp = requests.get("https://www.gstatic.com/ipranges/cloud.json", timeout=10)
-        cidrs = [
+        cloud_prefixes = [
             p["ipv4Prefix"]
             for p in resp.json().get("prefixes", [])
             if "ipv4Prefix" in p
         ]
-        print(f"  [+] Đã tải {len(cidrs)} prefix từ GCP Cloud IP Ranges.")
+        cidrs += cloud_prefixes
+        print(f"  [+] GCP cloud.json: {len(cloud_prefixes)} prefix.")
     except Exception as exc:
-        print(f"  [!] Không tải được GCP IP Ranges: {exc}")
-        print(f"  [!] Tiếp tục với danh sách tĩnh.")
+        print(f"  [!] Không tải được cloud.json: {exc}")
 
-    # Dải tĩnh bắt buộc — phải luôn có dù fetch thất bại
+
+
+
+    # RFC 1918 private ranges — bảo vệ mạng nội bộ VPC (DB, microservices, backends)
+    # Đảm bảo AI không bao giờ block traffic giữa các VM trong cùng VPC
+    private_ranges = [
+        "10.0.0.0/8",      # GCP VPC internal (10.128.0.0/9, 10.240.0.0/12, ...)
+        "172.16.0.0/12",   # Private class B
+        "192.168.0.0/16",  # Private class C
+    ]
+    cidrs += private_ranges
+
+    # Dải tĩnh bắt buộc — phải luôn có dù mọi fetch đều thất bại
     cidrs += [
         "35.235.240.0/20",   # GCP IAP — Identity-Aware Proxy (SSH Console)
         "169.254.169.254/32" # GCP Metadata Server (ops-agent, auth)
     ]
 
+    # Loại bỏ duplicate trước khi nạp
+    cidrs = list(dict.fromkeys(cidrs))
     print(f"  [*] Nạp {len(cidrs)} dải CIDR vào eBPF Whitelist (LPM Trie)...")
     py_whitelist, ok = [], 0
     for cidr in cidrs:
@@ -136,21 +153,36 @@ def memory_manager(blacklist_map, ttl_cache, lock):
     Daemon thread đồng bộ hoá eBPF blacklist_map (Kernel) với TTLCache (User-space).
 
     Chu kỳ mỗi 5 giây: quét các entry trong blacklist_map, nếu IP tương ứng
-    đã biến mất khỏi TTLCache (TTL 300s hết hạn) thì xoá khỏi eBPF map —
-    giải phóng đường truyền cho IP đó (Automated Amnesty).
+    đã biến mất khỏi TTLCache (TTL 300s hết hạn) thì xoá khỏi eBPF map.
+
+    Thiết kế lock-efficient: Việc scan map (đọc nhiều, chậm) được thực hiện
+    NGOÀI critical section. Lock chỉ được giữ trong khoảnh khắc xoá entry —
+    tránh block Main Thread (AI inference) trong thời gian dài.
     """
     while True:
         try:
             time.sleep(5)
-            expired = []
-            with lock:
+
+            # Bước 1: Scan map NGOÀI lock — đọc nhanh, không chặn Main Thread
+            candidates = []
+            try:
                 for key, _ in blacklist_map.items():
                     if int_to_ip(key.value) not in ttl_cache:
-                        expired.append(key)
-                for key in expired:
+                        candidates.append(key)
+            except Exception:
+                pass
+
+            # Bước 2: Xoá entry với lock — brief critical section
+            with lock:
+                for key in candidates:
                     ip_str = int_to_ip(key.value)
-                    del blacklist_map[key]
-                    print(f"  [↩] AMNESTY  {ip_str:<18} TTL hết hạn → gỡ khỏi XDP Blacklist")
+                    # Double-check dưới lock: tránh xoá IP vừa được ban lại
+                    if ip_str not in ttl_cache:
+                        try:
+                            del blacklist_map[key]
+                            print(f"  [↩] AMNESTY  {ip_str:<18} TTL hết hạn → gỡ khỏi XDP Blacklist")
+                        except Exception:
+                            pass
         except Exception as exc:
             print(f"  [-] Memory Manager lỗi: {exc}")
 
@@ -235,7 +267,17 @@ def main():
     _banner("1/4  KHỞI TẠO DATA PLANE (eBPF/XDP)")
     print(f"  [*] Biên dịch: {XDP_FILE}")
     try:
-        b  = BPF(src_file=XDP_FILE)
+        # Redirect fd2 (stderr) sang /dev/null trong lúc BCC gọi clang compile
+        # để ẩn các warning không liên quan về macro redefinition của kernel headers
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr = os.dup(2)
+        os.dup2(devnull_fd, 2)
+        try:
+            b  = BPF(src_file=XDP_FILE)
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+            os.close(devnull_fd)
         fn = b.load_func("xdp_prog", BPF.XDP)
         try:
             b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
@@ -317,16 +359,30 @@ def main():
                 if flow.src_ip in ttl_cache:
                     continue
 
-                # D. Sliding Window — phát hiện SYN/UDP Flood dạng rotating source-port
-                #    Mỗi packet hping3 dùng source port khác → nhiều micro-flow nhỏ
-                #    → cần gom tổng packet theo src_ip trong cửa sổ thời gian
+                # D. Sliding Window — phát hiện SYN/UDP/ACK Flood rotating source-port
+                #    hping3 dùng source port khác nhau → mỗi packet là 1 micro-flow riêng
+                #    → gom tổng packet theo src_ip trong cửa sổ WINDOW_SECONDS giây
+                #
+                #    Chống OOM: key được xoá khỏi dict ngay khi window trống,
+                #    và dict bị clear khẩn cấp nếu vượt 100 000 entries (IP Spoofing storm)
                 now = time.time()
-                window = packet_window[flow.src_ip]
+
+                # Guard: giới hạn kích thước dict để chống OOM khi IP Spoofing quy mô lớn
+                if len(packet_window) > 100_000:
+                    packet_window.clear()
+
+                window  = packet_window[flow.src_ip]
                 window.append((now, flow.src2dst_packets))
-                packet_window[flow.src_ip] = [
-                    (t, p) for t, p in window if now - t <= WINDOW_SECONDS
-                ]
-                total_pkts = sum(p for _, p in packet_window[flow.src_ip])
+                filtered = [(t, p) for t, p in window if now - t <= WINDOW_SECONDS]
+
+                if filtered:
+                    packet_window[flow.src_ip] = filtered
+                else:
+                    # Window trống — xoá key để giải phóng RAM (chống memory leak)
+                    packet_window.pop(flow.src_ip, None)
+                    continue
+
+                total_pkts = sum(p for _, p in filtered)
 
                 if total_pkts > PACKET_WINDOW_THRESHOLD:
                     if not is_whitelisted(flow.src_ip):
