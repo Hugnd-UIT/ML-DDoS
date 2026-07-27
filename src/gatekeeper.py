@@ -1,181 +1,219 @@
 import os
-import argparse
-import warnings
-import numpy as np
-import pandas as pd
-import joblib
 import time
-from enforcer import TokenBucketEnforcer
+import socket
+import struct
+import fcntl
+import threading
+import ipaddress
+import requests
+import ctypes
+import numpy as np
+import xgboost as xgb
+from bcc import BPF
+from cachetools import TTLCache
+from nfstream import NFStreamer
 
-try:
-    from nfstream import NFStreamer
-except ImportError:
-    print("[!] 'nfstream' library not found. Please install it: pip install nfstream")
-    NFStreamer = None
+# --- CẤU HÌNH HỆ THỐNG ---
+INTERFACE = "ens4"                 # Giao diện mạng cần bảo vệ
+XDP_FILE = "xdp_filter.c"          # Đường dẫn mã nguồn eBPF (Data Plane)
+MODEL_FILE = "xgboost_model.json"  # File mô hình AI
+# -------------------------
 
-warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
-warnings.filterwarnings("ignore", category=FutureWarning)
+def get_vm_ip(ifname):
+    """Trích xuất IP của Interface mạng để cấu hình."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+            s.fileno(),
+            0x8915,  # SIOCGIFADDR
+            struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+        )[20:24])
+    except Exception:
+        return "127.0.0.1"
 
-# Sau tung nay giay, cho phep bao dong lai cho cung 1 rule (thay vi im
-# lang vinh vien sau lan bao dau tien)
-ALERT_COOLDOWN_SECONDS = 300  # 5 phut
+def ip_to_int(ip_str):
+    """Chuyển đổi IP dạng chuỗi sang Interger (Network Byte Order) cho eBPF."""
+    return struct.unpack("I", socket.inet_aton(ip_str))[0]
 
-# Neu so luong flow can chay qua pipeline ML trong 1 giay vuot qua muc
-# nay, he thong tam thoi bo qua buoc tinh feature + model.predict (ton
-# CPU nhat) va coi nhu nghi ngo mac dinh, de tranh chinh he thong phong
-# thu tu ha guc CPU cua no truoc khi kip phan loai (self-DoS).
-MAX_ML_FLOWS_PER_SECOND = 200
+def int_to_ip(ip_int):
+    """Chuyển đổi Integer từ eBPF (Network Byte Order) về lại IP dạng chuỗi."""
+    return socket.inet_ntoa(struct.pack("I", ip_int))
 
-def get_args():
-    parser = argparse.ArgumentParser(description="Gatekeeper - Inline IPS System using ML and nfstream")
-    parser.add_argument("-i", "--interface", default="eth0", help="Network interface to sniff on (default: eth0)")
-    parser.add_argument("-m", "--model", default="./models/binary.pkl", help="Path to the trained XGBoost model")
-    return parser.parse_args()
-
-def map_nfstream_to_cic(flow):
-    duration_ms = getattr(flow, 'bidirectional_duration_ms', 0)
-    duration_s = duration_ms / 1000.0 if duration_ms > 0 else 0.001
-    
-    src2dst_bytes = getattr(flow, 'src2dst_bytes', 0)
-    dst2src_bytes = getattr(flow, 'dst2src_bytes', 0)
-    
-    features = {
-        'Flow Duration': duration_ms * 1000,
-        'Flow Bytes/s': getattr(flow, 'bidirectional_bytes', 0) / duration_s,
-        'Flow Packets/s': getattr(flow, 'bidirectional_packets', 0) / duration_s,
-        'Total Fwd Packets': getattr(flow, 'src2dst_packets', 0),
-        'Total Backward Packets': getattr(flow, 'dst2src_packets', 0),
-        'Down/Up Ratio': dst2src_bytes / src2dst_bytes if src2dst_bytes > 0 else 0,
-        'Total Length of Fwd Packets': src2dst_bytes,
-        'Total Length of Bwd Packets': dst2src_bytes,
-        'Fwd Packet Length Max': getattr(flow, 'src2dst_max_ps', 0),
-        'Fwd Packet Length Min': getattr(flow, 'src2dst_min_ps', 0),
-        'Fwd Packet Length Mean': getattr(flow, 'src2dst_mean_ps', 0),
-        'Bwd Packet Length Mean': getattr(flow, 'dst2src_mean_ps', 0),
-        'Flow IAT Mean': getattr(flow, 'bidirectional_mean_piat_ms', 0) * 1000,
-        'Flow IAT Std': getattr(flow, 'bidirectional_stddev_piat_ms', 0) * 1000,
-        'Fwd IAT Total': getattr(flow, 'src2dst_duration_ms', 0) * 1000,
-        'Protocol': getattr(flow, 'protocol', 0),
-        'SYN Flag Count': getattr(flow, 'bidirectional_syn_packets', 0),
-        'ACK Flag Count': getattr(flow, 'bidirectional_ack_packets', 0),
-        'Init_Win_bytes_forward': getattr(flow, 'src2dst_init_win_bytes', 0)
-    }
-    
-    feature_columns = [
-        'Flow Duration', 'Flow Bytes/s', 'Flow Packets/s', 'Total Fwd Packets', 
-        'Total Backward Packets', 'Down/Up Ratio', 'Total Length of Fwd Packets', 
-        'Total Length of Bwd Packets', 'Fwd Packet Length Max', 'Fwd Packet Length Min', 
-        'Fwd Packet Length Mean', 'Bwd Packet Length Mean', 'Flow IAT Mean', 'Flow IAT Std', 
-        'Fwd IAT Total', 'Protocol', 'SYN Flag Count', 'ACK Flag Count', 'Init_Win_bytes_forward'
-    ]
-    
-    df = pd.DataFrame([features], columns=feature_columns)
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.fillna(0, inplace=True)
-    return df
-
-def print_banner():
-    banner = """
-   _____       _       _                     
-  / ____|     | |     | |                    
- | |  __  __ _| |_ ___| | _____  ___ _ __   ___ _ __ 
- | | |_ |/ _` | __/ _ \ |/ / _ \/ _ \ '_ \ / _ \ '__|
- | |__| | (_| | ||  __/   <  __/  __/ |_) |  __/ |   
-  \_____|\__,_|\__\___|_|\_\___|\___| .__/ \___|_|   
-                                    | |              
-                                    |_|              
-======================================================
-    Inline IPS eBPF - Realtime DDoS Detection Engine
-======================================================
+def auto_load_gcp_whitelist(bpf_instance):
     """
-    print(banner)
+    1. KHỞI TẠO VÀ NẠP TỰ ĐỘNG (ZERO-MAINTENANCE):
+    Tải danh sách IP từ GCP, kết hợp cùng IP SSH/DNS và nạp xuống eBPF LPM_TRIE.
+    """
+    print("[*] Đang tiến hành đồng bộ Whitelist từ Google Cloud...")
+    whitelist_map = bpf_instance.get_table("whitelist_map")
+    
+    cidrs = []
+    # Fetch danh sách Public IPs của GCP (Các dịch vụ nội bộ Google)
+    try:
+        r = requests.get("https://www.gstatic.com/ipranges/cloud.json", timeout=10)
+        data = r.json()
+        cidrs = [prefix['ipv4Prefix'] for prefix in data.get('prefixes', []) if 'ipv4Prefix' in prefix]
+    except Exception as e:
+        print(f"[-] Cảnh báo: Không tải được GCP IPs ({e}). Hệ thống vẫn tiếp tục nạp IP tĩnh.")
+
+    cidrs.append("35.235.240.0/20")    # SSH IAP Console của GCP
+    cidrs.append("169.254.169.254/32")  # DNS và Metadata Authentication Server
+
+    # Nạp xuống Kernel (LPM_TRIE)
+    print(f"[*] Tiến hành nạp {len(cidrs)} dải IP/Subnet vào eBPF Whitelist (LPM Trie)...")
+    success_count = 0
+    for cidr in cidrs:
+        try:
+            net = ipaddress.IPv4Network(cidr, strict=False)
+            prefixlen = net.prefixlen
+            ip_str = str(net.network_address)
+            
+            # Khởi tạo struct key cho LPM_TRIE
+            key = whitelist_map.Key(prefixlen, ip_to_int(ip_str))
+            whitelist_map[key] = whitelist_map.Leaf(1)
+            success_count += 1
+        except Exception:
+            pass 
+            
+    print(f"[+] Hoàn tất. Đã nạp thành công {success_count} quy tắc Whitelist xuống Data Plane.")
+
+def memory_manager(blacklist_map, ttl_cache):
+    """
+    2. QUẢN LÝ BỘ NHỚ RAM:
+    """
+    while True:
+        try:
+            time.sleep(5) 
+            expired_keys = []
+            
+            # Lặp qua tất cả IPs đang bị phong tỏa dưới Kernel
+            for key, _ in blacklist_map.items():
+                ip_str = int_to_ip(key.value)
+                
+                if ip_str not in ttl_cache:
+                    expired_keys.append(key)
+                    
+            for key in expired_keys:
+                ip_str = int_to_ip(key.value)
+                del blacklist_map[key] 
+                print(f"[i] AMNESTY | {ip_str} đã hết hạn 300s, gỡ khỏi eBPF Blacklist.")
+                
+        except Exception as e:
+            print(f"[-] Memory Manager - Lỗi đồng bộ: {e}")
+
+def load_ai_model():
+    try:
+        model = xgb.Booster()
+        model.load_model(MODEL_FILE)
+        return model
+    except Exception as e:
+        print(f"[!] Lỗi nạp mô hình {MODEL_FILE}: {e}")
+        print(f"[!] Chạy chế độ Mock AI (Cứu hộ). Khóa IP nếu Packet > 500/flow.")
+        class MockAI:
+            def predict(self, features_matrix):
+                feats = features_matrix.get_data().toarray() if hasattr(features_matrix, 'get_data') else features_matrix
+                if feats[0][1] > 500:
+                    return [1.0]
+                return [0.0]
+        return MockAI()
+
+def extract_features(flow):
+    features = [
+        flow.bidirectional_duration_ms,
+        flow.bidirectional_packets,
+        flow.bidirectional_bytes,
+        flow.src2dst_packets,
+        flow.src2dst_bytes,
+        flow.dst2src_packets,
+        flow.dst2src_bytes,
+        flow.bidirectional_min_ps,
+        flow.bidirectional_mean_ps,
+        flow.bidirectional_stddev_ps,
+        flow.bidirectional_max_ps,
+        flow.src2dst_min_ps,
+        flow.src2dst_mean_ps,
+        flow.src2dst_max_ps,
+        flow.dst2src_min_ps,
+        flow.dst2src_mean_ps,
+        flow.dst2src_max_ps,
+        flow.bidirectional_syn_packets,
+        flow.bidirectional_ack_packets
+    ]
+    return np.array([features], dtype=np.float32)
 
 def main():
-    print_banner()
-    args = get_args()
-    
-    model_path = args.model
+    print("="*65)
+    print(" 🚀 KHỞI ĐỘNG HỆ THỐNG")
+    print("="*65)
+
+    print(f"[*] 1. Đang compile và attach {XDP_FILE} vào {INTERFACE}...")
     try:
-        print(f"[*] Loading model from: {model_path} ...")
-        if not os.path.exists(model_path):
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            alt_path = os.path.join(base_dir, '..', 'models', 'binary.pkl')
-            if os.path.exists(alt_path):
-                model_path = alt_path
-            
-        model = joblib.load(model_path)
-        print("[+] Model loaded successfully!")
+        b = BPF(src_file=XDP_FILE)
+        fn = b.load_func("xdp_prog", BPF.XDP)
+        b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
+        print(f"[+] Attach XDP thành công ở tầng Kernel!")
     except Exception as e:
-        print(f"[-] Critical Error: Could not load the ML model. Reason: {e}")
+        print(f"[-] FATAL ERROR: Không thể tải eBPF ({e}). Script cần quyền root (sudo).")
         return
 
-    if NFStreamer is None:
-        return
-
-    print(f"[*] Initializing NFStreamer on interface '{args.interface}' ...")
-    print("[*] Gatekeeper is listening for traffic. Press Ctrl+C to stop.\n")
+    auto_load_gcp_whitelist(b)
+    blacklist_map = b.get_table("blacklist_map")
     
-    blocked_rules = {}  # rule_key -> thoi diem canh bao gan nhat (time.time())
-    enforcer = TokenBucketEnforcer(max_pps_threshold=100.0, burst_capacity=150.0)
-    start_time = time.time()
+    print("[*] 2. Khởi tạo TTLCache (50,000 max_entries, 300s TTL)...")
+    ttl_cache = TTLCache(maxsize=50000, ttl=300)
+    mem_thread = threading.Thread(target=memory_manager, args=(blacklist_map, ttl_cache), daemon=True)
+    mem_thread.start()
 
-    # Trang thai cho circuit breaker chong self-DoS CPU
-    ml_window_start = time.time()
-    ml_flows_in_window = 0
+    print("[*] 3. Tải AI Engine (XGBoost)...")
+    ai_model = load_ai_model()
+    
+    vm_ip = get_vm_ip(INTERFACE)
+    print(f"[*] 4. Trích xuất Host IP ({vm_ip})")
+
+    print("\n" + "="*65)
+    print(" 🛡️ HỆ THỐNG ĐÃ SẴN SÀNG - ĐANG KIỂM SOÁT TRAFFIC")
+    print("="*65 + "\n")
+
     try:
-        streamer = NFStreamer(source=args.interface, active_timeout=1, idle_timeout=1, statistical_analysis=True)
+        streamer = NFStreamer(source=INTERFACE, active_timeout=1)
+        
         for flow in streamer:
-            # --- Circuit breaker chong self-DoS CPU ---
-            # Neu so flow/giay dang can ML xu ly vuot qua nguong an toan,
-            # bo qua buoc tinh feature (map_nfstream_to_cic) + model.predict
-            # (2 buoc ton CPU nhat) va coi flow do la nghi ngo mac dinh
-            # (fail-safe: tha cho Token Bucket xu ly tiep, khong de ML
-            # inference lam nghen CPU cua chinh he thong phong thu).
-            now_ml = time.time()
-            if now_ml - ml_window_start >= 1.0:
-                ml_window_start = now_ml
-                ml_flows_in_window = 0
-            ml_flows_in_window += 1
-
-            if ml_flows_in_window > MAX_ML_FLOWS_PER_SECOND:
-                prediction = 1  # qua tai -> mac dinh nghi ngo, khong chay ML
-            else:
-                df_features = map_nfstream_to_cic(flow)
-                prediction = model.predict(df_features)[0]
-
-            if prediction == 1:
-                protocol = str(getattr(flow, 'protocol', 'TCP'))
-                dst_port = int(getattr(flow, 'dst_port', 0))
-                fwd_len_mean = float(getattr(flow, 'src2dst_mean_ps', 0.0))
-                total_pkts = float(getattr(flow, 'bidirectional_packets', 1))
-
-                result = enforcer.evaluate_traffic(
-                    ai_label=prediction,
-                    protocol=protocol,
-                    dst_port=dst_port,
-                    fwd_len_mean=fwd_len_mean,
-                    packet_count=total_pkts
-                )
-
-                if result.action == "DROP_RATE_LIMIT_EXCEEDED":
-                    rule_key = (protocol, dst_port)
-                    now_alert = time.time()
-                    last_alert = blocked_rules.get(rule_key, 0)
-                    # Chi im lang trong khoang ALERT_COOLDOWN_SECONDS, sau do
-                    # bao dong lai neu rule van con bi drop (khong mu vinh vien)
-                    if now_alert - last_alert >= ALERT_COOLDOWN_SECONDS:
-                        print(f"[!] REAL-TIME ALERT: DDoS Rate Limit Exceeded => {result.signature_key}")
-                        print(f"RULE_DROP => {result.signature_key}")
-                        blocked_rules[rule_key] = now_alert
-                elif result.action == "PASS_SUSTAINED_LOW_AND_SLOW":
-                    print(f"[?] WARNING: Sustained low-and-slow pattern detected (van duoi nguong tuc thoi) => {result.signature_key}")
+            # -------------------------------------------------------------
+            # BƯỚC A: LỌC EGRESS BẮT BUỘC
+            # Bỏ qua mọi traffic do nội tại máy chủ tự sinh ra (Ví dụ: 
+            # Ops Agent gửi metrics, ứng dụng gọi DB, request apt-get...)
+            # -------------------------------------------------------------
+            if flow.src_ip == vm_ip or flow.src_ip == "127.0.0.1":
+                continue
                 
+            if flow.src_ip in ttl_cache:
+                continue 
+
+            features = extract_features(flow)
+            dmatrix = xgb.DMatrix(features) if isinstance(ai_model, xgb.Booster) else features
+            prediction = ai_model.predict(dmatrix)
+            
+            pred_val = prediction[0] if isinstance(prediction, (list, np.ndarray)) else prediction
+            
+            if pred_val >= 0.5: 
+                ttl_cache[flow.src_ip] = True
+                
+                ip_int = ip_to_int(flow.src_ip)
+                key = blacklist_map.Key(ip_int)
+                blacklist_map[key] = blacklist_map.Leaf(1)
+                
+                print(f"[!] AI DETECTED DDOS | Flow: {flow.src_ip} -> {flow.dst_ip} | Pushing to XDP Blacklist!")
+
     except KeyboardInterrupt:
-        print("\n[*] Gatekeeper stopped by user. Exiting gracefully...")
-    except PermissionError:
-        print("\n[-] Permission Denied. Please run the script as Root/Administrator to sniff packets.")
+        print("\n[*] Tín hiệu ngắt từ System Admin. Đang hạ tầng an toàn...")
     except Exception as e:
-        print(f"\n[-] Unexpected error occurred: {e}")
+        print(f"\n[-] Xảy ra sự cố ngoại lệ (Fail-safe): {e}")
+    finally:
+        try:
+            b.remove_xdp(INTERFACE, flags=0)
+            print("[+] Đã gỡ bỏ an toàn XDP Filter khỏi Interface. Hệ thống trở lại bình thường.")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
