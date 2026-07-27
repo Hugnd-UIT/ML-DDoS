@@ -8,6 +8,7 @@ import threading
 import ipaddress
 import requests
 import ctypes
+import warnings
 import joblib
 import numpy as np
 import xgboost as xgb
@@ -64,7 +65,8 @@ def auto_load_gcp_whitelist(bpf_instance):
     """
     Tải danh sách dải CIDR của Google Cloud từ API public, kết hợp với các dải
     tĩnh bắt buộc (SSH IAP, Metadata Server), nạp xuống eBPF LPM_TRIE map.
-    Đảm bảo traffic quản trị hệ thống không bao giờ bị chặn nhầm.
+    Trả về Python-side whitelist set (tập hợp IPv4Network) để Control Plane
+    kiểm tra trước khi ban, tránh AI ban nhầm IP hợp lệ.
     """
     print("[*] Đang đồng bộ Whitelist từ Google Cloud IP Ranges...")
     whitelist_map = bpf_instance.get_table("whitelist_map")
@@ -85,19 +87,21 @@ def auto_load_gcp_whitelist(bpf_instance):
     cidrs.append("35.235.240.0/20")    # GCP IAP (Identity-Aware Proxy) cho SSH Console
     cidrs.append("169.254.169.254/32")  # GCP Metadata Server (dùng cho auth và ops agent)
 
-    # Giới hạn theo capacity của map (max_entries = 2000 trong xdp_filter.c)
     print(f"[*] Nạp {len(cidrs)} dải CIDR vào eBPF Whitelist (LPM Trie)...")
     success_count = 0
+    py_whitelist = []  # Python-side whitelist để Control Plane tự kiểm tra
     for cidr in cidrs:
         try:
             net = ipaddress.IPv4Network(cidr, strict=False)
             key = whitelist_map.Key(net.prefixlen, ip_to_int(str(net.network_address)))
             whitelist_map[key] = whitelist_map.Leaf(1)
+            py_whitelist.append(net)
             success_count += 1
         except Exception:
             pass  # Bỏ qua IPv6 prefix và các entry không hợp lệ
 
     print(f"[+] Nạp thành công {success_count} quy tắc Whitelist xuống Data Plane.")
+    return py_whitelist  # Trả về danh sách IPv4Network để dùng ở Python layer
 
 
 def memory_manager(blacklist_map, ttl_cache, lock):
@@ -133,7 +137,10 @@ def load_ai_model():
     để hệ thống không sập khi thiếu model (Graceful Degradation).
     """
     try:
-        model = joblib.load(MODEL_FILE)
+        # Suppress cảnh báo tương thích phiên bản XGBoost pickle (không ảnh hưởng chức năng)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = joblib.load(MODEL_FILE)
         print(f"[+] Đã tải mô hình từ {MODEL_FILE} ({type(model).__name__}).")
         return model
     except Exception as e:
@@ -220,8 +227,16 @@ def main():
         return
 
     # --- 2. Nạp Whitelist ---
-    auto_load_gcp_whitelist(b)
+    py_whitelist = auto_load_gcp_whitelist(b)
     blacklist_map = b.get_table("blacklist_map")
+
+    def is_whitelisted(ip_str):
+        """Kiểm tra xem IP có nằm trong whitelist không (Python layer)."""
+        try:
+            addr = ipaddress.IPv4Address(ip_str)
+            return any(addr in net for net in py_whitelist)
+        except Exception:
+            return False
 
     # --- 3. Khởi tạo bộ nhớ User-space ---
     print("[*] 2. Khởi tạo TTLCache (maxsize=50000, ttl=300s)...")
@@ -264,7 +279,10 @@ def main():
             # === Bọc toàn bộ xử lý của mỗi flow trong try-except riêng ===
             # Lỗi trên một flow không được phép crash hệ thống hay gỡ XDP.
             try:
-                # --- BƯỚC A: Bỏ qua traffic Egress (do chính máy chủ gửi ra) ---
+                # --- BƯỚC A: Bỏ qua IPv6 và traffic Egress ---
+                # inet_aton chỉ hỗ trợ IPv4 — skip IPv6 để tránh crash
+                if ':' in flow.src_ip:
+                    continue
                 if flow.src_ip == vm_ip or flow.src_ip == "127.0.0.1":
                     continue
 
@@ -284,8 +302,10 @@ def main():
 
                 if total_pkts_in_window > PACKET_WINDOW_THRESHOLD:
                     # Ngưỡng sliding window vượt mức → đây là dấu hiệu flood rõ ràng
+                    if is_whitelisted(flow.src_ip):
+                        continue  # Không bao giờ ban IP nằm trong whitelist
                     ban_ip(flow.src_ip, blacklist_map, ttl_cache, bpf_lock)
-                    packet_window.pop(flow.src_ip, None)  # Reset counter sau khi ban
+                    packet_window.pop(flow.src_ip, None)
                     print(f"[!] SLIDING WINDOW DETECT | {flow.src_ip} | {total_pkts_in_window} pkts/{WINDOW_SECONDS}s → XDP Blacklist!")
                     continue
 
@@ -296,6 +316,8 @@ def main():
                 pred_val = int(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else int(prediction)
 
                 if pred_val >= 0.5:
+                    if is_whitelisted(flow.src_ip):
+                        continue  # Không bao giờ ban IP nằm trong whitelist dù AI phán nhầm
                     ban_ip(flow.src_ip, blacklist_map, ttl_cache, bpf_lock)
                     print(f"[!] AI DETECTED DDOS | {flow.src_ip} -> {flow.dst_ip} | pred={pred_val:.3f} → XDP Blacklist!")
 
