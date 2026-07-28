@@ -191,16 +191,15 @@ def memory_manager(blacklist_map, ban_registry, lock):
 
             # Scan ngoài lock (read-only) → tránh block Main Thread
             expired_ips = [
-                (ip, count)
-                for ip, (expire_ts, count) in list(ban_registry.items())
+                ip for ip, expire_ts in list(ban_registry.items())
                 if expire_ts <= now
             ]
 
             # Xóa dưới lock — brief critical section
             with lock:
-                for ip, count in expired_ips:
-                    entry = ban_registry.get(ip)
-                    if entry and entry[0] <= now:   # double-check race condition
+                for ip in expired_ips:
+                    expire_ts = ban_registry.get(ip)
+                    if expire_ts and expire_ts <= now:   # double-check race condition
                         del ban_registry[ip]
                         try:
                             del blacklist_map[blacklist_map.Key(ip_to_int(ip))]
@@ -255,18 +254,17 @@ def extract_features(flow):
     ]], dtype=np.float32)
 
 
-def ban_ip_backoff(src_ip, blacklist_map, ban_registry, lock):
+def ban_ip_backoff(src_ip, blacklist_map, ban_registry, offense_history, lock):
     """
-    Ban IP với TTL tăng lũy tiến theo số lần vi phạm (Exponential Backoff):
-      Lần 1 → 5 phút | Lần 2 → 1 tiếng | Lần 3+ → 24 tiếng
-    Ghi vào ban_registry (User-space) và eBPF blacklist_map (Kernel).
+    Ban IP với TTL tăng lũy tiến (Exponential Backoff): 5 phút → 1 tiếng → 24 tiếng.
+    Lịch sử vi phạm (offense_history) lưu 24h, hoàn toàn độc lập với trạng thái ban hiện tại.
     """
     with lock:
-        _, prev_count = ban_registry.get(src_ip, (0, 0))
-        count     = prev_count + 1
+        count = offense_history.get(src_ip, 0) + 1
+        offense_history[src_ip] = count
+        
         ttl_secs  = BAN_TTL[min(count - 1, len(BAN_TTL) - 1)]
-        expire_ts = time.time() + ttl_secs
-        ban_registry[src_ip] = (expire_ts, count)
+        ban_registry[src_ip] = time.time() + ttl_secs
         blacklist_map[blacklist_map.Key(ip_to_int(src_ip))] = blacklist_map.Leaf(1)
     return count, ttl_secs
 
@@ -332,16 +330,18 @@ def main():
 
     # ── 3. Memory Manager ───────────────────────────────────────────────
     _banner("2/4  KHỞI TẠO BỘ NHớ USER-SPACE")
-    # ban_registry: { src_ip: (expire_timestamp, offense_count) }
-    # TTL khác nhau cho từng IP
+    # ban_registry: { src_ip: expire_timestamp } -> quản lý án phạt hiện tại
     ban_registry = {}
-    bpf_lock     = threading.Lock()
+    # offense_history: { src_ip: count } -> ghi nhớ "tiền án" trong 24h bằng TTLCache
+    offense_history = TTLCache(maxsize=100_000, ttl=86400)
+    
+    bpf_lock = threading.Lock()
     threading.Thread(
         target=memory_manager,
         args=(blacklist_map, ban_registry, bpf_lock),
         daemon=True
     ).start()
-    print(f"  [+] Ban Registry khởi tạo  (Exponential Backoff: 5m → 1h → 24h)")
+    print(f"  [+] Offense History khởi tạo (TTLCache 24h)")
     print(f"  [+] Memory Manager daemon started")
 
     # ── 4. AI Engine ─────────────────────────────────────────────────────────
@@ -388,8 +388,8 @@ def main():
                     continue
 
                 # C. Bỏ qua IP đang trong thời gian bị phạt
-                entry = ban_registry.get(flow.src_ip)
-                if entry and entry[0] > time.time():
+                expire_ts = ban_registry.get(flow.src_ip)
+                if expire_ts and expire_ts > time.time():
                     continue
 
                 # D. Multi-vector Rate Limiting (Sliding Window)
@@ -423,7 +423,7 @@ def main():
                     total_pkts > TOTAL_THRESHOLD):
                     if not is_whitelisted(flow.src_ip):
                         count, ttl_secs = ban_ip_backoff(
-                            flow.src_ip, blacklist_map, ban_registry, bpf_lock
+                            flow.src_ip, blacklist_map, ban_registry, offense_history, bpf_lock
                         )
                         packet_window.pop(flow.src_ip, None)
                         ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
@@ -445,7 +445,7 @@ def main():
                 if pred_val >= 1:
                     if not is_whitelisted(flow.src_ip):
                         count, ttl_secs = ban_ip_backoff(
-                            flow.src_ip, blacklist_map, ban_registry, bpf_lock
+                            flow.src_ip, blacklist_map, ban_registry, offense_history, bpf_lock
                         )
                         ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
                         print(
