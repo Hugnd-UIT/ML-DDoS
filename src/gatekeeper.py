@@ -21,6 +21,7 @@ import numpy as np
 import xgboost as xgb
 from collections import defaultdict
 from bcc import BPF
+from cachetools import TTLCache
 from nfstream import NFStreamer
 
 # ── Cấu hình hệ thống ──────────────────────────────────────────────────
@@ -30,10 +31,11 @@ MODEL_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "models", "binary.pkl"
 )
 
-# Chỉ đếm SYN để phân biệt SYN Flood với luồng
-# tải dữ liệu hợp lệ (apt-get, PyPI...) vốn có ít SYN nhưng nhiều ACK/DATA
-WINDOW_SECONDS    = 5
-SYN_THRESHOLD     = 200
+# Multi-vector Rate Limiting (Sliding Window)
+WINDOW_SECONDS     = 5
+SYN_THRESHOLD      = 200    # Bắt SYN Flood
+UDP_ICMP_THRESHOLD = 1000   # Bắt UDP/ICMP Flood
+TOTAL_THRESHOLD    = 3000   # Bắt các loại flood khác (ACK, RST, FIN...)
 
 # Exponential Backoff Ban TTL — IP tái phạm sẽ bị phạt nặng hơn sau mỗi lần
 BAN_TTL = [
@@ -352,8 +354,9 @@ def main():
     print(f"  [+] Local IPs detected: {', '.join(sorted(local_ips))}")
     print(f"  [+] Mọi flow từ các địa chỉ này sẽ bỏ qua (Egress + Alias filter)")
 
-    # Sliding Window: { src_ip: [(timestamp, packet_count), ...] }
-    packet_window = defaultdict(list)
+    # Sliding Window: TTLCache tự động đá key cũ (LRU) khi vượt maxsize
+    # và xóa key hết hạn (ttl=60s), khắc phục lỗi tràn RAM và tránh xóa sạch data.
+    packet_window = TTLCache(maxsize=100_000, ttl=60)
 
     # ── Ready ─────────────────────────────────────────────────────────────────
     print()
@@ -389,38 +392,46 @@ def main():
                 if entry and entry[0] > time.time():
                     continue
 
-                # D. Sliding Window — chỉ đếm SYN để tránh false positive trên
-                #    luồng tải dữ liệu hợp lệ (apt-get, CDN: ít SYN, nhiều ACK/DATA)
+                # D. Multi-vector Rate Limiting (Sliding Window)
+                #    3 kênh đếm song song để bắt mọi loại bão (SYN, UDP, ACK, RST...)
                 now = time.time()
 
-                if len(packet_window) > 100_000:
-                    packet_window.clear()
+                syn_count   = flow.bidirectional_syn_packets
+                total_count = flow.bidirectional_packets
+                # NFStream protocol: 1 = ICMP, 17 = UDP
+                udp_icmp_count = total_count if flow.protocol in (1, 17) else 0
 
-                syn_count = flow.bidirectional_syn_packets  # Chỉ đếm SYN
-                if syn_count > 0:
-                    window   = packet_window[flow.src_ip]
-                    window.append((now, syn_count))
-                    filtered = [(t, p) for t, p in window if now - t <= WINDOW_SECONDS]
+                if flow.src_ip not in packet_window:
+                    packet_window[flow.src_ip] = []
 
-                    if filtered:
-                        packet_window[flow.src_ip] = filtered
-                    else:
+                window = packet_window[flow.src_ip]
+                window.append((now, syn_count, udp_icmp_count, total_count))
+                filtered = [(t, s, u, p) for (t, s, u, p) in window if now - t <= WINDOW_SECONDS]
+
+                if filtered:
+                    packet_window[flow.src_ip] = filtered
+                else:
+                    packet_window.pop(flow.src_ip, None)
+                    continue
+
+                total_syn      = sum(s for _, s, _, _ in filtered)
+                total_udp_icmp = sum(u for _, _, u, _ in filtered)
+                total_pkts     = sum(p for _, _, _, p in filtered)
+
+                if (total_syn > SYN_THRESHOLD or 
+                    total_udp_icmp > UDP_ICMP_THRESHOLD or 
+                    total_pkts > TOTAL_THRESHOLD):
+                    if not is_whitelisted(flow.src_ip):
+                        count, ttl_secs = ban_ip_backoff(
+                            flow.src_ip, blacklist_map, ban_registry, bpf_lock
+                        )
                         packet_window.pop(flow.src_ip, None)
-
-                    total_syn = sum(p for _, p in filtered)
-
-                    if total_syn > SYN_THRESHOLD:
-                        if not is_whitelisted(flow.src_ip):
-                            count, ttl_secs = ban_ip_backoff(
-                                flow.src_ip, blacklist_map, ban_registry, bpf_lock
-                            )
-                            packet_window.pop(flow.src_ip, None)
-                            ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
-                            print(
-                                f"  [BLOCK] {flow.src_ip:<20} "
-                                f"DDoS DETECTED  │ ban {ttl_label:<4} │ offense #{count}"
-                            )
-                        continue
+                        ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
+                        print(
+                            f"  [BLOCK] {flow.src_ip:<20} "
+                            f"DDoS DETECTED  │ ban {ttl_label:<4} │ offense #{count}"
+                        )
+                    continue
 
                 # E. ML Inference — chỉ chạy với flow >= 10 packet để loại
                 #    single-packet scanner/health-check (giảm false positive)
