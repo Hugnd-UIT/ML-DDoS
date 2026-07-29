@@ -11,20 +11,16 @@ import socket
 import struct
 import fcntl
 import argparse
-import threading
-import ipaddress
-import requests
-import ctypes
 import warnings
 import joblib
 import numpy as np
 import xgboost as xgb
-from collections import defaultdict
-from bcc import BPF
 from cachetools import TTLCache
 from nfstream import NFStreamer
 
-# ── Cấu hình hệ thống ──────────────────────────────────────────────────
+from enforcer import XDPEnforcer
+
+# ── Cấu hình hệ thống ──────────────────────────────────────────────────────────
 
 # Đường dẫn tới model XGBoost (phân loại nhị phân: DDoS / Benign)
 MODEL_FILE = os.path.join(
@@ -36,13 +32,6 @@ WINDOW_SECONDS     = 5
 SYN_THRESHOLD      = 200    # Bắt SYN Flood
 UDP_ICMP_THRESHOLD = 1000   # Bắt UDP/ICMP Flood
 TOTAL_THRESHOLD    = 3000   # Bắt các loại flood khác (ACK, RST, FIN...)
-
-# Exponential Backoff Ban TTL — IP tái phạm sẽ bị phạt nặng hơn sau mỗi lần
-BAN_TTL = [
-    5   * 60,   # Lần 1: 5 phút
-    60  * 60,   # Lần 2: 1 tiếng
-    24  * 3600, # Lần 3+: 24 tiếng
-]
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -101,118 +90,8 @@ def get_all_local_ips(ifname):
     return ips
 
 
-def ip_to_int(ip_str):
-    """Chuyển IPv4 string → unsigned 32-bit integer (Network Byte Order) cho eBPF map."""
-    return struct.unpack("I", socket.inet_aton(ip_str))[0]
-
-
-def int_to_ip(ip_int):
-    """Chuyển unsigned 32-bit integer từ eBPF map → IPv4 string."""
-    return socket.inet_ntoa(struct.pack("I", ip_int))
-
-
-def auto_load_gcp_whitelist(bpf_instance):
-    """
-    Fetch danh sách dải IPv4 của Google Cloud (cloud.json + goog.json) từ endpoint
-    public của Google, bổ sung RFC 1918 private ranges và các dải tĩnh bắt buộc,
-    rồi nạp tất cả xuống eBPF LPM_TRIE map.
-
-    Trả về list các IPv4Network để Control Plane Python tự kiểm tra trước
-    khi ra lệnh ban — tránh tình trạng AI phán nhầm và ban nhầm IP hợp lệ.
-    """
-    _banner("ĐỒNG BỘ WHITELIST")
-    whitelist_map = bpf_instance.get_table("whitelist_map")
-
-    cidrs = []
-
-    # Fetch GCP Cloud IP Ranges (các dải IP của GCP infrastructure)
-    try:
-        resp = requests.get("https://www.gstatic.com/ipranges/cloud.json", timeout=10)
-        cloud_prefixes = [
-            p["ipv4Prefix"]
-            for p in resp.json().get("prefixes", [])
-            if "ipv4Prefix" in p
-        ]
-        cidrs += cloud_prefixes
-        print(f"  [+] GCP cloud.json: {len(cloud_prefixes)} prefix.")
-    except Exception as exc:
-        print(f"  [!] Không tải được cloud.json: {exc}")
-    try:
-        resp = requests.get("https://www.gstatic.com/ipranges/goog.json", timeout=10)
-        goog_prefixes = [
-            p["ipv4Prefix"]
-            for p in resp.json().get("prefixes", [])
-            if "ipv4Prefix" in p
-        ]
-        cidrs += goog_prefixes
-        print(f"  [+] GCP goog.json:  {len(goog_prefixes)} prefix.")
-    except Exception as exc:
-        print(f"  [!] Không tải được goog.json: {exc}")
-
-    try:
-        resp = requests.get("https://api.fastly.com/public-ip-list", timeout=10)
-        fastly_data = resp.json()
-        fastly_prefixes = fastly_data.get("addresses", []) + fastly_data.get("ipv4_addresses", [])
-        cidrs += fastly_prefixes
-        print(f"  [+] Fastly CDN:     {len(fastly_prefixes)} prefix.")
-    except Exception as exc:
-        cidrs += ["151.101.0.0/16"]
-        print(f"  [!] Không tải được Fastly IP list: {exc}. Dùng fallback 151.101.0.0/16.")
-
-    cidrs += [
-        "35.235.240.0/20",   # GCP IAP — Identity-Aware Proxy (SSH Console)
-        "169.254.169.254/32" # GCP Metadata Server (ops-agent, auth)
-    ]
-
-    cidrs = list(dict.fromkeys(cidrs))
-
-    print(f"  [*] Nạp {len(cidrs)} dải CIDR vào eBPF Whitelist (LPM Trie)...")
-    py_whitelist, ok = [], 0
-    for cidr in cidrs:
-        try:
-            net = ipaddress.IPv4Network(cidr, strict=False)
-            key = whitelist_map.Key(net.prefixlen, ip_to_int(str(net.network_address)))
-            whitelist_map[key] = whitelist_map.Leaf(1)
-            py_whitelist.append(net)
-            ok += 1
-        except Exception:
-            pass  # Bỏ qua IPv6 prefix hoặc entry không hợp lệ
-
-    print(f"  [+] Nạp thành công {ok} quy tắc xuống Data Plane.")
-    return py_whitelist
-
-
-def memory_manager(blacklist_map, ban_registry, lock):
-    """Daemon: mỗi 5s quét ban_registry, gỡ eBPF entry khi TTL hết hạn."""
-    while True:
-        try:
-            time.sleep(5)
-            now = time.time()
-
-            # Scan ngoài lock (read-only) → tránh block Main Thread
-            expired_ips = [
-                ip for ip, expire_ts in list(ban_registry.items())
-                if expire_ts <= now
-            ]
-
-            # Xóa dưới lock — brief critical section
-            with lock:
-                for ip in expired_ips:
-                    expire_ts = ban_registry.get(ip)
-                    if expire_ts and expire_ts <= now:   # double-check race condition
-                        del ban_registry[ip]
-                        try:
-                            del blacklist_map[blacklist_map.Key(ip_to_int(ip))]
-                        except Exception:
-                            pass
-        except Exception as exc:
-            print(f"  [-] Memory Manager error: {exc}")
-
-
 def load_ai_model():
-    """
-    Tải XGBClassifier từ binary.pkl bằng joblib.
-    """
+    """Tải XGBClassifier từ binary.pkl bằng joblib."""
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -254,21 +133,6 @@ def extract_features(flow):
     ]], dtype=np.float32)
 
 
-def ban_ip_backoff(src_ip, blacklist_map, ban_registry, offense_history, lock):
-    """
-    Ban IP với TTL tăng lũy tiến (Exponential Backoff): 5 phút → 1 tiếng → 24 tiếng.
-    Lịch sử vi phạm (offense_history) lưu 24h, hoàn toàn độc lập với trạng thái ban hiện tại.
-    """
-    with lock:
-        count = offense_history.get(src_ip, 0) + 1
-        offense_history[src_ip] = count
-        
-        ttl_secs  = BAN_TTL[min(count - 1, len(BAN_TTL) - 1)]
-        ban_registry[src_ip] = time.time() + ttl_secs
-        blacklist_map[blacklist_map.Key(ip_to_int(src_ip))] = blacklist_map.Leaf(1)
-    return count, ttl_secs
-
-
 def _banner(title, width=65):
     """In banner phân đoạn ra terminal."""
     print(f"\n  {'─' * width}")
@@ -288,59 +152,18 @@ def main():
     print("  ╚" + "═" * 63 + "╝")
     print()
 
-    # ── 1. Compile & Attach XDP ───────────────────────────────────────────────
+    # ── 1. Khởi tạo Data Plane (eBPF/XDP) ────────────────────────────────────
     _banner("1/4  KHỞI TẠO DATA PLANE (eBPF/XDP)")
-    print(f"  [*] Biên dịch: {XDP_FILE}")
-    try:
-        # Redirect fd2 (stderr) sang /dev/null trong lúc BCC gọi clang compile
-        # để ẩn các warning không liên quan về macro redefinition của kernel headers
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        saved_stderr = os.dup(2)
-        os.dup2(devnull_fd, 2)
-        try:
-            b  = BPF(src_file=XDP_FILE)
-        finally:
-            os.dup2(saved_stderr, 2)
-            os.close(saved_stderr)
-            os.close(devnull_fd)
-        fn = b.load_func("xdp_prog", BPF.XDP)
-        try:
-            b.attach_xdp(dev=INTERFACE, fn=fn, flags=0)
-            print(f"  [+] XDP attached → Native (Driver) Mode  [{INTERFACE}]")
-        except Exception:
-            print(f"  [~] Native Mode không khả dụng, thử Generic (SKB) Mode...")
-            b.attach_xdp(dev=INTERFACE, fn=fn, flags=2)
-            print(f"  [+] XDP attached → Generic (SKB) Mode  [{INTERFACE}]")
-    except Exception as exc:
-        print(f"  [✗] FATAL: Không thể tải eBPF — {exc}")
-        print(f"  [✗] Hãy chạy bằng sudo.")
+    enforcer = XDPEnforcer(INTERFACE, XDP_FILE)
+    if not enforcer.load_and_attach():
         return
 
     # ── 2. Whitelist ──────────────────────────────────────────────────────────
-    py_whitelist = auto_load_gcp_whitelist(b)
-    blacklist_map = b.get_table("blacklist_map")
+    _banner("ĐỒNG BỘ WHITELIST")
+    enforcer.load_whitelist()
 
-    def is_whitelisted(ip_str):
-        """Trả về True nếu ip_str khớp với bất kỳ CIDR nào trong whitelist."""
-        try:
-            addr = ipaddress.IPv4Address(ip_str)
-            return any(addr in net for net in py_whitelist)
-        except Exception:
-            return False
-
-    # ── 3. Memory Manager ───────────────────────────────────────────────
-    _banner("2/4  KHỞI TẠO BỘ NHớ USER-SPACE")
-    # ban_registry: { src_ip: expire_timestamp } -> quản lý án phạt hiện tại
-    ban_registry = {}
-    # offense_history: { src_ip: count } -> ghi nhớ "tiền án" trong 24h bằng TTLCache
-    offense_history = TTLCache(maxsize=100_000, ttl=86400)
-    
-    bpf_lock = threading.Lock()
-    threading.Thread(
-        target=memory_manager,
-        args=(blacklist_map, ban_registry, bpf_lock),
-        daemon=True
-    ).start()
+    # ── 3. Memory Manager & State ─────────────────────────────────────────────
+    _banner("2/4  KHỞI TẠO BỘ NHỚ USER-SPACE")
     print(f"  [+] Offense History khởi tạo (TTLCache 24h)")
     print(f"  [+] Memory Manager daemon started")
 
@@ -348,14 +171,13 @@ def main():
     _banner("3/4  KHỞI TẠO AI ENGINE (XGBoost)")
     ai_model = load_ai_model()
 
-    # ── 5. Thu thập tất cả IP của máy chủ (Egress Filter) ──────────────────
+    # ── 5. Egress Filter ──────────────────────────────────────────────────────
     _banner("4/4  CẤU HÌNH EGRESS FILTER")
     local_ips = get_all_local_ips(INTERFACE)
     print(f"  [+] Local IPs detected: {', '.join(sorted(local_ips))}")
     print(f"  [+] Mọi flow từ các địa chỉ này sẽ bỏ qua (Egress + Alias filter)")
 
     # Sliding Window: TTLCache tự động đá key cũ (LRU) khi vượt maxsize
-    # và xóa key hết hạn (ttl=60s), khắc phục lỗi tràn RAM và tránh xóa sạch data.
     packet_window = TTLCache(maxsize=100_000, ttl=60)
 
     # ── Ready ─────────────────────────────────────────────────────────────────
@@ -383,13 +205,11 @@ def main():
                     continue
 
                 # B. Bỏ qua Egress: flow từ bất kỳ IP nào của chính máy chủ
-                #    (primary IP, alias IP, loopback)
                 if flow.src_ip in local_ips:
                     continue
 
                 # C. Bỏ qua IP đang trong thời gian bị phạt
-                expire_ts = ban_registry.get(flow.src_ip)
-                if expire_ts and expire_ts > time.time():
+                if enforcer.is_banned(flow.src_ip):
                     continue
 
                 # D. Multi-vector Rate Limiting (Sliding Window)
@@ -418,13 +238,11 @@ def main():
                 total_udp_icmp = sum(u for _, _, u, _ in filtered)
                 total_pkts     = sum(p for _, _, _, p in filtered)
 
-                if (total_syn > SYN_THRESHOLD or 
-                    total_udp_icmp > UDP_ICMP_THRESHOLD or 
-                    total_pkts > TOTAL_THRESHOLD):
-                    if not is_whitelisted(flow.src_ip):
-                        count, ttl_secs = ban_ip_backoff(
-                            flow.src_ip, blacklist_map, ban_registry, offense_history, bpf_lock
-                        )
+                if (total_syn > SYN_THRESHOLD or
+                        total_udp_icmp > UDP_ICMP_THRESHOLD or
+                        total_pkts > TOTAL_THRESHOLD):
+                    if not enforcer.is_whitelisted(flow.src_ip):
+                        count, ttl_secs = enforcer.block_ip(flow.src_ip)
                         packet_window.pop(flow.src_ip, None)
                         ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
                         print(
@@ -443,10 +261,8 @@ def main():
                 pred_val   = int(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else int(prediction)
 
                 if pred_val >= 1:
-                    if not is_whitelisted(flow.src_ip):
-                        count, ttl_secs = ban_ip_backoff(
-                            flow.src_ip, blacklist_map, ban_registry, offense_history, bpf_lock
-                        )
+                    if not enforcer.is_whitelisted(flow.src_ip):
+                        count, ttl_secs = enforcer.block_ip(flow.src_ip)
                         ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
                         print(
                             f"  [BLOCK] {flow.src_ip:<20} "
@@ -463,14 +279,7 @@ def main():
         print(f"\n  [✗] Lỗi không phục hồi được: {exc}")
     finally:
         # Luôn gỡ XDP khi thoát — không để lại filter trên interface
-        try:
-            try:
-                b.remove_xdp(INTERFACE, flags=0)
-            except Exception:
-                b.remove_xdp(INTERFACE, flags=2)
-            print("  [+] XDP filter đã gỡ khỏi interface an toàn.\n")
-        except Exception:
-            pass
+        enforcer.detach()
 
 
 if __name__ == "__main__":
