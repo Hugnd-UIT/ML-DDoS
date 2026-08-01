@@ -118,9 +118,55 @@ class XDPEnforcer:
 
     # ── Whitelist ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _resolve_canonical_ips() -> list:
+        """
+        Resolve DNS động các hostname chính thức của Canonical/Ubuntu.
+        Vì Canonical dùng DNS load-balancing (không có API JSON như GCP),
+        cách chuẩn nhất là resolve hostname → lấy IP hiện tại tại thời điểm khởi động.
+
+        Trả về list các CIDR string "/32" (host route) + fallback CIDR tĩnh.
+        """
+        # Các hostname chính thức cần resolve
+        # — apt update/install, security patches, unattended-upgrades, snap, motd
+        canonical_hostnames = [
+            "archive.ubuntu.com",
+            "security.ubuntu.com",
+            "ports.ubuntu.com",
+            "changelogs.ubuntu.com",
+            "motd.ubuntu.com",
+            "api.snapcraft.io",
+            "canonical.com",
+            "launchpad.net",
+        ]
+
+        resolved = []
+        for hostname in canonical_hostnames:
+            try:
+                # getaddrinfo trả về list các (family, type, proto, canonname, sockaddr)
+                # sockaddr = (ip, port) với IPv4
+                infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
+                ips = list({info[4][0] for info in infos})  # deduplicate
+                for ip in ips:
+                    resolved.append(f"{ip}/32")
+                print(f"  [+] Canonical DNS [{hostname}]: {', '.join(ips)}")
+            except Exception as exc:
+                print(f"  [!] Không resolve được {hostname}: {exc}")
+
+        # CIDR tĩnh fallback: dải IP của Canonical theo RIPE database (91.189.88.0/21)
+        # Luôn thêm dù DNS đã resolve, để bắt các IP Canonical chưa có trong hostname list
+        canonical_static_cidrs = [
+            "91.189.88.0/21",   # Canonical Group Limited — RIPE: CANONICAL-CORE
+        ]
+        resolved += canonical_static_cidrs
+        print(f"  [+] Canonical static CIDR fallback: {', '.join(canonical_static_cidrs)}")
+
+        return resolved
+
     def load_whitelist(self) -> list:
         """
-        Fetch GCP cloud.json + goog.json + Fastly, nạp xuống eBPF LPM_TRIE map.
+        Fetch GCP cloud.json + goog.json + Fastly + Canonical (DNS resolve),
+        nạp xuống eBPF LPM_TRIE map.
         Trả về list[IPv4Network].
         """
         cidrs = []
@@ -160,6 +206,10 @@ class XDPEnforcer:
             cidrs += ["151.101.0.0/16"]
             print(f"  [!] Không tải được Fastly IP list: {exc}. Dùng fallback 151.101.0.0/16.")
 
+        # Canonical/Ubuntu — resolve DNS động tại thời điểm khởi động
+        canonical_cidrs = self._resolve_canonical_ips()
+        cidrs += canonical_cidrs
+
         cidrs += [
             "35.235.240.0/20",    # GCP IAP — Identity-Aware Proxy (SSH Console)
             "169.254.169.254/32"  # GCP Metadata Server (ops-agent, auth)
@@ -181,6 +231,7 @@ class XDPEnforcer:
 
         print(f"  [+] Nạp thành công {ok} quy tắc xuống Data Plane.")
         return self.py_whitelist
+
 
     def is_whitelisted(self, ip_str: str) -> bool:
         """Trả về True nếu ip_str khớp với bất kỳ CIDR nào trong whitelist."""
