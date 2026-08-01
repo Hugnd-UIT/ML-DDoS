@@ -143,20 +143,16 @@ class XDPEnforcer:
         resolved = []
         for hostname in canonical_hostnames:
             try:
-                # getaddrinfo trả về list các (family, type, proto, canonname, sockaddr)
-                # sockaddr = (ip, port) với IPv4
                 infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
-                ips = list({info[4][0] for info in infos})  # deduplicate
+                ips = list({info[4][0] for info in infos})
                 for ip in ips:
                     resolved.append(f"{ip}/32")
                 print(f"  [+] Canonical DNS [{hostname}]: {', '.join(ips)}")
             except Exception as exc:
                 print(f"  [!] Không resolve được {hostname}: {exc}")
 
-        # CIDR tĩnh fallback: dải IP của Canonical theo RIPE database (91.189.88.0/21)
-        # Luôn thêm dù DNS đã resolve, để bắt các IP Canonical chưa có trong hostname list
         canonical_static_cidrs = [
-            "91.189.88.0/21",   # Canonical Group Limited — RIPE: CANONICAL-CORE
+            "91.189.88.0/21",
         ]
         resolved += canonical_static_cidrs
         print(f"  [+] Canonical static CIDR fallback: {', '.join(canonical_static_cidrs)}")

@@ -132,12 +132,10 @@ def extract_features(flow):
         18 Init_Win_bytes_forward — cửa sổ TCP khởi tạo chiều → (fallback=0)
     """
     # ── Thời gian luồng ─────────────────────────────────────────────────────────
-    # NFStream: bidirectional_duration_ms (ms) → CIC yêu cầu microsecond (µs)
     duration_us = float(flow.bidirectional_duration_ms) * 1000.0
-    # Dùng giây để tính rates; max(..., 1e-9) chặn tuyệt đối chia-0
     duration_s  = max(float(flow.bidirectional_duration_ms) / 1000.0, 1e-9)
 
-    # ── Tốc độ (Rates) ── phải TỰ TÍNH vì NFStream không cho sẵn ───────────────
+    # ── Tốc độ (Rates) ───────────────
     flow_bytes_per_s   = float(flow.bidirectional_bytes)   / duration_s
     flow_packets_per_s = float(flow.bidirectional_packets) / duration_s
 
@@ -147,7 +145,7 @@ def extract_features(flow):
     fwd_bytes = float(flow.src2dst_bytes)
     bwd_bytes = float(flow.dst2src_bytes)
 
-    # ── Down/Up Ratio ── TỰ TÍNH; tránh chia-0 khi fwd_pkts == 0 ───────────────
+    # ── Down/Up Ratio ───────────────
     down_up_ratio = bwd_pkts / fwd_pkts if fwd_pkts > 0 else 0.0
 
     # ── Packet Length Stats ──────────────────────────────────────────────────────
@@ -156,14 +154,10 @@ def extract_features(flow):
     fwd_len_mean = float(flow.src2dst_mean_ps)
     bwd_len_mean = float(flow.dst2src_mean_ps)
 
-    # ── IAT (Inter-Arrival Time) ── ước lượng từ thời gian & số gói ─────────────
-    # NFStream không xuất IAT statistics trực tiếp → ước lượng:
-    # IAT Mean ≈ tổng thời gian / (số gói - 1); nếu chỉ 1 gói thì IAT = 0
+    # ── IAT (Inter-Arrival Time) ─────────────
     total_pkts = int(flow.bidirectional_packets)
     iat_mean_us = (duration_us / (total_pkts - 1)) if total_pkts > 1 else 0.0
-    iat_std_us  = 0.0   # NFStream không có, placeholder an toàn
-
-    # Fwd IAT Total = thời gian chiều Fwd tính bằng microsecond
+    iat_std_us  = 0.0
     try:
         fwd_iat_total_us = float(flow.src2dst_duration_ms) * 1000.0
     except AttributeError:
@@ -177,10 +171,10 @@ def extract_features(flow):
     try:
         init_win_fwd = float(flow.src2dst_init_win)
     except AttributeError:
-        init_win_fwd = 0.0   # fallback: NFStream không có attribute này
+        init_win_fwd = 0.0
 
     # ── Giao thức ────────────────────────────────────────────────────────────────
-    protocol = float(flow.protocol)   # 6=TCP, 17=UDP, 1=ICMP
+    protocol = float(flow.protocol)
 
     # ── Ghép vector đúng thứ tự FEATURES trong parser.py ────────────────────────
     vec = np.array([[
@@ -205,8 +199,7 @@ def extract_features(flow):
         init_win_fwd,       # 18 Init_Win_bytes_forward
     ]], dtype=np.float32)
 
-    # ── Vệ sinh cuối: chặn inf / NaN trước khi đưa vào XGBoost ─────────────────
-    # posinf=0 và neginf=0: đặt về 0 thay vì max float để tránh khuếch đại bất thường
+
     vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
 
     return vec
