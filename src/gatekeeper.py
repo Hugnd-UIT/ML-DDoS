@@ -107,30 +107,111 @@ def load_ai_model():
 
 def extract_features(flow):
     """
-    Trích xuất 19 đặc trưng thống kê luồng chuẩn CIC-DDoS2019 từ NFStream flow.
-    Yêu cầu NFStreamer khởi tạo với `statistical_analysis=True`.
+    Trích xuất 19 đặc trưng chuẩn CIC-DDoS2019 từ NFStream flow object,
+    khớp 100% thứ tự và đơn vị với FEATURES trong parser.py.
+
+    Thứ tự cột (parser.py FEATURES list):
+        0  Flow Duration          — thời gian luồng (micro-giây)
+        1  Flow Bytes/s           — tốc độ byte (byte/giây) ← TỰ TÍNH
+        2  Flow Packets/s         — tốc độ gói (gói/giây)  ← TỰ TÍNH
+        3  Total Fwd Packets      — tổng gói chiều client→server
+        4  Total Backward Packets — tổng gói chiều server→client
+        5  Down/Up Ratio          — tỷ lệ Bwd/Fwd packets  ← TỰ TÍNH
+        6  Total Length of Fwd Packets — tổng bytes chiều client→server
+        7  Total Length of Bwd Packets — tổng bytes chiều server→client
+        8  Fwd Packet Length Max  — pkt size lớn nhất chiều →
+        9  Fwd Packet Length Min  — pkt size nhỏ nhất chiều →
+        10 Fwd Packet Length Mean — pkt size trung bình chiều →
+        11 Bwd Packet Length Mean — pkt size trung bình chiều ←
+        12 Flow IAT Mean          — trung bình khoảng cách thời gian giữa gói ← TỰ TÍNH
+        13 Flow IAT Std           — độ lệch chuẩn IAT (ước lượng = 0)
+        14 Fwd IAT Total          — tổng IAT chiều → (µs) ← TỰ TÍNH
+        15 Protocol               — giao thức (6=TCP, 17=UDP, 1=ICMP...)
+        16 SYN Flag Count         — số gói SYN
+        17 ACK Flag Count         — số gói ACK
+        18 Init_Win_bytes_forward — cửa sổ TCP khởi tạo chiều → (fallback=0)
     """
-    return np.array([[
-        flow.bidirectional_duration_ms,  # 00 — tổng thời gian luồng (ms)
-        flow.bidirectional_packets,      # 01 — tổng packet hai chiều
-        flow.bidirectional_bytes,        # 02 — tổng bytes hai chiều
-        flow.src2dst_packets,            # 03 — packet chiều client→server
-        flow.src2dst_bytes,              # 04 — bytes chiều client→server
-        flow.dst2src_packets,            # 05 — packet chiều server→client
-        flow.dst2src_bytes,              # 06 — bytes chiều server→client
-        flow.bidirectional_min_ps,       # 07 — packet size nhỏ nhất
-        flow.bidirectional_mean_ps,      # 08 — packet size trung bình
-        flow.bidirectional_stddev_ps,    # 09 — độ lệch chuẩn packet size
-        flow.bidirectional_max_ps,       # 10 — packet size lớn nhất
-        flow.src2dst_min_ps,             # 11 — pkt size nhỏ nhất chiều →
-        flow.src2dst_mean_ps,            # 12 — pkt size TB chiều →
-        flow.src2dst_max_ps,             # 13 — pkt size lớn nhất chiều →
-        flow.dst2src_min_ps,             # 14 — pkt size nhỏ nhất chiều ←
-        flow.dst2src_mean_ps,            # 15 — pkt size TB chiều ←
-        flow.dst2src_max_ps,             # 16 — pkt size lớn nhất chiều ←
-        flow.bidirectional_syn_packets,  # 17 — tổng SYN packet
-        flow.bidirectional_ack_packets,  # 18 — tổng ACK packet
+    # ── Thời gian luồng ─────────────────────────────────────────────────────────
+    # NFStream: bidirectional_duration_ms (ms) → CIC yêu cầu microsecond (µs)
+    duration_us = float(flow.bidirectional_duration_ms) * 1000.0
+    # Dùng giây để tính rates; max(..., 1e-9) chặn tuyệt đối chia-0
+    duration_s  = max(float(flow.bidirectional_duration_ms) / 1000.0, 1e-9)
+
+    # ── Tốc độ (Rates) ── phải TỰ TÍNH vì NFStream không cho sẵn ───────────────
+    flow_bytes_per_s   = float(flow.bidirectional_bytes)   / duration_s
+    flow_packets_per_s = float(flow.bidirectional_packets) / duration_s
+
+    # ── Tổng Fwd / Bwd ───────────────────────────────────────────────────────────
+    fwd_pkts  = float(flow.src2dst_packets)
+    bwd_pkts  = float(flow.dst2src_packets)
+    fwd_bytes = float(flow.src2dst_bytes)
+    bwd_bytes = float(flow.dst2src_bytes)
+
+    # ── Down/Up Ratio ── TỰ TÍNH; tránh chia-0 khi fwd_pkts == 0 ───────────────
+    down_up_ratio = bwd_pkts / fwd_pkts if fwd_pkts > 0 else 0.0
+
+    # ── Packet Length Stats ──────────────────────────────────────────────────────
+    fwd_len_max  = float(flow.src2dst_max_ps)
+    fwd_len_min  = float(flow.src2dst_min_ps)
+    fwd_len_mean = float(flow.src2dst_mean_ps)
+    bwd_len_mean = float(flow.dst2src_mean_ps)
+
+    # ── IAT (Inter-Arrival Time) ── ước lượng từ thời gian & số gói ─────────────
+    # NFStream không xuất IAT statistics trực tiếp → ước lượng:
+    # IAT Mean ≈ tổng thời gian / (số gói - 1); nếu chỉ 1 gói thì IAT = 0
+    total_pkts = int(flow.bidirectional_packets)
+    iat_mean_us = (duration_us / (total_pkts - 1)) if total_pkts > 1 else 0.0
+    iat_std_us  = 0.0   # NFStream không có, placeholder an toàn
+
+    # Fwd IAT Total = thời gian chiều Fwd tính bằng microsecond
+    try:
+        fwd_iat_total_us = float(flow.src2dst_duration_ms) * 1000.0
+    except AttributeError:
+        fwd_iat_total_us = duration_us   # fallback an toàn
+
+    # ── Cờ TCP ───────────────────────────────────────────────────────────────────
+    syn_count = float(flow.bidirectional_syn_packets)
+    ack_count = float(flow.bidirectional_ack_packets)
+
+    # ── Init_Win_bytes_forward ────────────────────────────────────────────────────
+    try:
+        init_win_fwd = float(flow.src2dst_init_win)
+    except AttributeError:
+        init_win_fwd = 0.0   # fallback: NFStream không có attribute này
+
+    # ── Giao thức ────────────────────────────────────────────────────────────────
+    protocol = float(flow.protocol)   # 6=TCP, 17=UDP, 1=ICMP
+
+    # ── Ghép vector đúng thứ tự FEATURES trong parser.py ────────────────────────
+    vec = np.array([[
+        duration_us,        # 0  Flow Duration
+        flow_bytes_per_s,   # 1  Flow Bytes/s
+        flow_packets_per_s, # 2  Flow Packets/s
+        fwd_pkts,           # 3  Total Fwd Packets
+        bwd_pkts,           # 4  Total Backward Packets
+        down_up_ratio,      # 5  Down/Up Ratio
+        fwd_bytes,          # 6  Total Length of Fwd Packets
+        bwd_bytes,          # 7  Total Length of Bwd Packets
+        fwd_len_max,        # 8  Fwd Packet Length Max
+        fwd_len_min,        # 9  Fwd Packet Length Min
+        fwd_len_mean,       # 10 Fwd Packet Length Mean
+        bwd_len_mean,       # 11 Bwd Packet Length Mean
+        iat_mean_us,        # 12 Flow IAT Mean
+        iat_std_us,         # 13 Flow IAT Std
+        fwd_iat_total_us,   # 14 Fwd IAT Total
+        protocol,           # 15 Protocol
+        syn_count,          # 16 SYN Flag Count
+        ack_count,          # 17 ACK Flag Count
+        init_win_fwd,       # 18 Init_Win_bytes_forward
     ]], dtype=np.float32)
+
+    # ── Vệ sinh cuối: chặn inf / NaN trước khi đưa vào XGBoost ─────────────────
+    # posinf=0 và neginf=0: đặt về 0 thay vì max float để tránh khuếch đại bất thường
+    vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return vec
+
+
 
 
 def _banner(title, width=65):
