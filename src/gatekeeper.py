@@ -1,360 +1,893 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         GATEKEEPER IPS — HYBRID AI + eBPF/XDP CONTROL PLANE      ║
-║  Phát hiện DDoS bằng XGBoost + Thi hành án bằng eBPF/XDP         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
+import argparse
+import fcntl
 import os
-import time
 import socket
 import struct
-import fcntl
-import argparse
+import time
 import warnings
+
 import joblib
 import numpy as np
 import xgboost as xgb
+
 from cachetools import TTLCache
 from nfstream import NFStreamer
 
-from enforcer import XDPEnforcer
+from enforcer import XDPEnforcer, AttackSignature
 
-# ── Cấu hình hệ thống ──────────────────────────────────────────────────────────
 
-# Đường dẫn tới model XGBoost (phân loại nhị phân: DDoS / Benign)
+# Map IANA protocol numbers to readable protocol names
+PROTO_NAMES = {
+    1: "ICMP",
+    6: "TCP",
+    17: "UDP"
+}
+
+
+# Convert a protocol number into a readable name
+def proto_name(proto_num):
+    return PROTO_NAMES.get(
+        int(proto_num),
+        str(proto_num)
+    )
+
+
+# Set the path to the binary XGBoost model
 MODEL_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "models", "binary.pkl"
+    os.path.dirname(
+        os.path.abspath(__file__)
+    ),
+    "..",
+    "models",
+    "binary.pkl"
 )
 
-# Multi-vector Rate Limiting (Sliding Window)
-WINDOW_SECONDS     = 5
-SYN_THRESHOLD      = 200    # Bắt SYN Flood
-UDP_ICMP_THRESHOLD = 1000   # Bắt UDP/ICMP Flood
-TOTAL_THRESHOLD    = 3000   # Bắt các loại flood khác (ACK, RST, FIN...)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# Configure the multi-vector sliding window
+WINDOW_SECONDS = 5
+
+SYN_THRESHOLD = 200
+
+UDP_ICMP_THRESHOLD = 1000
+
+TOTAL_THRESHOLD = 3000
 
 
+# Parse command-line arguments
 def parse_args():
-    """Phân tích tham số dòng lệnh."""
     parser = argparse.ArgumentParser(
-        description="Gatekeeper IPS — Hybrid AI XGBoost + eBPF/XDP",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description=(
+            "Gatekeeper IPS — "
+            "Hybrid AI XGBoost + eBPF/XDP"
+        ),
+        formatter_class=(
+            argparse.RawDescriptionHelpFormatter
+        )
     )
+
+    # Define the protected network interface
     parser.add_argument(
-        "-i", "--interface",
+        "-i",
+        "--interface",
         required=True,
         metavar="IFACE",
-        help="Interface mạng cần bảo vệ (vd: ens4, eth0)"
+        help=(
+            "Network interface to protect "
+            "for example ens4 or eth0"
+        )
     )
+
     return parser.parse_args()
 
 
+# Get all IPv4 addresses assigned to the interface
 def get_all_local_ips(ifname):
-    """
-    Trả về tập hợp tất cả địa chỉ IPv4 gắn với interface `ifname`.
-    Dùng để lọc Egress traffic: bỏ qua mọi flow đến từ bất kỳ IP nào của chính máy chủ.
-    """
     import subprocess
+
+    # Store detected local addresses
     ips = set()
+
+    # Try to detect addresses using the ip command
     try:
         result = subprocess.run(
-            ["ip", "-4", "addr", "show", ifname],
-            capture_output=True, text=True, timeout=3
+            [
+                "ip",
+                "-4",
+                "addr",
+                "show",
+                ifname
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3
         )
+
+        # Parse IPv4 addresses from command output
         for line in result.stdout.splitlines():
             line = line.strip()
+
             if line.startswith("inet "):
-                ip = line.split()[1].split("/")[0]
+                ip = line.split()[1]
+                ip = ip.split("/")[0]
+
                 ips.add(ip)
+
     except Exception:
         pass
+
+    # Use ioctl as a fallback when ip command fails
     if not ips:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock = socket.socket(
+                socket.AF_INET,
+                socket.SOCK_DGRAM
+            )
+
             try:
-                ip = socket.inet_ntoa(
-                    fcntl.ioctl(
-                        s.fileno(),
-                        0x8915,  # SIOCGIFADDR
-                        struct.pack('256s', bytes(ifname[:15], 'utf-8'))
-                    )[20:24]
+                # Request the interface IPv4 address
+                address = fcntl.ioctl(
+                    sock.fileno(),
+                    0x8915,
+                    struct.pack(
+                        "256s",
+                        bytes(
+                            ifname[:15],
+                            "utf-8"
+                        )
+                    )
                 )
+
+                # Convert the returned address to IPv4
+                ip = socket.inet_ntoa(
+                    address[20:24]
+                )
+
                 ips.add(ip)
+
             finally:
-                s.close()
+                # Close the fallback socket
+                sock.close()
+
         except Exception:
             pass
+
+    # Always ignore localhost traffic
     ips.add("127.0.0.1")
+
     return ips
 
 
+# Load the trained XGBoost model
 def load_ai_model():
-    """Tải XGBClassifier từ binary.pkl bằng joblib."""
     try:
+        # Suppress model loading warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = joblib.load(MODEL_FILE)
-        print(f"  [+] Model loaded: {type(model).__name__}  ←  {MODEL_FILE}")
+
+            model = joblib.load(
+                MODEL_FILE
+            )
+
+        # Show the loaded model information
+        print(
+            f"  [+] Model loaded: "
+            f"{type(model).__name__}"
+        )
+
+        print(
+            f"      Path: {MODEL_FILE}"
+        )
+
         return model
+
     except Exception as exc:
-        print(f"  [✗] Không tải được model: {exc}")
-        print(f"  [✗] Cần có file model thực để hoạt động. Thoát hệ thống...")
+        # Stop the system when the model cannot be loaded
+        print(
+            f"  [✗] Unable to load model: {exc}"
+        )
+
+        print(
+            "  [✗] A valid model file is required."
+        )
+
+        print(
+            "  [✗] Exiting system..."
+        )
+
         import sys
+
         sys.exit(1)
 
 
+# Extract the 19 CIC-DDoS2019 features from an NFStream flow
 def extract_features(flow):
-    """
-    Trích xuất 19 đặc trưng chuẩn CIC-DDoS2019 từ NFStream flow object,
-    khớp 100% thứ tự và đơn vị với FEATURES trong parser.py.
+    # Calculate flow duration
+    duration_us = (
+        float(
+            flow.bidirectional_duration_ms
+        )
+        * 1000.0
+    )
 
-    Thứ tự cột (parser.py FEATURES list):
-        0  Flow Duration          — thời gian luồng (micro-giây)
-        1  Flow Bytes/s           — tốc độ byte (byte/giây) ← TỰ TÍNH
-        2  Flow Packets/s         — tốc độ gói (gói/giây)  ← TỰ TÍNH
-        3  Total Fwd Packets      — tổng gói chiều client→server
-        4  Total Backward Packets — tổng gói chiều server→client
-        5  Down/Up Ratio          — tỷ lệ Bwd/Fwd packets  ← TỰ TÍNH
-        6  Total Length of Fwd Packets — tổng bytes chiều client→server
-        7  Total Length of Bwd Packets — tổng bytes chiều server→client
-        8  Fwd Packet Length Max  — pkt size lớn nhất chiều →
-        9  Fwd Packet Length Min  — pkt size nhỏ nhất chiều →
-        10 Fwd Packet Length Mean — pkt size trung bình chiều →
-        11 Bwd Packet Length Mean — pkt size trung bình chiều ←
-        12 Flow IAT Mean          — trung bình khoảng cách thời gian giữa gói ← TỰ TÍNH
-        13 Flow IAT Std           — độ lệch chuẩn IAT (ước lượng = 0)
-        14 Fwd IAT Total          — tổng IAT chiều → (µs) ← TỰ TÍNH
-        15 Protocol               — giao thức (6=TCP, 17=UDP, 1=ICMP...)
-        16 SYN Flag Count         — số gói SYN
-        17 ACK Flag Count         — số gói ACK
-        18 Init_Win_bytes_forward — cửa sổ TCP khởi tạo chiều → (fallback=0)
-    """
-    # ── Thời gian luồng ─────────────────────────────────────────────────────────
-    duration_us = float(flow.bidirectional_duration_ms) * 1000.0
-    duration_s  = max(float(flow.bidirectional_duration_ms) / 1000.0, 1e-9)
+    duration_s = max(
+        float(
+            flow.bidirectional_duration_ms
+        ) / 1000.0,
+        1e-9
+    )
 
-    # ── Tốc độ (Rates) ───────────────
-    flow_bytes_per_s   = float(flow.bidirectional_bytes)   / duration_s
-    flow_packets_per_s = float(flow.bidirectional_packets) / duration_s
 
-    # ── Tổng Fwd / Bwd ───────────────────────────────────────────────────────────
-    fwd_pkts  = float(flow.src2dst_packets)
-    bwd_pkts  = float(flow.dst2src_packets)
-    fwd_bytes = float(flow.src2dst_bytes)
-    bwd_bytes = float(flow.dst2src_bytes)
+    # Calculate traffic rates
+    flow_bytes_per_s = (
+        float(
+            flow.bidirectional_bytes
+        )
+        / duration_s
+    )
 
-    # ── Down/Up Ratio ───────────────
-    down_up_ratio = bwd_pkts / fwd_pkts if fwd_pkts > 0 else 0.0
+    flow_packets_per_s = (
+        float(
+            flow.bidirectional_packets
+        )
+        / duration_s
+    )
 
-    # ── Packet Length Stats ──────────────────────────────────────────────────────
-    fwd_len_max  = float(flow.src2dst_max_ps)
-    fwd_len_min  = float(flow.src2dst_min_ps)
-    fwd_len_mean = float(flow.src2dst_mean_ps)
-    bwd_len_mean = float(flow.dst2src_mean_ps)
 
-    # ── IAT (Inter-Arrival Time) ─────────────
-    total_pkts = int(flow.bidirectional_packets)
-    iat_mean_us = (duration_us / (total_pkts - 1)) if total_pkts > 1 else 0.0
-    iat_std_us  = 0.0
+    # Calculate forward and backward traffic totals
+    fwd_pkts = float(
+        flow.src2dst_packets
+    )
+
+    bwd_pkts = float(
+        flow.dst2src_packets
+    )
+
+    fwd_bytes = float(
+        flow.src2dst_bytes
+    )
+
+    bwd_bytes = float(
+        flow.dst2src_bytes
+    )
+
+
+    # Calculate the backward-to-forward packet ratio
+    if fwd_pkts > 0:
+        down_up_ratio = (
+            bwd_pkts / fwd_pkts
+        )
+    else:
+        down_up_ratio = 0.0
+
+
+    # Extract packet length statistics
+    fwd_len_max = float(
+        flow.src2dst_max_ps
+    )
+
+    fwd_len_min = float(
+        flow.src2dst_min_ps
+    )
+
+    fwd_len_mean = float(
+        flow.src2dst_mean_ps
+    )
+
+    bwd_len_mean = float(
+        flow.dst2src_mean_ps
+    )
+
+
+    # Calculate inter-arrival time statistics
+    total_pkts = int(
+        flow.bidirectional_packets
+    )
+
+    if total_pkts > 1:
+        iat_mean_us = (
+            duration_us
+            / (total_pkts - 1)
+        )
+    else:
+        iat_mean_us = 0.0
+
+    iat_std_us = 0.0
+
+
+    # Calculate forward inter-arrival time
     try:
-        fwd_iat_total_us = float(flow.src2dst_duration_ms) * 1000.0
+        fwd_iat_total_us = (
+            float(
+                flow.src2dst_duration_ms
+            )
+            * 1000.0
+        )
+
     except AttributeError:
-        fwd_iat_total_us = duration_us   # fallback an toàn
+        # Use the full flow duration as fallback
+        fwd_iat_total_us = duration_us
 
-    # ── Cờ TCP ───────────────────────────────────────────────────────────────────
-    syn_count = float(flow.bidirectional_syn_packets)
-    ack_count = float(flow.bidirectional_ack_packets)
 
-    # ── Init_Win_bytes_forward ────────────────────────────────────────────────────
+    # Extract TCP flag statistics
+    syn_count = float(
+        flow.bidirectional_syn_packets
+    )
+
+    ack_count = float(
+        flow.bidirectional_ack_packets
+    )
+
+
+    # Extract the initial forward TCP window size
     try:
-        init_win_fwd = float(flow.src2dst_init_win)
+        init_win_fwd = float(
+            flow.src2dst_init_win
+        )
+
     except AttributeError:
+        # Use zero when NFStream does not provide the field
         init_win_fwd = 0.0
 
-    # ── Giao thức ────────────────────────────────────────────────────────────────
-    protocol = float(flow.protocol)
 
-    # ── Ghép vector đúng thứ tự FEATURES trong parser.py ────────────────────────
-    vec = np.array([[
-        duration_us,        # 0  Flow Duration
-        flow_bytes_per_s,   # 1  Flow Bytes/s
-        flow_packets_per_s, # 2  Flow Packets/s
-        fwd_pkts,           # 3  Total Fwd Packets
-        bwd_pkts,           # 4  Total Backward Packets
-        down_up_ratio,      # 5  Down/Up Ratio
-        fwd_bytes,          # 6  Total Length of Fwd Packets
-        bwd_bytes,          # 7  Total Length of Bwd Packets
-        fwd_len_max,        # 8  Fwd Packet Length Max
-        fwd_len_min,        # 9  Fwd Packet Length Min
-        fwd_len_mean,       # 10 Fwd Packet Length Mean
-        bwd_len_mean,       # 11 Bwd Packet Length Mean
-        iat_mean_us,        # 12 Flow IAT Mean
-        iat_std_us,         # 13 Flow IAT Std
-        fwd_iat_total_us,   # 14 Fwd IAT Total
-        protocol,           # 15 Protocol
-        syn_count,          # 16 SYN Flag Count
-        ack_count,          # 17 ACK Flag Count
-        init_win_fwd,       # 18 Init_Win_bytes_forward
-    ]], dtype=np.float32)
+    # Extract the network protocol number
+    protocol = float(
+        flow.protocol
+    )
 
 
-    vec = np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+    # Build the feature vector in parser.py order
+    features = np.array(
+        [[
+            duration_us,
+            flow_bytes_per_s,
+            flow_packets_per_s,
+            fwd_pkts,
+            bwd_pkts,
+            down_up_ratio,
+            fwd_bytes,
+            bwd_bytes,
+            fwd_len_max,
+            fwd_len_min,
+            fwd_len_mean,
+            bwd_len_mean,
+            iat_mean_us,
+            iat_std_us,
+            fwd_iat_total_us,
+            protocol,
+            syn_count,
+            ack_count,
+            init_win_fwd
+        ]],
+        dtype=np.float32
+    )
 
-    return vec
+
+    # Replace invalid numeric values with zero
+    features = np.nan_to_num(
+        features,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0
+    )
+
+    return features
 
 
+# Print a section banner
+def _banner(
+    title,
+    width=65
+):
+    # Print the top border
+    print(
+        f"\n  {'─' * width}"
+    )
+
+    # Print the section title
+    print(
+        f"  {title}"
+    )
+
+    # Print the bottom border
+    print(
+        f"  {'─' * width}"
+    )
 
 
-def _banner(title, width=65):
-    """In banner phân đoạn ra terminal."""
-    print(f"\n  {'─' * width}")
-    print(f"  {title}")
-    print(f"  {'─' * width}")
-
-
+# Start the Gatekeeper IPS
 def main():
-    args      = parse_args()
-    INTERFACE = args.interface
-    XDP_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xdp_filter.c")
+    # Parse command-line arguments
+    args = parse_args()
+
+    # Get the protected network interface
+    interface = args.interface
+
+    # Set the XDP source file path
+    xdp_file = os.path.join(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        ),
+        "xdp_filter.c"
+    )
+
+
+    # Print the application header
+    print()
+
+    print(
+        "  ╔" + "═" * 63 + "╗"
+    )
+
+    print(
+        "  ║   GATEKEEPER IPS  —  AI XGBoost + eBPF/XDP          ║"
+    )
+
+    print(
+        f"  ║   Interface : {interface:<47}║"
+    )
+
+    print(
+        "  ╚" + "═" * 63 + "╝"
+    )
 
     print()
-    print("  ╔" + "═" * 63 + "╗")
-    print("  ║   🛡  GATEKEEPER IPS  —  AI XGBoost + eBPF/XDP          ║")
-    print("  ║   Interface : {:<47}║".format(INTERFACE))
-    print("  ╚" + "═" * 63 + "╝")
-    print()
 
-    # ── 1. Khởi tạo Data Plane (eBPF/XDP) ────────────────────────────────────
-    _banner("1/4  KHỞI TẠO DATA PLANE (eBPF/XDP)")
-    enforcer = XDPEnforcer(INTERFACE, XDP_FILE)
+
+    # Initialize the XDP data plane
+    _banner(
+        "1/4  INITIALIZING DATA PLANE eBPF/XDP"
+    )
+
+    enforcer = XDPEnforcer(
+        interface,
+        xdp_file
+    )
+
+    # Stop startup when XDP cannot be attached
     if not enforcer.load_and_attach():
         return
 
-    # ── 2. Whitelist ──────────────────────────────────────────────────────────
-    _banner("ĐỒNG BỘ WHITELIST")
+
+    # Synchronize the whitelist
+    _banner(
+        "WHITELIST SYNCHRONIZATION"
+    )
+
     enforcer.load_whitelist()
 
-    # ── 3. Memory Manager & State ─────────────────────────────────────────────
-    _banner("2/4  KHỞI TẠO BỘ NHỚ USER-SPACE")
-    print(f"  [+] Offense History khởi tạo (TTLCache 24h)")
-    print(f"  [+] Memory Manager daemon started")
 
-    # ── 4. AI Engine ─────────────────────────────────────────────────────────
-    _banner("3/4  KHỞI TẠO AI ENGINE (XGBoost)")
+    # Initialize user-space memory and state
+    _banner(
+        "2/4  INITIALIZING USER-SPACE MEMORY"
+    )
+
+    print(
+        "  [+] Offense History initialized "
+        "TTLCache 24h"
+    )
+
+    print(
+        "  [+] Memory Manager daemon started"
+    )
+
+
+    # Initialize the AI engine
+    _banner(
+        "3/4  INITIALIZING AI ENGINE XGBoost"
+    )
+
     ai_model = load_ai_model()
 
-    # ── 5. Egress Filter ──────────────────────────────────────────────────────
-    _banner("4/4  CẤU HÌNH EGRESS FILTER")
-    local_ips = get_all_local_ips(INTERFACE)
-    print(f"  [+] Local IPs detected: {', '.join(sorted(local_ips))}")
-    print(f"  [+] Mọi flow từ các địa chỉ này sẽ bỏ qua (Egress + Alias filter)")
 
-    # Sliding Window: TTLCache tự động đá key cũ (LRU) khi vượt maxsize
-    packet_window = TTLCache(maxsize=100_000, ttl=60)
+    # Configure the egress traffic filter
+    _banner(
+        "4/4  CONFIGURING EGRESS FILTER"
+    )
 
-    # ── Ready ─────────────────────────────────────────────────────────────────
+    local_ips = get_all_local_ips(
+        interface
+    )
+
+    print(
+        f"  [+] Local IPs detected: "
+        f"{', '.join(sorted(local_ips))}"
+    )
+
+    print(
+        "  [+] Traffic originating from these "
+        "addresses will be ignored"
+    )
+
+
+    # Create the sliding-window packet tracker
+    packet_window = TTLCache(
+        maxsize=100_000,
+        ttl=60
+    )
+
+
+    # Show that the system is ready
     print()
-    print("  ╔" + "═" * 63 + "╗")
-    print("  ║   ✅  HỆ THỐNG SẴN SÀNG — ĐANG GIÁM SÁT INGRESS TRAFFIC ║")
-    print("  ╚" + "═" * 63 + "╝")
+
+    print(
+        "  ╔" + "═" * 63 + "╗"
+    )
+
+    print(
+        "  ║   GATEKEEPER READY — MONITORING INGRESS TRAFFIC     ║"
+    )
+
+    print(
+        "  ╚" + "═" * 63 + "╝"
+    )
+
     print()
 
     try:
-        # active_timeout=1 : xuất flow đã active > 1s (bắt flood liên tục)
-        # idle_timeout=1   : xuất flow idle > 1s (bắt micro-flow rotating-port)
-        # statistical_analysis=True : tính min/mean/stddev/max packet size
+        # Create the NFStream traffic monitor
         streamer = NFStreamer(
-            source=INTERFACE,
+            source=interface,
             active_timeout=1,
             idle_timeout=1,
             statistical_analysis=True
         )
 
+        # Process each detected network flow
         for flow in streamer:
             try:
-                # A. Bỏ qua IPv6 — inet_aton chỉ xử lý IPv4
+                # Ignore IPv6 traffic
                 if ":" in flow.src_ip:
                     continue
 
-                # B. Bỏ qua Egress: flow từ bất kỳ IP nào của chính máy chủ
+
+                # Ignore traffic originating from local IPs
                 if flow.src_ip in local_ips:
                     continue
 
-                # C. Bỏ qua IP đang trong thời gian bị phạt
-                if enforcer.is_banned(flow.src_ip):
+
+                # Ignore IPs that are already banned
+                if enforcer.is_banned(
+                    flow.src_ip
+                ):
                     continue
 
-                # D. Multi-vector Rate Limiting (Sliding Window)
-                #    3 kênh đếm song song để bắt mọi loại bão (SYN, UDP, ACK, RST...)
+
+                # Get the current timestamp
                 now = time.time()
 
-                syn_count   = flow.bidirectional_syn_packets
-                total_count = flow.bidirectional_packets
-                # NFStream protocol: 1 = ICMP, 17 = UDP
-                udp_icmp_count = total_count if flow.protocol in (1, 17) else 0
 
-                if flow.src_ip not in packet_window:
-                    packet_window[flow.src_ip] = []
+                # Get SYN and total packet counts
+                syn_count = (
+                    flow.bidirectional_syn_packets
+                )
 
-                window = packet_window[flow.src_ip]
-                window.append((now, syn_count, udp_icmp_count, total_count))
-                filtered = [(t, s, u, p) for (t, s, u, p) in window if now - t <= WINDOW_SECONDS]
+                total_count = (
+                    flow.bidirectional_packets
+                )
 
-                if filtered:
-                    packet_window[flow.src_ip] = filtered
+
+                # Count UDP and ICMP packets separately
+                if flow.protocol in (1, 17):
+                    udp_icmp_count = total_count
                 else:
-                    packet_window.pop(flow.src_ip, None)
+                    udp_icmp_count = 0
+
+
+                # Create a tracking entry for new source IPs
+                if flow.src_ip not in packet_window:
+                    packet_window[
+                        flow.src_ip
+                    ] = []
+
+
+                # Get the packet history for this IP
+                window = packet_window[
+                    flow.src_ip
+                ]
+
+
+                # Add the current flow to the sliding window
+                window.append(
+                    (
+                        now,
+                        syn_count,
+                        udp_icmp_count,
+                        total_count
+                    )
+                )
+
+
+                # Keep only entries inside the time window
+                filtered = [
+                    (
+                        timestamp,
+                        syn,
+                        udp_icmp,
+                        packets
+                    )
+                    for (
+                        timestamp,
+                        syn,
+                        udp_icmp,
+                        packets
+                    ) in window
+                    if now - timestamp <= WINDOW_SECONDS
+                ]
+
+
+                # Remove empty tracking entries
+                if not filtered:
+                    packet_window.pop(
+                        flow.src_ip,
+                        None
+                    )
+
                     continue
 
-                total_syn      = sum(s for _, s, _, _ in filtered)
-                total_udp_icmp = sum(u for _, _, u, _ in filtered)
-                total_pkts     = sum(p for _, _, _, p in filtered)
 
-                if (total_syn > SYN_THRESHOLD or
-                        total_udp_icmp > UDP_ICMP_THRESHOLD or
-                        total_pkts > TOTAL_THRESHOLD):
-                    if not enforcer.is_whitelisted(flow.src_ip):
-                        count, ttl_secs = enforcer.block_ip(flow.src_ip)
-                        packet_window.pop(flow.src_ip, None)
-                        ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
-                        print(
-                            f"  [BLOCK] {flow.src_ip:<20} "
-                            f"DDoS DETECTED  │ ban {ttl_label:<4} │ offense #{count}"
+                # Save the filtered sliding window
+                packet_window[
+                    flow.src_ip
+                ] = filtered
+
+
+                # Calculate total SYN traffic
+                total_syn = sum(
+                    syn
+                    for _, syn, _, _ in filtered
+                )
+
+
+                # Calculate total UDP and ICMP traffic
+                total_udp_icmp = sum(
+                    udp_icmp
+                    for _, _, udp_icmp, _ in filtered
+                )
+
+
+                # Calculate total packets
+                total_pkts = sum(
+                    packets
+                    for _, _, _, packets in filtered
+                )
+
+
+                # Check all rate-limit thresholds
+                threshold_exceeded = (
+                    total_syn > SYN_THRESHOLD
+                    or total_udp_icmp > UDP_ICMP_THRESHOLD
+                    or total_pkts > TOTAL_THRESHOLD
+                )
+
+
+                # Apply the rule-based flood detector
+                if threshold_exceeded:
+                    # Skip trusted whitelist addresses
+                    if not enforcer.is_whitelisted(
+                        flow.src_ip
+                    ):
+                        # Identify the specific flood type
+                        if total_syn > SYN_THRESHOLD:
+                            rule_reason = (
+                                "RULE_SYN_FLOOD"
+                            )
+
+                        elif (
+                            total_udp_icmp
+                            > UDP_ICMP_THRESHOLD
+                        ):
+                            rule_reason = (
+                                "RULE_UDP_ICMP_FLOOD"
+                            )
+
+                        else:
+                            rule_reason = (
+                                "RULE_GENERIC_FLOOD"
+                            )
+
+
+                        # Build the attack signature
+                        sig = AttackSignature(
+                            src_ip=flow.src_ip,
+                            protocol=proto_name(
+                                flow.protocol
+                            ),
+                            dst_port=int(
+                                getattr(
+                                    flow,
+                                    "dst_port",
+                                    0
+                                )
+                            ),
+                            fwd_len_mean=float(
+                                getattr(
+                                    flow,
+                                    "src2dst_mean_ps",
+                                    0.0
+                                )
+                            ),
+                            pps=(
+                                total_pkts
+                                / WINDOW_SECONDS
+                            ),
+                            reason=rule_reason
                         )
+
+
+                        # Block the attacking source IP
+                        count, ttl_secs = (
+                            enforcer.block_ip(sig)
+                        )
+
+
+                        # Clear the tracking state after blocking
+                        packet_window.pop(
+                            flow.src_ip,
+                            None
+                        )
+
+
+                        # Convert the ban duration into a readable label
+                        if ttl_secs >= 3600:
+                            ttl_label = (
+                                f"{ttl_secs // 3600}h"
+                            )
+                        else:
+                            ttl_label = (
+                                f"{ttl_secs // 60}m"
+                            )
+
+
+                        # Print the block event
+                        print(
+                            f"  [BLOCK] "
+                            f"{flow.src_ip:<20} "
+                            f"{rule_reason:<20} "
+                            f"│ ban {ttl_label:<4} "
+                            f"│ offense #{count}"
+                        )
+
+                    # Do not run ML inference for flood traffic
                     continue
 
-                # E. ML Inference — chỉ chạy với flow >= 10 packet để loại
-                #    single-packet scanner/health-check (giảm false positive)
+                # Skip very small flows to reduce false positives
                 if flow.bidirectional_packets < 10:
                     continue
 
-                features   = extract_features(flow)
-                prediction = ai_model.predict(features)
-                pred_val   = int(prediction[0]) if isinstance(prediction, (list, np.ndarray)) else int(prediction)
 
+                # Extract the 19 model features
+                features = extract_features(
+                    flow
+                )
+
+
+                # Run XGBoost inference
+                prediction = ai_model.predict(
+                    features
+                )
+
+
+                # Convert the prediction into an integer
+                if isinstance(
+                    prediction,
+                    (list, np.ndarray)
+                ):
+                    pred_val = int(
+                        prediction[0]
+                    )
+                else:
+                    pred_val = int(
+                        prediction
+                    )
+
+
+                # Block flows classified as DDoS
                 if pred_val >= 1:
-                    if not enforcer.is_whitelisted(flow.src_ip):
-                        count, ttl_secs = enforcer.block_ip(flow.src_ip)
-                        ttl_label = f"{ttl_secs // 3600}h" if ttl_secs >= 3600 else f"{ttl_secs // 60}m"
-                        print(
-                            f"  [BLOCK] {flow.src_ip:<20} "
-                            f"DDoS DETECTED  │ ban {ttl_label:<4} │ offense #{count}"
+                    # Skip trusted whitelist addresses
+                    if not enforcer.is_whitelisted(
+                        flow.src_ip
+                    ):
+                        # Calculate flow duration
+                        duration_s = max(
+                            float(
+                                flow.bidirectional_duration_ms
+                            ) / 1000.0,
+                            1e-9
                         )
 
-            except Exception as flow_err:
-                # Lỗi trên một flow đơn lẻ không được crash toàn vòng lặp
-                print(f"  [-] Flow error ({flow.src_ip}): {flow_err}")
 
+                        # Build the AI attack signature
+                        sig = AttackSignature(
+                            src_ip=flow.src_ip,
+                            protocol=proto_name(
+                                flow.protocol
+                            ),
+                            dst_port=int(
+                                getattr(
+                                    flow,
+                                    "dst_port",
+                                    0
+                                )
+                            ),
+                            fwd_len_mean=float(
+                                getattr(
+                                    flow,
+                                    "src2dst_mean_ps",
+                                    0.0
+                                )
+                            ),
+                            pps=(
+                                float(
+                                    flow.bidirectional_packets
+                                )
+                                / duration_s
+                            ),
+                            reason="AI_DETECTED_DDOS",
+                            features=features[0].tolist()
+                        )
+
+
+                        # Block the detected attacker
+                        count, ttl_secs = (
+                            enforcer.block_ip(sig)
+                        )
+
+
+                        # Convert the ban duration into a readable label
+                        if ttl_secs >= 3600:
+                            ttl_label = (
+                                f"{ttl_secs // 3600}h"
+                            )
+                        else:
+                            ttl_label = (
+                                f"{ttl_secs // 60}m"
+                            )
+
+
+                        # Print the AI block event
+                        print(
+                            f"  [BLOCK] "
+                            f"{flow.src_ip:<20} "
+                            f"AI_DETECTED_DDOS     "
+                            f"│ ban {ttl_label:<4} "
+                            f"│ offense #{count}"
+                        )
+
+
+            # Handle errors from individual flows
+            except Exception as flow_err:
+                print(
+                    f"  [-] Flow error "
+                    f"({flow.src_ip}): {flow_err}"
+                )
+
+
+    # Handle manual shutdown
     except KeyboardInterrupt:
-        print("\n  [~] Ctrl+C nhận được — đang dọn dẹp...")
+        print(
+            "\n  [~] Ctrl+C received "
+            "— cleaning up..."
+        )
+
+
+    # Handle unrecoverable runtime errors
     except Exception as exc:
-        print(f"\n  [✗] Lỗi không phục hồi được: {exc}")
+        print(
+            f"\n  [✗] Fatal error: {exc}"
+        )
+
+
+    # Always detach XDP before exiting
     finally:
-        # Luôn gỡ XDP khi thoát — không để lại filter trên interface
         enforcer.detach()
 
 
+# Start the Gatekeeper application
 if __name__ == "__main__":
     main()
