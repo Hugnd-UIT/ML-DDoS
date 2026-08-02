@@ -17,10 +17,12 @@ Type=simple
 
 
 # Set the project working directory
+# TODO: Change to your own path
 WorkingDirectory=/home/hoangminh13022006/ML-DDoS
 
 
 # Start the Gatekeeper service
+# TODO: Change to your own path
 ExecStart=/home/hoangminh13022006/ML-DDoS/scripts/start_ips.sh
 
 
