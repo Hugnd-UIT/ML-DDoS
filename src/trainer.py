@@ -34,7 +34,7 @@ def train_binary():
         [df_train, df_test],
         ignore_index=True
     )
-
+#
     # Separate features and labels
     X = df_merged.drop(
         columns=['Label']

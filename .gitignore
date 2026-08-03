@@ -13,9 +13,9 @@ ENV/
 data/CICDDoS2019/*
 !data/CICDDoS2019/.gitkeep
 
-*.pkl
-models/*
-!models/.gitkeep
+# *.pkl
+# models/*
+# !models/.gitkeep
 
 *.json
 .env
