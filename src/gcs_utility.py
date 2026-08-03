@@ -518,4 +518,4 @@ def get_collector():
 def log_attack(sig):
     collector = get_collector()
     features = getattr(sig, "features", None)
-    collector.record_from_signature(sig, features=features)
+    collector.record_from_signature(sig, features=features)
