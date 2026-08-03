@@ -719,6 +719,7 @@ def main():
                 if threshold_exceeded:
                     if not enforcer.is_whitelisted(flow.src_ip):
                         rule_reason = "RATE_LIMIT (Volumetric)"
+                        rl_features = extract_features(flow)
 
                         sig = AttackSignature(
                             src_ip       = flow.src_ip,
@@ -726,7 +727,8 @@ def main():
                             dst_port     = int(getattr(flow, "dst_port", 0)),
                             fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
                             pps          = total_pkts / WINDOW_SECONDS,
-                            reason       = rule_reason
+                            reason       = rule_reason,
+                            features     = rl_features[0].tolist() if rl_features is not None else None
                         )
 
                         count, ttl_secs = enforcer.block_ip(sig)

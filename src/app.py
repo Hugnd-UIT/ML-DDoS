@@ -204,23 +204,13 @@ def classify_attack_types(df, model, label_encoder):
     # Check whether all required feature columns exist
     has_feature_columns = set(FEATURE_COLUMNS).issubset(df.columns)
 
-    # Identify rows containing all 19 feature values
-    if has_feature_columns:
-        has_features = df[FEATURE_COLUMNS].notna().all(axis=1)
-    else:
-        has_features = pd.Series(False, index=df.index)
-
-    # Select only rows that can be classified by the model
-    ai_rows = df[has_features]
-
-    # Keep the default reason labels when no rows qualify
-    if ai_rows.empty:
+    if not has_feature_columns:
         return df
 
-    # Build the model input using the exact feature order
-    X = ai_rows[FEATURE_COLUMNS].astype(np.float32)
+    # Fill missing feature values with 0 to ensure every row is classified into one of the 13 classes
+    X = df[FEATURE_COLUMNS].fillna(0).astype(np.float32)
 
-    # Run multiclass prediction
+    # Run multiclass prediction on 100% of rows
     try:
         preds = model.predict(X)
 
@@ -229,13 +219,13 @@ def classify_attack_types(df, model, label_encoder):
             preds = label_encoder.inverse_transform(preds.astype(int))
 
         # Store the predicted attack types
-        df.loc[ai_rows.index, "attack_type"] = preds
+        df["attack_type"] = preds
 
-    # Keep the original reason labels when prediction fails
+    # Keep the original labels only when prediction fails
     except Exception as exc:
         st.warning(
             f"Multiclass prediction failed ({exc}). "
-            "Using the original 'reason' labels instead."
+            "Using original labels instead."
         )
 
     return df
