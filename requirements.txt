@@ -10,3 +10,4 @@ streamlit
 requests
 matplotlib
 cachetools
+plotly
