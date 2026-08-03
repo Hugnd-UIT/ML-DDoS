@@ -85,25 +85,25 @@ FEATURE_COLUMNS = [
 
 
 # Core color palette, shared by the CSS theme and the charts
-# Modeled after the Kibana Discover screen: white canvas, pink brand
-# accent, muted blue-gray for data visuals
+# Modeled after the CloudWatch dashboard: near-black canvas, dark navy
+# panels, and an amber/gold accent for data
 COLORS = {
-    "bg": "#ffffff",
-    "panel": "#ffffff",
-    "panel_border": "#d3dae6",
-    "sidebar": "#e2007a",
-    "sidebar_dark": "#c4006a",
-    "text": "#1a1c21",
-    "muted": "#69707d",
-    "critical": "#e2007a",
-    "warning": "#f5a623",
-    "accent": "#a3d3e0",
-    "grid": "#eef2f7",
+    "bg": "#0e1015",
+    "panel": "#181b22",
+    "panel_border": "#2a2e38",
+    "sidebar": "#14161c",
+    "sidebar_dark": "#0e1015",
+    "text": "#eceef2",
+    "muted": "#8b909c",
+    "critical": "#ff9900",
+    "warning": "#f5c542",
+    "accent": "#ff9900",
+    "grid": "#242832",
 }
 
 ATTACK_COLOR_SEQUENCE = [
-    "#a3d3e0", "#e2007a", "#f5a623", "#54b399",
-    "#6092c0", "#d36086", "#9170b8", "#79aad9",
+    "#ff9900", "#f5c542", "#2ec9c9", "#6fb1e8",
+    "#c792ea", "#e8735f", "#a6c96a", "#d9a441",
 ]
 
 
@@ -257,28 +257,27 @@ def inject_theme():
                 color: {COLORS["text"]};
             }}
 
-            /* Sidebar styled after the Kibana nav rail */
+            /* Sidebar styled after the CloudWatch dark nav panel */
             section[data-testid="stSidebar"] {{
-                background: linear-gradient(180deg, {COLORS["sidebar"]} 0%, {COLORS["sidebar_dark"]} 100%);
-                border-right: none;
+                background: {COLORS["sidebar"]};
+                border-right: 1px solid {COLORS["panel_border"]};
             }}
             section[data-testid="stSidebar"] * {{
-                color: #ffffff !important;
+                color: {COLORS["text"]} !important;
             }}
             section[data-testid="stSidebar"] hr {{
-                border-color: rgba(255,255,255,0.25) !important;
-            }}
-            section[data-testid="stSidebar"] div[data-baseweb="checkbox"] div {{
-                border-color: rgba(255,255,255,0.6) !important;
+                border-color: {COLORS["panel_border"]} !important;
             }}
 
-            /* Header bar mimicking the Kibana top brand strip */
+            /* Header bar mimicking the CloudWatch breadcrumb and title strip */
             .soc-header {{
                 display: flex;
                 align-items: center;
                 gap: 14px;
                 padding: 14px 18px;
-                background: {COLORS["sidebar"]};
+                background: {COLORS["panel"]};
+                border: 1px solid {COLORS["panel_border"]};
+                border-left: 4px solid {COLORS["accent"]};
                 border-radius: 6px;
                 margin-bottom: 18px;
             }}
@@ -287,39 +286,38 @@ def inject_theme():
                 font-weight: 700;
                 letter-spacing: 0.01em;
                 margin: 0;
-                color: #ffffff;
+                color: {COLORS["text"]};
             }}
             .soc-header .soc-sub {{
                 font-family: 'Roboto Mono', monospace;
                 font-size: 0.75rem;
-                color: rgba(255,255,255,0.85);
+                color: {COLORS["muted"]};
                 margin-top: 2px;
             }}
             .soc-pulse {{
                 width: 10px;
                 height: 10px;
                 border-radius: 50%;
-                background: #ffffff;
-                box-shadow: 0 0 0 0 rgba(255,255,255,0.7);
+                background: {COLORS["accent"]};
+                box-shadow: 0 0 0 0 rgba(255,153,0,0.6);
                 animation: soc-ping 1.8s ease-out infinite;
                 flex-shrink: 0;
             }}
             @keyframes soc-ping {{
-                0%   {{ box-shadow: 0 0 0 0 rgba(255,255,255,0.55); }}
-                70%  {{ box-shadow: 0 0 0 9px rgba(255,255,255,0); }}
-                100% {{ box-shadow: 0 0 0 0 rgba(255,255,255,0); }}
+                0%   {{ box-shadow: 0 0 0 0 rgba(255,153,0,0.55); }}
+                70%  {{ box-shadow: 0 0 0 9px rgba(255,153,0,0); }}
+                100% {{ box-shadow: 0 0 0 0 rgba(255,153,0,0); }}
             }}
             @media (prefers-reduced-motion: reduce) {{
                 .soc-pulse {{ animation: none; }}
             }}
 
-            /* Metric cards styled like Kibana's flat info panels */
+            /* Metric cards styled like CloudWatch's dark flat widgets */
             div[data-testid="stMetric"] {{
-                background: #ffffff;
+                background: {COLORS["panel"]};
                 border: 1px solid {COLORS["panel_border"]};
-                border-radius: 4px;
+                border-radius: 6px;
                 padding: 12px 16px;
-                box-shadow: 0 1px 2px rgba(0,0,0,0.04);
             }}
             div[data-testid="stMetricLabel"] {{
                 font-family: 'Inter', sans-serif;
@@ -331,10 +329,10 @@ def inject_theme():
             div[data-testid="stMetricValue"] {{
                 font-family: 'Roboto Mono', monospace;
                 font-size: 1.6rem;
-                color: {COLORS["text"]};
+                color: {COLORS["accent"]};
             }}
 
-            /* Section headings above each chart, Kibana panel-title style */
+            /* Section headings above each chart, CloudWatch widget-title style */
             h3 {{
                 font-size: 0.95rem !important;
                 font-weight: 600 !important;
@@ -344,10 +342,10 @@ def inject_theme():
                 padding-bottom: 8px;
             }}
 
-            /* Data tables styled as a flat bordered panel like Discover's log list */
+            /* Data tables styled as a flat bordered dark panel */
             div[data-testid="stDataFrame"] {{
                 border: 1px solid {COLORS["panel_border"]};
-                border-radius: 4px;
+                border-radius: 6px;
                 overflow: hidden;
             }}
 
@@ -355,8 +353,10 @@ def inject_theme():
                 border-color: {COLORS["panel_border"]} !important;
             }}
 
-            /* Text input styled like the Kibana search bar */
+            /* Text input styled like the CloudWatch search field */
             div[data-testid="stTextInput"] input {{
+                background: {COLORS["panel"]} !important;
+                color: {COLORS["text"]} !important;
                 border: 1px solid {COLORS["panel_border"]} !important;
                 border-radius: 4px !important;
             }}
@@ -540,14 +540,15 @@ def main():
             .reset_index(name="blocked_count")
         )
 
-        # Build the traffic histogram, styled after the Kibana Discover
-        # timestamp-per-interval bar chart
+        # Build the traffic timeline chart, styled after the CloudWatch
+        # spiky orange line chart
         fig_line = go.Figure()
         fig_line.add_trace(
-            go.Bar(
+            go.Scatter(
                 x=df_time["timestamp"],
                 y=df_time["blocked_count"],
-                marker=dict(color=COLORS["accent"], line=dict(width=0)),
+                mode="lines",
+                line=dict(color=COLORS["accent"], width=1.6),
             )
         )
         fig_line.update_layout(
@@ -555,7 +556,6 @@ def main():
             plot_bgcolor="rgba(0,0,0,0)",
             font_color=COLORS["text"],
             font_family="Inter, sans-serif",
-            bargap=0.15,
             xaxis=dict(gridcolor=COLORS["grid"], showgrid=False),
             yaxis=dict(gridcolor=COLORS["grid"], showgrid=True, title="Event count"),
             margin=dict(t=10, b=10, l=10, r=10),
