@@ -512,3 +512,10 @@ def get_collector():
         collector_instance.start()
 
     return collector_instance
+
+
+# Convenience wrapper for logging attack events to GCS
+def log_attack(sig):
+    collector = get_collector()
+    features = getattr(sig, "features", None)
+    collector.record_from_signature(sig, features=features)

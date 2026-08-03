@@ -659,11 +659,14 @@ class XDPEnforcer:
 
         # Send the event to GCS
         try:
-            # Import the GCS logging utility
-            from gcs_utility import log_attack
+            # Import the GCS logging utility collector
+            from gcs_utility import get_collector
 
             # Store the attack event in GCS
-            log_attack(sig)
+            get_collector().record_from_signature(
+                sig,
+                features=getattr(sig, "features", None)
+            )
 
         except Exception as exc:
             # Show GCS logging errors

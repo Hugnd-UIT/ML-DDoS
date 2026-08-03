@@ -19,6 +19,36 @@ import requests
 
 # ── Cấu hình Telegram ─────────────────────────────────────────────────────────
 
+# Tự động tìm và nạp tệp .env (khắc phục lỗi sudo xóa biến môi trường trên Linux)
+def _auto_load_dotenv():
+    env_candidate_paths = [
+        os.path.join(os.path.dirname(__file__), "..", ".env"),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.expanduser("~/.env"),
+        os.path.expanduser("~/ML-DDoS/.env"),
+        "/home/hoangminh13022006/ML-DDoS/.env",
+        "/root/ML-DDoS/.env",
+        "/root/.env",
+    ]
+    for filepath in env_candidate_paths:
+        filepath = os.path.abspath(filepath)
+        if os.path.exists(filepath):
+            print(f"[+] Notifier: Tự động phát hiện và nạp cấu hình từ {filepath}")
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+                break
+            except Exception as e:
+                print(f"[-] Lỗi đọc file {filepath}: {e}")
+_auto_load_dotenv()
+
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
 TG_MAX_RETRY = int(os.environ.get("TG_MAX_RETRY", "3"))
