@@ -415,23 +415,6 @@ class DirtyFlowCollector:
         )
 
 
-        # Send the periodic attack summary
-        if window_blocked > 0:
-            try:
-                import notifier
-
-                notifier.send_digest_alert(
-                    window_blocked,
-                    top_ips,
-                    f"{GCS_FLUSH_INTERVAL // 60} min"
-                )
-
-            except Exception as exc:
-                print(
-                    f"[-] Digest alert error: {exc}"
-                )
-
-
     # Convert a batch of events into CSV and upload it
     def flush_batch(
         self,

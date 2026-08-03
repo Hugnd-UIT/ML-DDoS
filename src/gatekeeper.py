@@ -772,6 +772,12 @@ def main():
 
     # Always detach XDP before exiting
     finally:
+        try:
+            from gcs_utility import get_collector
+            get_collector().stop()
+        except Exception as e:
+            print(f"  [-] Lỗi dừng GCS collector: {e}")
+
         enforcer.detach()
 
 
