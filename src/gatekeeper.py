@@ -658,205 +658,99 @@ def main():
                 )
 
 
-                # Check all rate-limit thresholds
-                threshold_exceeded = (
-                    total_syn > SYN_THRESHOLD
-                    or total_udp_icmp > UDP_ICMP_THRESHOLD
-                    or total_pkts > TOTAL_THRESHOLD
-                )
+                # ── TUYẾN 1: AI XGBoost (Trọng tâm phát hiện chính) ─────────────────────
+                # Chỉ phân tích flow đủ lớn để AI có dữ liệu ý nghĩa (>= 10 packets).
+                # Đây là tuyến phát hiện chính của hệ thống.
+                if flow.bidirectional_packets >= 10:
+                    features   = extract_features(flow)
+                    prediction = ai_model.predict(features)
 
+                    if isinstance(prediction, (list, np.ndarray)):
+                        pred_val = int(prediction[0])
+                    else:
+                        pred_val = int(prediction)
 
-                # Apply the rule-based flood detector
-                if threshold_exceeded:
-                    # Skip trusted whitelist addresses
-                    if not enforcer.is_whitelisted(
-                        flow.src_ip
-                    ):
-                        # Identify the specific flood type
-                        if total_syn > SYN_THRESHOLD:
-                            rule_reason = (
-                                "RULE_SYN_FLOOD"
+                    if pred_val >= 1:
+                        if not enforcer.is_whitelisted(flow.src_ip):
+                            duration_s = max(
+                                float(flow.bidirectional_duration_ms) / 1000.0,
+                                1e-9
                             )
 
-                        elif (
-                            total_udp_icmp
-                            > UDP_ICMP_THRESHOLD
-                        ):
-                            rule_reason = (
-                                "RULE_UDP_ICMP_FLOOD"
+                            sig = AttackSignature(
+                                src_ip       = flow.src_ip,
+                                protocol     = proto_name(flow.protocol),
+                                dst_port     = int(getattr(flow, "dst_port", 0)),
+                                fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
+                                pps          = float(flow.bidirectional_packets) / duration_s,
+                                reason       = "AI_DETECTED_DDOS",
+                                features     = features[0].tolist()
                             )
 
-                        else:
-                            rule_reason = (
-                                "RULE_GENERIC_FLOOD"
-                            )
+                            count, ttl_secs = enforcer.block_ip(sig)
 
-
-                        # Build the attack signature
-                        sig = AttackSignature(
-                            src_ip=flow.src_ip,
-                            protocol=proto_name(
-                                flow.protocol
-                            ),
-                            dst_port=int(
-                                getattr(
-                                    flow,
-                                    "dst_port",
-                                    0
-                                )
-                            ),
-                            fwd_len_mean=float(
-                                getattr(
-                                    flow,
-                                    "src2dst_mean_ps",
-                                    0.0
-                                )
-                            ),
-                            pps=(
-                                total_pkts
-                                / WINDOW_SECONDS
-                            ),
-                            reason=rule_reason
-                        )
-
-
-                        # Block the attacking source IP
-                        count, ttl_secs = (
-                            enforcer.block_ip(sig)
-                        )
-
-
-                        # Clear the tracking state after blocking
-                        packet_window.pop(
-                            flow.src_ip,
-                            None
-                        )
-
-
-                        # Convert the ban duration into a readable label
-                        if ttl_secs >= 3600:
                             ttl_label = (
                                 f"{ttl_secs // 3600}h"
+                                if ttl_secs >= 3600
+                                else f"{ttl_secs // 60}m"
                             )
+
+                            print(
+                                f"  [BLOCK] {flow.src_ip:<20} "
+                                f"AI_DETECTED_DDOS     "
+                                f"│ ban {ttl_label:<4} "
+                                f"│ offense #{count}"
+                            )
+
+                        # Đã xử lý qua AI, không cần Rate Limiter kiểm tra lại
+                        packet_window.pop(flow.src_ip, None)
+                        continue
+
+                # ── TUYẾN 2: Rate Limiter (Lưới an toàn cho bão cực lớn) ─────────────────
+                # Chỉ kích hoạt khi flow quá nhỏ cho AI (< 10 packets) NHƯNG khối lượng
+                # gói tin trong cửa sổ trượt vượt ngưỡng volumetric cực cao.
+                # Đây là biện pháp phòng vệ cuối chống bão SYN/UDP xả chớp nhoáng.
+                threshold_exceeded = (
+                    total_syn      > SYN_THRESHOLD
+                    or total_udp_icmp > UDP_ICMP_THRESHOLD
+                    or total_pkts  > TOTAL_THRESHOLD
+                )
+
+                if threshold_exceeded:
+                    if not enforcer.is_whitelisted(flow.src_ip):
+                        if total_syn > SYN_THRESHOLD:
+                            rule_reason = "RULE_SYN_FLOOD"
+                        elif total_udp_icmp > UDP_ICMP_THRESHOLD:
+                            rule_reason = "RULE_UDP_ICMP_FLOOD"
                         else:
-                            ttl_label = (
-                                f"{ttl_secs // 60}m"
-                            )
+                            rule_reason = "RULE_GENERIC_FLOOD"
 
+                        sig = AttackSignature(
+                            src_ip       = flow.src_ip,
+                            protocol     = proto_name(flow.protocol),
+                            dst_port     = int(getattr(flow, "dst_port", 0)),
+                            fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
+                            pps          = total_pkts / WINDOW_SECONDS,
+                            reason       = rule_reason
+                        )
 
-                        # Print the block event
+                        count, ttl_secs = enforcer.block_ip(sig)
+
+                        packet_window.pop(flow.src_ip, None)
+
+                        ttl_label = (
+                            f"{ttl_secs // 3600}h"
+                            if ttl_secs >= 3600
+                            else f"{ttl_secs // 60}m"
+                        )
+
                         print(
-                            f"  [BLOCK] "
-                            f"{flow.src_ip:<20} "
+                            f"  [BLOCK] {flow.src_ip:<20} "
                             f"{rule_reason:<20} "
                             f"│ ban {ttl_label:<4} "
                             f"│ offense #{count}"
                         )
 
-                    # Do not run ML inference for flood traffic
-                    continue
-
-                # Skip very small flows to reduce false positives
-                if flow.bidirectional_packets < 10:
-                    continue
-
-
-                # Extract the 19 model features
-                features = extract_features(
-                    flow
-                )
-
-
-                # Run XGBoost inference
-                prediction = ai_model.predict(
-                    features
-                )
-
-
-                # Convert the prediction into an integer
-                if isinstance(
-                    prediction,
-                    (list, np.ndarray)
-                ):
-                    pred_val = int(
-                        prediction[0]
-                    )
-                else:
-                    pred_val = int(
-                        prediction
-                    )
-
-
-                # Block flows classified as DDoS
-                if pred_val >= 1:
-                    # Skip trusted whitelist addresses
-                    if not enforcer.is_whitelisted(
-                        flow.src_ip
-                    ):
-                        # Calculate flow duration
-                        duration_s = max(
-                            float(
-                                flow.bidirectional_duration_ms
-                            ) / 1000.0,
-                            1e-9
-                        )
-
-
-                        # Build the AI attack signature
-                        sig = AttackSignature(
-                            src_ip=flow.src_ip,
-                            protocol=proto_name(
-                                flow.protocol
-                            ),
-                            dst_port=int(
-                                getattr(
-                                    flow,
-                                    "dst_port",
-                                    0
-                                )
-                            ),
-                            fwd_len_mean=float(
-                                getattr(
-                                    flow,
-                                    "src2dst_mean_ps",
-                                    0.0
-                                )
-                            ),
-                            pps=(
-                                float(
-                                    flow.bidirectional_packets
-                                )
-                                / duration_s
-                            ),
-                            reason="AI_DETECTED_DDOS",
-                            features=features[0].tolist()
-                        )
-
-
-                        # Block the detected attacker
-                        count, ttl_secs = (
-                            enforcer.block_ip(sig)
-                        )
-
-
-                        # Convert the ban duration into a readable label
-                        if ttl_secs >= 3600:
-                            ttl_label = (
-                                f"{ttl_secs // 3600}h"
-                            )
-                        else:
-                            ttl_label = (
-                                f"{ttl_secs // 60}m"
-                            )
-
-
-                        # Print the AI block event
-                        print(
-                            f"  [BLOCK] "
-                            f"{flow.src_ip:<20} "
-                            f"AI_DETECTED_DDOS     "
-                            f"│ ban {ttl_label:<4} "
-                            f"│ offense #{count}"
                         )
 
 

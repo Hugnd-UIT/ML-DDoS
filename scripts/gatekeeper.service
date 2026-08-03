@@ -23,7 +23,7 @@ WorkingDirectory=/home/hoangminh13022006/ML-DDoS
 
 # Start the Gatekeeper service
 # TODO: Change to your own path
-ExecStart=/home/hoangminh13022006/ML-DDoS/scripts/start_ips.sh
+ExecStart=/home/hoangminh13022006/ML-DDoS/scripts/start.sh
 
 
 # Run as root because eBPF/XDP and BPF map access require it
@@ -31,12 +31,9 @@ User=root
 Group=root
 
 
-# Set environment variables
-# Never commit Telegram tokens or chat IDs to Git
+# Load environment variables directly from the .env file
+EnvironmentFile=-/home/hoangminh13022006/ML-DDoS/.env
 Environment=GW_INTERFACE=ens4
-Environment=TG_BOT_TOKEN=
-Environment=TG_CHAT_ID=
-Environment=GCS_BUCKET_NAME=
 
 
 # Restart the service when it crashes

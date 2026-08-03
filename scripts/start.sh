@@ -14,6 +14,14 @@ PROJECT_ROOT="$(
 
 SRC_DIR="${PROJECT_ROOT}/src"
 
+# Load variables from .env file if present
+if [ -f "${PROJECT_ROOT}/.env" ]; then
+    echo "[*] Loading environment variables from .env file..."
+    set -o allexport
+    source "${PROJECT_ROOT}/.env"
+    set +o allexport
+fi
+
 INTERFACE="${GW_INTERFACE:-ens4}"
 
 
