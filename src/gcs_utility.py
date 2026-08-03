@@ -35,7 +35,7 @@ GCS_LOG_PREFIX = os.environ.get(
 GCS_FLUSH_INTERVAL = int(
     os.environ.get(
         "GCS_FLUSH_INTERVAL",
-        "300"
+        "60"
     )
 )
 

@@ -61,7 +61,7 @@ TG_TIMEOUT_S = int(os.environ.get("TG_TIMEOUT_S", "8"))
 
 TG_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 
-DIGEST_INTERVAL_S = 180  # Chu kỳ 3 phút / lần báo cáo toàn hệ thống
+DIGEST_INTERVAL_S = 60  # Chu kỳ 1 phút / lần báo cáo toàn hệ thống
 
 KNOWN_PORTS = {
     22:   "SSH (22)",
@@ -133,7 +133,7 @@ def _fmt_open_alert(sig) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🛡️ XDP eBPF đang cô lập chớp nhoáng tầng hạt nhân.\n"
         f"🔇 Hệ thống vào chế độ ngắt tiếng (Mute Mode) để chống bão Spam.\n"
-        f"📈 Báo cáo thực tế chiến sự sẽ gửi trung bình mỗi 3 phút."
+        f"📈 Báo cáo thực tế chiến sự sẽ gửi trung bình mỗi 1 phút."
     )
 
 
@@ -170,7 +170,7 @@ def _fmt_digest(duration_s: float, total_b: int) -> str:
     )
 
     return (
-        f"📊 <b>[SOC DIGEST] Báo cáo Toàn cảnh Chiến sự (Mỗi 3 phút)</b>\n\n"
+        f"📊 <b>[SOC DIGEST] Báo cáo Toàn cảnh Chiến sự (Mỗi 1 phút)</b>\n\n"
         f"🕐 Thời điểm: <code>{ts}</code>\n"
         f"⏱ Thời gian tác chiến liên tục: <code>{dur_str}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
