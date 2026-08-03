@@ -751,8 +751,6 @@ def main():
                             f"│ offense #{count}"
                         )
 
-                        )
-
 
             # Handle errors from individual flows
             except Exception as flow_err:
