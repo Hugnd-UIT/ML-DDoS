@@ -418,7 +418,7 @@ def main():
     # Search bar for filtering logs, styled after the Kibana query bar
     search_term = st.text_input(
         "Search",
-        placeholder="Search... (e.g. src_ip:1.2.3.4 or attack_type:SYN_FLOOD)",
+        placeholder="Search...",
         label_visibility="collapsed",
     )
 
