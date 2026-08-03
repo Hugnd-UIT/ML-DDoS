@@ -6,6 +6,7 @@
 
 
 import glob
+import io
 import os
 
 import joblib
@@ -13,6 +14,12 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+try:
+    from google.cloud import storage as gcs
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
 
 
 # Define the base directory of the dashboard
@@ -25,16 +32,18 @@ BASE_DIR = os.path.dirname(
 LOG_DIR = os.path.join(
     BASE_DIR,
     "..",
-    "..",
     "logs",
     "dirty_flows"
 )
+
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
+GCS_LOG_PREFIX = os.environ.get("GCS_LOG_PREFIX", "ddos-logs/")
+READ_FROM_GCS = bool(GCS_BUCKET_NAME) and GCS_AVAILABLE
 
 
 # Define the multiclass model path
 MULTICLASS_MODEL_PATH = os.path.join(
     BASE_DIR,
-    "..",
     "..",
     "models",
     "multiclass.pkl"
@@ -44,7 +53,6 @@ MULTICLASS_MODEL_PATH = os.path.join(
 # Define the label encoder path
 LABEL_ENCODER_PATH = os.path.join(
     BASE_DIR,
-    "..",
     "..",
     "models",
     "label.pkl"
@@ -75,78 +83,62 @@ FEATURE_COLUMNS = [
 ]
 
 
-# Load and merge all dirty flow CSV files
-@st.cache_data(ttl=10)
-def load_dirty_flows(log_dir):
-    # Find all CSV files in the log directory
-    csv_files = sorted(
-        glob.glob(
-            os.path.join(
-                log_dir,
-                "*.csv"
-            )
-        )
-    )
+# Read all CSV files from a GCS bucket (used on Cloud Run — no shared disk
+# with VM1, which is the machine actually writing the logs)
+def _load_from_gcs(bucket_name, prefix):
+    client = gcs.Client()
+    blobs = list(client.list_blobs(bucket_name, prefix=prefix))
+    csv_blobs = [b for b in blobs if b.name.endswith(".csv")]
 
+    if not csv_blobs:
+        return pd.DataFrame(), []
 
-    # Return empty data when no log files exist
-    if not csv_files:
-        return (
-            pd.DataFrame(),
-            csv_files
-        )
-
-
-    # Store successfully loaded DataFrames
     frames = []
+    for blob in csv_blobs:
+        try:
+            content = blob.download_as_bytes()
+            frames.append(pd.read_csv(io.BytesIO(content)))
+        except Exception as exc:
+            st.warning(f"Unable to read gs://{bucket_name}/{blob.name}: {exc}")
+
+    if not frames:
+        return pd.DataFrame(), [b.name for b in csv_blobs]
+
+    return pd.concat(frames, ignore_index=True), [b.name for b in csv_blobs]
 
 
-    # Read each CSV file
+# Read all CSV files from local disk 
+def _load_from_local(log_dir):
+    csv_files = sorted(glob.glob(os.path.join(log_dir, "*.csv")))
+    if not csv_files:
+        return pd.DataFrame(), csv_files
+
+    frames = []
     for path in csv_files:
         try:
-            frame = pd.read_csv(
-                path
-            )
-
-            frames.append(
-                frame
-            )
-
+            frames.append(pd.read_csv(path))
         except Exception as exc:
-            # Warn when a CSV file cannot be read
-            st.warning(
-                f"Unable to read "
-                f"{os.path.basename(path)}: "
-                f"{exc}"
-            )
+            st.warning(f"Unable to read {os.path.basename(path)}: {exc}")
 
-
-    # Return empty data when every file failed
     if not frames:
-        return (
-            pd.DataFrame(),
-            csv_files
-        )
+        return pd.DataFrame(), csv_files
+
+    return pd.concat(frames, ignore_index=True), csv_files
 
 
-    # Merge all loaded CSV files
-    df = pd.concat(
-        frames,
-        ignore_index=True
-    )
+# Load and merge all dirty flow CSV files
+@st.cache_data(ttl=10)
+def load_dirty_flows(log_dir, read_from_gcs, bucket_name, prefix):
+    if read_from_gcs:
+        df, sources = _load_from_gcs(bucket_name, prefix)
+    else:
+        df, sources = _load_from_local(log_dir)
 
+    if df.empty:
+        return df, sources
 
-    # Convert timestamps into datetime values
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        errors="coerce"
-    )
-
-
-    return (
-        df,
-        csv_files
-    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return df, sources
 
 
 # Load the multiclass model and label encoder
@@ -342,22 +334,26 @@ def main():
         )
 
         st.caption(
-            "Data source: "
-            "`logs/dirty_flows/`"
+            f"Data source: gs://{GCS_BUCKET_NAME}/{GCS_LOG_PREFIX} (Cloud Run)"
+            if READ_FROM_GCS else
+            "Data source: `logs/dirty_flows/` (local, running on VM1)"
         )
 
 
     # Load the dirty flow logs
     df, csv_files = load_dirty_flows(
-        LOG_DIR
+        LOG_DIR, READ_FROM_GCS, GCS_BUCKET_NAME, GCS_LOG_PREFIX
     )
 
 
     # Show an empty-state message when no logs exist
     if df.empty:
+        source_hint = (
+            f"GCS bucket `{GCS_BUCKET_NAME}`" if READ_FROM_GCS
+            else "`logs/dirty_flows/`"
+        )
         st.info(
-            "No data found in "
-            "`logs/dirty_flows/`. "
+            f"No data found in {source_hint}. "
             "The dashboard will update "
             "when Gatekeeper starts "
             "blocking traffic."
