@@ -63,7 +63,7 @@ class AttackSignature:
         dst_port=0,
         fwd_len_mean=0.0,
         pps=0.0,
-        reason="AI_DETECTED_DDOS",
+        reason="AI_INFERENCE (Binary Model)",
         features=None
     ):
         self.src_ip = src_ip

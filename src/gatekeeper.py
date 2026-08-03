@@ -683,7 +683,7 @@ def main():
                                 dst_port     = int(getattr(flow, "dst_port", 0)),
                                 fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
                                 pps          = float(flow.bidirectional_packets) / duration_s,
-                                reason       = "AI_DETECTED_DDOS",
+                                reason       = "AI_INFERENCE (Binary Model)",
                                 features     = features[0].tolist()
                             )
 
@@ -697,7 +697,7 @@ def main():
 
                             print(
                                 f"  [BLOCK] {flow.src_ip:<20} "
-                                f"AI_DETECTED_DDOS     "
+                                f"AI_INFERENCE (Binary) "
                                 f"│ ban {ttl_label:<4} "
                                 f"│ offense #{count}"
                             )
@@ -718,12 +718,7 @@ def main():
 
                 if threshold_exceeded:
                     if not enforcer.is_whitelisted(flow.src_ip):
-                        if total_syn > SYN_THRESHOLD:
-                            rule_reason = "RULE_SYN_FLOOD"
-                        elif total_udp_icmp > UDP_ICMP_THRESHOLD:
-                            rule_reason = "RULE_UDP_ICMP_FLOOD"
-                        else:
-                            rule_reason = "RULE_GENERIC_FLOOD"
+                        rule_reason = "RATE_LIMIT (Volumetric)"
 
                         sig = AttackSignature(
                             src_ip       = flow.src_ip,
