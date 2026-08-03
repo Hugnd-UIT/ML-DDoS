@@ -85,21 +85,25 @@ FEATURE_COLUMNS = [
 
 
 # Core color palette, shared by the CSS theme and the charts
+# Modeled after the Kibana Discover screen: white canvas, pink brand
+# accent, muted blue-gray for data visuals
 COLORS = {
-    "bg": "#0a0e14",
-    "panel": "#11161f",
-    "panel_border": "#1f2937",
-    "text": "#e6e9ef",
-    "muted": "#7c8798",
-    "critical": "#ff5c5c",
-    "warning": "#ffb454",
-    "accent": "#00d9c0",
-    "grid": "#1a2130",
+    "bg": "#ffffff",
+    "panel": "#ffffff",
+    "panel_border": "#d3dae6",
+    "sidebar": "#e2007a",
+    "sidebar_dark": "#c4006a",
+    "text": "#1a1c21",
+    "muted": "#69707d",
+    "critical": "#e2007a",
+    "warning": "#f5a623",
+    "accent": "#a3d3e0",
+    "grid": "#eef2f7",
 }
 
 ATTACK_COLOR_SEQUENCE = [
-    "#00d9c0", "#ff5c5c", "#ffb454", "#5b8cff",
-    "#c792ea", "#66d9ef", "#f78c6c", "#a6e22e",
+    "#a3d3e0", "#e2007a", "#f5a623", "#54b399",
+    "#6092c0", "#d36086", "#9170b8", "#79aad9",
 ]
 
 
@@ -242,102 +246,119 @@ def inject_theme():
     st.markdown(
         f"""
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap');
 
             html, body, [class*="css"] {{
                 font-family: 'Inter', sans-serif;
             }}
 
             .stApp {{
-                background:
-                    radial-gradient(circle at 15% 0%, rgba(0,217,192,0.06), transparent 45%),
-                    {COLORS["bg"]};
+                background: {COLORS["bg"]};
                 color: {COLORS["text"]};
             }}
 
+            /* Sidebar styled after the Kibana nav rail */
             section[data-testid="stSidebar"] {{
-                background-color: {COLORS["panel"]};
-                border-right: 1px solid {COLORS["panel_border"]};
+                background: linear-gradient(180deg, {COLORS["sidebar"]} 0%, {COLORS["sidebar_dark"]} 100%);
+                border-right: none;
+            }}
+            section[data-testid="stSidebar"] * {{
+                color: #ffffff !important;
+            }}
+            section[data-testid="stSidebar"] hr {{
+                border-color: rgba(255,255,255,0.25) !important;
+            }}
+            section[data-testid="stSidebar"] div[data-baseweb="checkbox"] div {{
+                border-color: rgba(255,255,255,0.6) !important;
             }}
 
-            /* Header bar with a pulsing status dot */
+            /* Header bar mimicking the Kibana top brand strip */
             .soc-header {{
                 display: flex;
                 align-items: center;
                 gap: 14px;
-                padding: 4px 0 18px 0;
-                border-bottom: 1px solid {COLORS["panel_border"]};
-                margin-bottom: 22px;
+                padding: 14px 18px;
+                background: {COLORS["sidebar"]};
+                border-radius: 6px;
+                margin-bottom: 18px;
             }}
             .soc-header h1 {{
-                font-size: 1.55rem;
+                font-size: 1.3rem;
                 font-weight: 700;
-                letter-spacing: 0.02em;
+                letter-spacing: 0.01em;
                 margin: 0;
-                color: {COLORS["text"]};
+                color: #ffffff;
             }}
             .soc-header .soc-sub {{
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.78rem;
-                color: {COLORS["muted"]};
+                font-family: 'Roboto Mono', monospace;
+                font-size: 0.75rem;
+                color: rgba(255,255,255,0.85);
                 margin-top: 2px;
             }}
             .soc-pulse {{
-                width: 11px;
-                height: 11px;
+                width: 10px;
+                height: 10px;
                 border-radius: 50%;
-                background: {COLORS["critical"]};
-                box-shadow: 0 0 0 0 rgba(255,92,92,0.6);
+                background: #ffffff;
+                box-shadow: 0 0 0 0 rgba(255,255,255,0.7);
                 animation: soc-ping 1.8s ease-out infinite;
                 flex-shrink: 0;
             }}
             @keyframes soc-ping {{
-                0%   {{ box-shadow: 0 0 0 0 rgba(255,92,92,0.55); }}
-                70%  {{ box-shadow: 0 0 0 10px rgba(255,92,92,0); }}
-                100% {{ box-shadow: 0 0 0 0 rgba(255,92,92,0); }}
+                0%   {{ box-shadow: 0 0 0 0 rgba(255,255,255,0.55); }}
+                70%  {{ box-shadow: 0 0 0 9px rgba(255,255,255,0); }}
+                100% {{ box-shadow: 0 0 0 0 rgba(255,255,255,0); }}
             }}
             @media (prefers-reduced-motion: reduce) {{
                 .soc-pulse {{ animation: none; }}
             }}
 
-            /* Metric cards with a colored left border */
+            /* Metric cards styled like Kibana's flat info panels */
             div[data-testid="stMetric"] {{
-                background: {COLORS["panel"]};
+                background: #ffffff;
                 border: 1px solid {COLORS["panel_border"]};
-                border-left: 3px solid {COLORS["accent"]};
-                border-radius: 10px;
-                padding: 14px 18px;
+                border-radius: 4px;
+                padding: 12px 16px;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.04);
             }}
             div[data-testid="stMetricLabel"] {{
-                font-family: 'JetBrains Mono', monospace;
+                font-family: 'Inter', sans-serif;
                 font-size: 0.72rem;
                 text-transform: uppercase;
-                letter-spacing: 0.08em;
+                letter-spacing: 0.06em;
                 color: {COLORS["muted"]};
             }}
             div[data-testid="stMetricValue"] {{
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 1.7rem;
+                font-family: 'Roboto Mono', monospace;
+                font-size: 1.6rem;
                 color: {COLORS["text"]};
             }}
 
-            /* Section headings above each chart */
+            /* Section headings above each chart, Kibana panel-title style */
             h3 {{
-                font-size: 1rem !important;
+                font-size: 0.95rem !important;
                 font-weight: 600 !important;
                 color: {COLORS["text"]} !important;
                 letter-spacing: 0.01em;
+                border-bottom: 1px solid {COLORS["panel_border"]};
+                padding-bottom: 8px;
             }}
 
-            /* Data tables use a monospace font for easier scanning */
+            /* Data tables styled as a flat bordered panel like Discover's log list */
             div[data-testid="stDataFrame"] {{
                 border: 1px solid {COLORS["panel_border"]};
-                border-radius: 10px;
+                border-radius: 4px;
                 overflow: hidden;
             }}
 
             hr {{
                 border-color: {COLORS["panel_border"]} !important;
+            }}
+
+            /* Text input styled like the Kibana search bar */
+            div[data-testid="stTextInput"] input {{
+                border: 1px solid {COLORS["panel_border"]} !important;
+                border-radius: 4px !important;
             }}
         </style>
         """,
@@ -394,6 +415,13 @@ def main():
 
     render_header(source_caption)
 
+    # Search bar for filtering logs, styled after the Kibana query bar
+    search_term = st.text_input(
+        "Search",
+        placeholder="Search... (e.g. src_ip:1.2.3.4 or attack_type:SYN_FLOOD)",
+        label_visibility="collapsed",
+    )
+
     # Load the dirty flow logs
     df, csv_files = load_dirty_flows(
         LOG_DIR, READ_FROM_GCS, GCS_BUCKET_NAME, GCS_LOG_PREFIX
@@ -428,6 +456,17 @@ def main():
 
     # Classify attacks using the loaded model
     df = classify_attack_types(df, model, label_encoder)
+
+    # Apply the free-text search filter across all columns
+    if search_term:
+        mask = df.apply(
+            lambda col: col.astype(str).str.contains(search_term, case=False, na=False)
+        ).any(axis=1)
+        df = df[mask]
+
+        if df.empty:
+            st.info(f"No results match \"{search_term}\".")
+            return
 
     # High-level security metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -481,6 +520,7 @@ def main():
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             font_color=COLORS["text"],
+            font_family="Inter, sans-serif",
             legend=dict(orientation="h", yanchor="bottom", y=-0.15),
             margin=dict(t=10, b=10, l=10, r=10),
         )
@@ -500,24 +540,23 @@ def main():
             .reset_index(name="blocked_count")
         )
 
-        # Build the traffic timeline chart with an area fill under the line
+        # Build the traffic histogram, styled after the Kibana Discover
+        # timestamp-per-interval bar chart
         fig_line = go.Figure()
         fig_line.add_trace(
-            go.Scatter(
+            go.Bar(
                 x=df_time["timestamp"],
                 y=df_time["blocked_count"],
-                mode="lines+markers",
-                line=dict(color=COLORS["critical"], width=2),
-                marker=dict(size=5, color=COLORS["critical"]),
-                fill="tozeroy",
-                fillcolor="rgba(255,92,92,0.12)",
+                marker=dict(color=COLORS["accent"], line=dict(width=0)),
             )
         )
         fig_line.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             font_color=COLORS["text"],
-            xaxis=dict(gridcolor=COLORS["grid"], showgrid=True),
+            font_family="Inter, sans-serif",
+            bargap=0.15,
+            xaxis=dict(gridcolor=COLORS["grid"], showgrid=False),
             yaxis=dict(gridcolor=COLORS["grid"], showgrid=True, title="Event count"),
             margin=dict(t=10, b=10, l=10, r=10),
         )
