@@ -2,31 +2,51 @@
 ╔══════════════════════════════════════════════════════════════════╗
 ║         GATEKEEPER IPS — HYBRID AI + eBPF/XDP CONTROL PLANE      ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+Sửa lỗi đã ghi nhận:
+  - Thêm GlobalFloodDetector: bản cũ chỉ cộng dồn theo TỪNG src_ip, nên một
+    trận SYN flood với source giả mạo ngẫu nhiên (mỗi IP 1-2 gói) không chạm
+    ngưỡng nào cả — đúng kịch bản DDoS phổ biến nhất lại là điểm mù.
+  - Không còn bỏ qua IPv6: trước đây `continue` khi thấy ':' trong src_ip,
+    trong khi XDP cũng PASS mọi gói IPv6 → bypass hoàn toàn.
+  - Kiểm tra khớp số feature giữa model và features.py ngay lúc khởi động.
+    Trước đây model lệch feature làm predict_proba ném lỗi ở MỌI flow, bị
+    handler nuốt, và hệ thống âm thầm tụt xuống chỉ còn rate limiter.
 """
 
 import argparse
 import fcntl
+import hashlib
+import json
 import os
 import socket
 import struct
 import time
 import warnings
 
+from collections import Counter, deque
+
 import joblib
-import numpy as np
-import xgboost as xgb
 
 from cachetools import TTLCache
 from nfstream import NFStreamer
 
 from enforcer import XDPEnforcer, AttackSignature
+from features import (
+    extract_features,
+    FEATURE_NAMES,
+    MIN_DURATION_S,
+    MIN_PACKETS_FOR_INFERENCE,
+    N_FEATURES,
+)
 
 
 # Map IANA protocol numbers to readable protocol names
 PROTO_NAMES = {
     1: "ICMP",
     6: "TCP",
-    17: "UDP"
+    17: "UDP",
+    58: "ICMPv6"
 }
 
 
@@ -48,6 +68,15 @@ MODEL_FILE = os.path.join(
     "binary.pkl"
 )
 
+THRESHOLD_FILE = os.path.join(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    ),
+    "..",
+    "models",
+    "threshold.json"
+)
+
 
 # Configure the multi-vector sliding window
 WINDOW_SECONDS = 5
@@ -57,6 +86,40 @@ SYN_THRESHOLD = 200
 UDP_ICMP_THRESHOLD = 1000
 
 TOTAL_THRESHOLD = 3000
+
+
+# Số gói tối thiểu để tuyến AI vào cuộc trong chế độ bình thường
+MIN_PACKETS_FOR_AI = 10
+
+
+# ── Ngưỡng volumetric TOÀN CỤC (cộng dồn qua MỌI source) ────────────────────
+#
+# Các ngưỡng per-IP ở trên vô dụng trước flood có source giả mạo: attacker rải
+# đều 1-2 gói trên hàng chục nghìn IP khác nhau thì không IP nào chạm ngưỡng,
+# mà tổng lưu lượng vẫn đủ giết server. Bộ đếm dưới đây nhìn tổng thể interface.
+GLOBAL_SYN_THRESHOLD = int(
+    os.environ.get("GLOBAL_SYN_THRESHOLD", "2000")
+)
+
+GLOBAL_PACKET_THRESHOLD = int(
+    os.environ.get("GLOBAL_PACKET_THRESHOLD", "20000")
+)
+
+GLOBAL_SOURCE_THRESHOLD = int(
+    os.environ.get("GLOBAL_SOURCE_THRESHOLD", "500")
+)
+
+# Khi ở FLOOD MODE, chia ngưỡng per-IP cho số này để những source nhỏ lẻ cũng
+# bị chặn. Ở chế độ bình thường thì không, vì đó chính là nguồn false positive.
+FLOOD_MODE_DIVISOR = int(
+    os.environ.get("FLOOD_MODE_DIVISOR", "10")
+)
+
+# Số giây yên ắng liên tục trước khi thoát FLOOD MODE (chống dao động bật/tắt)
+FLOOD_EXIT_GRACE_S = 15
+
+# Trần cứng cho hàng đợi sự kiện của bộ đếm toàn cục
+MAX_FLOOD_EVENTS = 500_000
 
 
 # Parse command-line arguments
@@ -86,7 +149,7 @@ def parse_args():
     return parser.parse_args()
 
 
-# Get all IPv4 addresses assigned to the interface
+# Get all IP addresses assigned to the interface (cả IPv4 lẫn IPv6)
 def get_all_local_ips(ifname):
     import subprocess
 
@@ -94,32 +157,33 @@ def get_all_local_ips(ifname):
     ips = set()
 
     # Try to detect addresses using the ip command
-    try:
-        result = subprocess.run(
-            [
-                "ip",
-                "-4",
-                "addr",
-                "show",
-                ifname
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3
-        )
+    for family_flag in ("-4", "-6"):
+        try:
+            result = subprocess.run(
+                [
+                    "ip",
+                    family_flag,
+                    "addr",
+                    "show",
+                    ifname
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
 
-        # Parse IPv4 addresses from command output
-        for line in result.stdout.splitlines():
-            line = line.strip()
+            # Parse addresses from command output
+            for line in result.stdout.splitlines():
+                line = line.strip()
 
-            if line.startswith("inet "):
-                ip = line.split()[1]
-                ip = ip.split("/")[0]
+                if line.startswith("inet ") or line.startswith("inet6 "):
+                    ip = line.split()[1]
+                    ip = ip.split("/")[0]
 
-                ips.add(ip)
+                    ips.add(ip)
 
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # Use ioctl as a fallback when ip command fails
     if not ips:
@@ -157,10 +221,79 @@ def get_all_local_ips(ifname):
         except Exception:
             pass
 
-    # Always ignore localhost traffic
+    # Always ignore loopback traffic
     ips.add("127.0.0.1")
+    ips.add("::1")
 
     return ips
+
+
+# Đối chiếu sha256 của binary.pkl với giá trị trainer.py đã ghi.
+#
+# PHẢI chạy TRƯỚC load_ai_model(): joblib.load() là unpickle, tức là thực thi
+# mã tuỳ ý chứa trong file, và gatekeeper chạy dưới quyền root vì eBPF đòi hỏi
+# thế. Kiểm tra sau khi đã load thì đã muộn. Hash không ngăn được kẻ sửa được
+# cả hai file, nhưng biến một vụ đánh tráo âm thầm thành cảnh báo nhìn thấy được.
+def verify_model_integrity():
+    try:
+        with open(THRESHOLD_FILE, encoding="utf-8") as fh:
+            expected = json.load(fh).get("binary_sha256")
+
+    except Exception:
+        expected = None
+
+    if not expected:
+        print(
+            "  [!] threshold.json chưa có binary_sha256; "
+            "bỏ qua bước kiểm tra toàn vẹn (chạy lại trainer.py để bật)."
+        )
+
+        return
+
+    digest = hashlib.sha256()
+
+    try:
+        with open(MODEL_FILE, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(block)
+
+    except Exception as exc:
+        print(f"  [!] Không đọc được model để băm: {exc}")
+
+        return
+
+    actual = digest.hexdigest()
+
+    if actual != expected:
+        print(
+            "  [✗] CẢNH BÁO BẢO MẬT: sha256 của binary.pkl KHÔNG khớp "
+            "giá trị trainer.py đã ghi."
+        )
+
+        print(f"      mong đợi : {expected}")
+        print(f"      thực tế  : {actual}")
+
+        print(
+            "  [✗] File model đã bị thay đổi sau khi huấn luyện. "
+            "joblib.load() sẽ chạy mã tuỳ ý dưới quyền root."
+        )
+
+        print(
+            "  [✗] Đặt GATEKEEPER_SKIP_INTEGRITY=1 nếu bạn CHẮC CHẮN "
+            "file này là của mình (ví dụ vừa retrain trên máy khác)."
+        )
+
+        if os.environ.get(
+            "GATEKEEPER_SKIP_INTEGRITY", ""
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            import sys
+
+            sys.exit(1)
+
+        print("  [!] GATEKEEPER_SKIP_INTEGRITY đang bật — vẫn nạp model.")
+
+    else:
+        print("  [+] Model integrity: sha256 khớp")
 
 
 # Load the trained XGBoost model
@@ -205,178 +338,242 @@ def load_ai_model():
         sys.exit(1)
 
 
-# Extract the 19 CIC-DDoS2019 features from an NFStream flow
-def extract_features(flow):
-    # Calculate flow duration
-    duration_us = (
-        float(
-            flow.bidirectional_duration_ms
+# Đối chiếu số feature của model với hợp đồng feature trong features.py.
+#
+# Nếu binary.pkl là bản cũ (ví dụ 19 feature) còn features.py đã rút xuống 18,
+# thì predict_proba() ném exception ở MỌI flow. Handler per-flow nuốt lỗi, in
+# vài dòng rồi chạy tiếp, nên hệ thống vẫn "chạy" nhưng thực chất chỉ còn rate
+# limiter — không ai nhận ra AI đã chết. Thà dừng hẳn lúc khởi động.
+def validate_model_contract(model):
+    n_model = getattr(model, "n_features_in_", None)
+
+    if n_model is None:
+        try:
+            booster = model.get_booster()
+            n_model = len(booster.feature_names or []) or None
+
+        except Exception:
+            n_model = None
+
+    if n_model is None:
+        print(
+            "  [!] Không xác định được số feature của model; "
+            "bỏ qua bước đối chiếu."
         )
-        * 1000.0
-    )
 
-    duration_s = max(
-        float(
-            flow.bidirectional_duration_ms
-        ) / 1000.0,
-        1e-9
-    )
+        return
 
-
-    # Calculate traffic rates
-    flow_bytes_per_s = (
-        float(
-            flow.bidirectional_bytes
+    if int(n_model) != N_FEATURES:
+        print(
+            f"  [✗] FATAL: model nhận {int(n_model)} feature nhưng "
+            f"features.py khai báo {N_FEATURES}."
         )
-        / duration_s
-    )
 
-    flow_packets_per_s = (
-        float(
-            flow.bidirectional_packets
+        print(
+            "  [✗] Model và feature contract lệch nhau — mọi lần suy luận "
+            "sẽ thất bại và hệ thống chỉ còn rate limiter."
         )
-        / duration_s
-    )
+
+        print("  [✗] Chạy lại: python3 src/parser.py && python3 src/trainer.py")
+
+        import sys
+
+        sys.exit(1)
+
+    print(f"  [+] Feature contract khớp: {N_FEATURES} feature")
 
 
-    # Calculate forward and backward traffic totals
-    fwd_pkts = float(
-        flow.src2dst_packets
-    )
-
-    bwd_pkts = float(
-        flow.dst2src_packets
-    )
-
-    fwd_bytes = float(
-        flow.src2dst_bytes
-    )
-
-    bwd_bytes = float(
-        flow.dst2src_bytes
-    )
-
-
-    # Calculate the backward-to-forward packet ratio
-    if fwd_pkts > 0:
-        down_up_ratio = (
-            bwd_pkts / fwd_pkts
-        )
-    else:
-        down_up_ratio = 0.0
-
-
-    # Extract packet length statistics
-    fwd_len_max = float(
-        flow.src2dst_max_ps
-    )
-
-    fwd_len_min = float(
-        flow.src2dst_min_ps
-    )
-
-    fwd_len_mean = float(
-        flow.src2dst_mean_ps
-    )
-
-    bwd_len_mean = float(
-        flow.dst2src_mean_ps
-    )
-
-
-    # Calculate inter-arrival time statistics
-    total_pkts = int(
-        flow.bidirectional_packets
-    )
-
-    if total_pkts > 1:
-        iat_mean_us = (
-            duration_us
-            / (total_pkts - 1)
-        )
-    else:
-        iat_mean_us = 0.0
-
-    iat_std_us = 0.0
-
-
-    # Calculate forward inter-arrival time
+# Load the decision threshold chosen during training.
+#
+# trainer.py picks it on the held-out day-2 capture to hit a target false
+# positive rate, then writes it beside the model. Falling back to 0.5 keeps
+# the system runnable with an older model directory, but 0.5 is the value
+# that made benign traffic a large share of everything the dashboard shows.
+def load_threshold():
     try:
-        fwd_iat_total_us = (
-            float(
-                flow.src2dst_duration_ms
+        with open(THRESHOLD_FILE, encoding="utf-8") as fh:
+            meta = json.load(fh)
+
+        threshold = float(meta["threshold"])
+
+        print(f"  [+] Decision threshold: {threshold:.4f}")
+
+        print(
+            f"      Measured on day-2 holdout: "
+            f"FPR {meta.get('measured_fpr', 0):.4%} / "
+            f"TPR {meta.get('measured_tpr', 0):.4%}"
+        )
+
+        # Đối chiếu số feature ghi trong threshold.json với features.py
+        n_declared = meta.get("n_features")
+
+        if n_declared is not None and int(n_declared) != N_FEATURES:
+            print(
+                f"  [!] threshold.json ghi {int(n_declared)} feature nhưng "
+                f"features.py có {N_FEATURES}. threshold.json đã cũ."
             )
-            * 1000.0
+
+        # Cảnh báo theo hướng NGƯỢC LẠI: chỉ im lặng khi có bằng chứng rõ ràng
+        # rằng ngưỡng đã được hiệu chỉnh trên model production.
+        #
+        # Bản trước chỉ cảnh báo khi calibrated_on == "eval_model", nên đúng
+        # cái file nguy hiểm nhất — threshold.json cũ, KHÔNG có trường này,
+        # chứa ngưỡng lấy nguyên từ eval model — lại chạy hoàn toàn im lặng.
+        if meta.get("calibrated_on") != "production_model":
+            print(
+                "  [!] threshold.json không xác nhận đã hiệu chỉnh trên model "
+                "production (calibrated_on="
+                f"{meta.get('calibrated_on') or 'thiếu'})."
+            )
+
+            print(
+                "  [!] Giá trị xác suất KHÔNG mang cùng ý nghĩa giữa "
+                "binary_eval.pkl và binary.pkl, nên FPR/TPR thực tế có thể "
+                "khác xa số ghi ở trên. Chạy lại src/trainer.py."
+            )
+
+        # Đối chiếu cả TÊN feature, không chỉ số lượng: hai bộ 18 feature khác
+        # thứ tự vẫn đếm ra 18 mà vector đưa vào model thì sai hoàn toàn.
+        declared_names = meta.get("feature_names")
+
+        if declared_names and list(declared_names) != list(FEATURE_NAMES):
+            print(
+                "  [✗] Tên/thứ tự feature trong threshold.json khác "
+                "features.py — model đang được nạp sai vector."
+            )
+
+            print("  [✗] Chạy lại: python3 src/parser.py && python3 src/trainer.py")
+
+            import sys
+
+            sys.exit(1)
+
+        return threshold
+
+    except Exception as exc:
+        print(
+            f"  [!] No usable models/threshold.json ({exc}); "
+            f"falling back to 0.5"
         )
 
-    except AttributeError:
-        # Use the full flow duration as fallback
-        fwd_iat_total_us = duration_us
-
-
-    # Extract TCP flag statistics
-    syn_count = float(
-        flow.bidirectional_syn_packets
-    )
-
-    ack_count = float(
-        flow.bidirectional_ack_packets
-    )
-
-
-    # Extract the initial forward TCP window size
-    try:
-        init_win_fwd = float(
-            flow.src2dst_init_win
+        print(
+            "  [!] Re-run src/trainer.py to generate a tuned threshold."
         )
 
-    except AttributeError:
-        # Use zero when NFStream does not provide the field
-        init_win_fwd = 0.0
+        return 0.5
 
 
-    # Extract the network protocol number
-    protocol = float(
-        flow.protocol
-    )
+# Bộ đếm volumetric toàn cục.
+#
+# Cộng dồn SYN, tổng gói và SỐ SOURCE KHÁC NHAU trên toàn interface trong một
+# cửa sổ trượt. Đây là thứ duy nhất nhìn thấy được flood phân tán/giả mạo, vì
+# theo định nghĩa loại flood đó không có source nào nổi bật.
+class GlobalFloodDetector:
 
+    def __init__(
+        self,
+        window_s=WINDOW_SECONDS,
+        syn_limit=GLOBAL_SYN_THRESHOLD,
+        packet_limit=GLOBAL_PACKET_THRESHOLD,
+        source_limit=GLOBAL_SOURCE_THRESHOLD
+    ):
+        self.window_s = window_s
+        self.syn_limit = syn_limit
+        self.packet_limit = packet_limit
+        self.source_limit = source_limit
 
-    # Build the feature vector in parser.py order
-    features = np.array(
-        [[
-            duration_us,
-            flow_bytes_per_s,
-            flow_packets_per_s,
-            fwd_pkts,
-            bwd_pkts,
-            down_up_ratio,
-            fwd_bytes,
-            bwd_bytes,
-            fwd_len_max,
-            fwd_len_min,
-            fwd_len_mean,
-            bwd_len_mean,
-            iat_mean_us,
-            iat_std_us,
-            fwd_iat_total_us,
-            protocol,
-            syn_count,
-            ack_count,
-            init_win_fwd
-        ]],
-        dtype=np.float32
-    )
+        self._events = deque()
+        self._sources = Counter()
 
+        self._syn_total = 0
+        self._packet_total = 0
 
-    # Replace invalid numeric values with zero
-    features = np.nan_to_num(
-        features,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0
-    )
+        self.active = False
+        self._last_exceed = 0.0
+        self.trigger_reason = ""
 
-    return features
+    # Loại bỏ một sự kiện cũ nhất và trừ lại các bộ đếm
+    def _pop_oldest(self):
+        _, syn, packets, src_ip = self._events.popleft()
+
+        self._syn_total -= syn
+        self._packet_total -= packets
+
+        self._sources[src_ip] -= 1
+
+        if self._sources[src_ip] <= 0:
+            del self._sources[src_ip]
+
+    # Loại bỏ các sự kiện đã rơi ra ngoài cửa sổ
+    def _trim(self, now):
+        cutoff = now - self.window_s
+
+        while self._events and self._events[0][0] < cutoff:
+            self._pop_oldest()
+
+        # Trần cứng: nếu đồng hồ hệ thống nhảy lùi thì điều kiện thời gian ở
+        # trên không bao giờ đúng và deque sẽ phình vô hạn ngay giữa lúc bị
+        # tấn công. Chính bộ đếm chống DDoS mà bị DoS thì hỏng cả hệ thống.
+        while len(self._events) > MAX_FLOOD_EVENTS:
+            self._pop_oldest()
+
+    # Ghi nhận một flow và trả về True nếu đang trong FLOOD MODE
+    def observe(self, now, syn, packets, src_ip):
+        self._events.append((now, syn, packets, src_ip))
+
+        self._syn_total += syn
+        self._packet_total += packets
+        self._sources[src_ip] += 1
+
+        self._trim(now)
+
+        reasons = []
+
+        if self._syn_total > self.syn_limit:
+            reasons.append(
+                f"SYN {self._syn_total:,}/{self.window_s}s "
+                f"> {self.syn_limit:,}"
+            )
+
+        if self._packet_total > self.packet_limit:
+            reasons.append(
+                f"packets {self._packet_total:,}/{self.window_s}s "
+                f"> {self.packet_limit:,}"
+            )
+
+        if len(self._sources) > self.source_limit:
+            reasons.append(
+                f"distinct sources {len(self._sources):,}/{self.window_s}s "
+                f"> {self.source_limit:,}"
+            )
+
+        if reasons:
+            self._last_exceed = now
+            self.trigger_reason = " | ".join(reasons)
+
+            if not self.active:
+                self.active = True
+
+                return True, True  # (đang flood, vừa mới kích hoạt)
+
+        elif self.active and now - self._last_exceed > FLOOD_EXIT_GRACE_S:
+            self.active = False
+            self.trigger_reason = ""
+
+            print(
+                f"  [~] FLOOD MODE OFF — "
+                f"{FLOOD_EXIT_GRACE_S}s không còn vượt ngưỡng toàn cục"
+            )
+
+        return self.active, False
+
+    # Số liệu hiện tại của cửa sổ, dùng cho log và cảnh báo
+    def snapshot(self):
+        return {
+            "syn": self._syn_total,
+            "packets": self._packet_total,
+            "sources": len(self._sources),
+        }
 
 
 # Print a section banner
@@ -398,6 +595,48 @@ def _banner(
     print(
         f"  {'─' * width}"
     )
+
+
+# Cảnh báo khi vào FLOOD MODE. Tách riêng để không phụ thuộc notifier khi
+# module đó chưa cấu hình Telegram.
+def _announce_flood(detector):
+    stats = detector.snapshot()
+
+    print()
+    print("  ╔" + "═" * 63 + "╗")
+    print("  ║   ⚠  GLOBAL FLOOD MODE ACTIVATED                            ║")
+    print("  ╚" + "═" * 63 + "╝")
+    print(f"  [!] Trigger: {detector.trigger_reason}")
+    print(
+        f"  [!] Cửa sổ {detector.window_s}s: "
+        f"{stats['syn']:,} SYN / {stats['packets']:,} gói / "
+        f"{stats['sources']:,} source khác nhau"
+    )
+    print(
+        f"  [!] Hạ ngưỡng per-IP xuống 1/{FLOOD_MODE_DIVISOR} và cho AI "
+        f"phân tích cả flow nhỏ (>= {MIN_PACKETS_FOR_INFERENCE} gói)."
+    )
+    print(
+        "  [!] LƯU Ý: nếu source bị giả mạo thì chặn theo src IP là vô nghĩa "
+        "về bản chất — tuyến phòng thủ ở đây là tcp_syncookies (đã bật trong "
+        "scripts/setup.sh) và rp_filter, không phải blacklist."
+    )
+    print()
+
+    try:
+        from notifier import send_telegram_async
+
+        send_telegram_async(
+            "🌊 <b>[SOC] GLOBAL FLOOD MODE</b>\n\n"
+            f"Trigger: <code>{detector.trigger_reason}</code>\n"
+            f"Cửa sổ {detector.window_s}s: {stats['syn']:,} SYN / "
+            f"{stats['packets']:,} gói / {stats['sources']:,} source\n\n"
+            "Hệ thống đã hạ ngưỡng per-IP và mở rộng phạm vi suy luận AI.\n"
+            "Nếu source bị spoof, hãy dựa vào syncookies + upstream scrubbing."
+        )
+
+    except Exception as exc:
+        print(f"  [!] Không gửi được cảnh báo flood: {exc}")
 
 
 # Start the Gatekeeper IPS
@@ -482,7 +721,14 @@ def main():
         "3/4  INITIALIZING AI ENGINE XGBoost"
     )
 
+    # Kiểm tra toàn vẹn TRƯỚC khi unpickle
+    verify_model_integrity()
+
     ai_model = load_ai_model()
+
+    validate_model_contract(ai_model)
+
+    ai_threshold = load_threshold()
 
 
     # Configure the egress traffic filter
@@ -504,11 +750,40 @@ def main():
         "addresses will be ignored"
     )
 
+    # Nói rõ trạng thái IPv6 thay vì âm thầm bỏ qua như bản cũ
+    has_global_v6 = any(
+        ":" in ip and not ip.startswith(("fe80", "::1"))
+        for ip in local_ips
+    )
+
+    if has_global_v6 and enforcer.blacklist6_map is None:
+        print(
+            "  [✗] Interface có địa chỉ IPv6 global nhưng eBPF program "
+            "không có map IPv6 — traffic IPv6 sẽ KHÔNG được chặn."
+        )
+
+        print(
+            "  [✗] Biên dịch lại với src/xdp_filter.c mới nhất."
+        )
+
+    elif enforcer.blacklist6_map is not None:
+        print("  [+] IPv6 enforcement: ENABLED")
+
 
     # Create the sliding-window packet tracker
     packet_window = TTLCache(
         maxsize=100_000,
         ttl=60
+    )
+
+    # Bộ đếm volumetric toàn cục
+    flood = GlobalFloodDetector()
+
+    print(
+        f"  [+] Global flood thresholds: "
+        f"{GLOBAL_SYN_THRESHOLD:,} SYN / "
+        f"{GLOBAL_PACKET_THRESHOLD:,} gói / "
+        f"{GLOBAL_SOURCE_THRESHOLD:,} source mỗi {WINDOW_SECONDS}s"
     )
 
 
@@ -529,23 +804,12 @@ def main():
 
     print()
 
-    try:
-        # Create the NFStream traffic monitor
-        streamer = NFStreamer(
-            source=interface,
-            active_timeout=1,
-            idle_timeout=1,
-            statistical_analysis=True
-        )
-
+    # Vòng tiêu thụ flow, tách khỏi main() để supervisor bên dưới dựng lại
+    # được NFStream mà vẫn giữ nguyên enforcer, whitelist, model và sổ ban.
+    def consume(streamer):
         # Process each detected network flow
         for flow in streamer:
             try:
-                # Ignore IPv6 traffic
-                if ":" in flow.src_ip:
-                    continue
-
-
                 # Ignore traffic originating from local IPs
                 if flow.src_ip in local_ips:
                     continue
@@ -573,10 +837,23 @@ def main():
 
 
                 # Count UDP and ICMP packets separately
-                if flow.protocol in (1, 17):
+                if flow.protocol in (1, 17, 58):
                     udp_icmp_count = total_count
                 else:
                     udp_icmp_count = 0
+
+
+                # Cập nhật bộ đếm toàn cục TRƯỚC mọi quyết định per-IP.
+                # Đây là chỗ duy nhất nhìn thấy flood phân tán.
+                flood_mode, flood_just_started = flood.observe(
+                    now,
+                    syn_count,
+                    total_count,
+                    flow.src_ip
+                )
+
+                if flood_just_started:
+                    _announce_flood(flood)
 
 
                 # Create a tracking entry for new source IPs
@@ -659,22 +936,38 @@ def main():
 
 
                 # ── TUYẾN 1: AI XGBoost (Trọng tâm phát hiện chính) ─────────────────────
-                # Chỉ phân tích flow đủ lớn để AI có dữ liệu ý nghĩa (>= 10 packets).
-                # Đây là tuyến phát hiện chính của hệ thống.
-                if flow.bidirectional_packets >= 10:
-                    features   = extract_features(flow)
-                    prediction = ai_model.predict(features)
+                # Chỉ phân tích flow đủ lớn để AI có dữ liệu ý nghĩa.
+                # Trong FLOOD MODE, hạ yêu cầu xuống mức tối thiểu mà
+                # extract_features() còn mô tả được, để không bỏ lọt flow nhỏ.
+                min_packets = (
+                    MIN_PACKETS_FOR_INFERENCE
+                    if flood_mode
+                    else MIN_PACKETS_FOR_AI
+                )
 
-                    if isinstance(prediction, (list, np.ndarray)):
-                        pred_val = int(prediction[0])
-                    else:
-                        pred_val = int(prediction)
+                features = None
 
-                    if pred_val >= 1:
+                if flow.bidirectional_packets >= min_packets:
+                    features = extract_features(flow)
+
+                # extract_features returns None for flows too small to
+                # describe. Feeding the model a placeholder vector there
+                # produced confident nonsense, so fall through to the rate
+                # limiter instead.
+                if features is not None:
+                    # Score against the tuned threshold rather than
+                    # predict()'s implicit 0.5. Benign traffic outnumbers
+                    # attacks in production, so a cut-off chosen for balanced
+                    # data floods the dashboard with false positives.
+                    attack_proba = float(
+                        ai_model.predict_proba(features)[0][1]
+                    )
+
+                    if attack_proba >= ai_threshold:
                         if not enforcer.is_whitelisted(flow.src_ip):
                             duration_s = max(
                                 float(flow.bidirectional_duration_ms) / 1000.0,
-                                1e-9
+                                MIN_DURATION_S
                             )
 
                             sig = AttackSignature(
@@ -689,36 +982,50 @@ def main():
 
                             count, ttl_secs = enforcer.block_ip(sig)
 
-                            ttl_label = (
-                                f"{ttl_secs // 3600}h"
-                                if ttl_secs >= 3600
-                                else f"{ttl_secs // 60}m"
-                            )
+                            if count:
+                                ttl_label = (
+                                    f"{ttl_secs // 3600}h"
+                                    if ttl_secs >= 3600
+                                    else f"{ttl_secs // 60}m"
+                                )
 
-                            print(
-                                f"  [BLOCK] {flow.src_ip:<20} "
-                                f"AI_INFERENCE (Binary) "
-                                f"│ ban {ttl_label:<4} "
-                                f"│ offense #{count}"
-                            )
+                                print(
+                                    f"  [BLOCK] {flow.src_ip:<20} "
+                                    f"AI_INFERENCE (Binary) "
+                                    f"│ p={attack_proba:.4f} "
+                                    f"│ ban {ttl_label:<4} "
+                                    f"│ offense #{count}"
+                                )
 
                         # Đã xử lý qua AI, không cần Rate Limiter kiểm tra lại
                         packet_window.pop(flow.src_ip, None)
                         continue
 
                 # ── TUYẾN 2: Rate Limiter (Lưới an toàn cho bão cực lớn) ─────────────────
-                # Chỉ kích hoạt khi flow quá nhỏ cho AI (< 10 packets) NHƯNG khối lượng
-                # gói tin trong cửa sổ trượt vượt ngưỡng volumetric cực cao.
-                # Đây là biện pháp phòng vệ cuối chống bão SYN/UDP xả chớp nhoáng.
+                # Kích hoạt khi khối lượng gói tin trong cửa sổ trượt của MỘT
+                # source vượt ngưỡng volumetric. Trong FLOOD MODE ngưỡng được
+                # hạ xuống 1/FLOOD_MODE_DIVISOR vì lúc đó tổng thể đã bất
+                # thường, nên rủi ro false positive được đánh đổi có chủ đích.
+                divisor = FLOOD_MODE_DIVISOR if flood_mode else 1
+
+                syn_limit = max(SYN_THRESHOLD // divisor, 1)
+                udp_limit = max(UDP_ICMP_THRESHOLD // divisor, 1)
+                pkt_limit = max(TOTAL_THRESHOLD // divisor, 1)
+
                 threshold_exceeded = (
-                    total_syn      > SYN_THRESHOLD
-                    or total_udp_icmp > UDP_ICMP_THRESHOLD
-                    or total_pkts  > TOTAL_THRESHOLD
+                    total_syn > syn_limit
+                    or total_udp_icmp > udp_limit
+                    or total_pkts > pkt_limit
                 )
 
                 if threshold_exceeded:
                     if not enforcer.is_whitelisted(flow.src_ip):
-                        rule_reason = "RATE_LIMIT (Volumetric)"
+                        rule_reason = (
+                            "RATE_LIMIT (Flood Mode)"
+                            if flood_mode
+                            else "RATE_LIMIT (Volumetric)"
+                        )
+
                         rl_features = extract_features(flow)
 
                         sig = AttackSignature(
@@ -735,26 +1042,99 @@ def main():
 
                         packet_window.pop(flow.src_ip, None)
 
-                        ttl_label = (
-                            f"{ttl_secs // 3600}h"
-                            if ttl_secs >= 3600
-                            else f"{ttl_secs // 60}m"
-                        )
+                        if count:
+                            ttl_label = (
+                                f"{ttl_secs // 3600}h"
+                                if ttl_secs >= 3600
+                                else f"{ttl_secs // 60}m"
+                            )
 
-                        print(
-                            f"  [BLOCK] {flow.src_ip:<20} "
-                            f"{rule_reason:<20} "
-                            f"│ ban {ttl_label:<4} "
-                            f"│ offense #{count}"
-                        )
+                            print(
+                                f"  [BLOCK] {flow.src_ip:<20} "
+                                f"{rule_reason:<24} "
+                                f"│ ban {ttl_label:<4} "
+                                f"│ offense #{count}"
+                            )
 
 
             # Handle errors from individual flows
             except Exception as flow_err:
+                # Đọc src_ip trong try riêng: nếu chính việc truy cập thuộc
+                # tính flow là thứ đã ném lỗi thì handler cũ sẽ ném lần hai.
+                try:
+                    who = flow.src_ip
+
+                except Exception:
+                    who = "unknown"
+
                 print(
                     f"  [-] Flow error "
-                    f"({flow.src_ip}): {flow_err}"
+                    f"({who}): {flow_err}"
                 )
+
+
+    # Supervisor: dựng lại NFStream khi nó chết.
+    #
+    # Bản trước để `for flow in streamer` trần trong một try duy nhất, nên bất
+    # kỳ exception nào thoát ra từ NFStream — libpcap mất interface, hết bộ
+    # nhớ, một gói dị dạng làm rơi luồng — đều rơi thẳng xuống `finally`, gỡ
+    # XDP và thoát. Nghĩa là ĐÚNG lúc bị tấn công nặng nhất, máy chủ không chỉ
+    # mất bộ phát hiện mà mất luôn cả tầng chặn ở kernel: những IP đang bị ban
+    # bỗng đi qua được. Một sự cố nhỏ ở tầng bắt gói trở thành gỡ bỏ toàn bộ
+    # hàng phòng thủ.
+    try:
+        backoff_s = 1
+        restarts = 0
+
+        while True:
+            started_at = time.time()
+
+            try:
+                streamer = NFStreamer(
+                    source=interface,
+                    active_timeout=1,
+                    idle_timeout=1,
+                    statistical_analysis=True
+                )
+
+                consume(streamer)
+
+                cause = "NFStream đã đóng luồng"
+
+            except KeyboardInterrupt:
+                raise
+
+            except Exception as exc:
+                cause = f"NFStream lỗi: {exc}"
+
+            uptime = time.time() - started_at
+
+            # Chạy được một lúc rồi mới chết → coi như sự cố nhất thời, thử
+            # lại ngay. Chết liên tiếp → giãn dần để không quay tít CPU.
+            if uptime > 60:
+                backoff_s = 1
+
+            restarts += 1
+
+            print(
+                f"\n  [✗] {cause}"
+            )
+
+            print(
+                f"  [~] XDP VẪN đang gắn và tiếp tục chặn "
+                f"({len(enforcer.ban_registry):,} IP trong sổ ban)."
+            )
+
+            print(
+                f"  [~] Khởi động lại bộ bắt gói sau {backoff_s}s "
+                f"(lần thứ {restarts})..."
+            )
+
+            enforcer.print_stats()
+
+            time.sleep(backoff_s)
+
+            backoff_s = min(backoff_s * 2, 30)
 
 
     # Handle manual shutdown
@@ -765,15 +1145,15 @@ def main():
         )
 
 
-    # Handle unrecoverable runtime errors
-    except Exception as exc:
-        print(
-            f"\n  [✗] Fatal error: {exc}"
-        )
-
-
     # Always detach XDP before exiting
     finally:
+        # In số liệu data plane TRƯỚC khi gỡ XDP: sau detach thì map biến mất
+        # cùng chương trình và không còn gì để đọc.
+        try:
+            enforcer.print_stats()
+        except Exception as e:
+            print(f"  [-] Không đọc được XDP counters: {e}")
+
         try:
             from gcs_utility import get_collector
             get_collector().stop()

@@ -18,6 +18,11 @@ data/CICDDoS2019/*
 # !models/.gitkeep
 
 *.json
+# threshold.json là ARTIFACT TRIỂN KHAI, không phải file rác.
+# Thiếu nó thì gatekeeper.load_threshold() rơi về 0.5, và FPR nhảy từ
+# 0.0018% lên 0.966% — gấp hơn 500 lần số false positive.
+!models/threshold.json
+
 .env
 *.pem
 *.key

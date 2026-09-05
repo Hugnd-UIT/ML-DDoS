@@ -6,6 +6,7 @@
 
 
 import glob
+import hmac
 import io
 import os
 
@@ -15,6 +16,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from features import FEATURE_NAMES
 
 try:
     from google.cloud import storage as gcs
@@ -41,6 +44,24 @@ GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
 GCS_LOG_PREFIX = os.environ.get("GCS_LOG_PREFIX", "ddos-logs/")
 READ_FROM_GCS = bool(GCS_BUCKET_NAME) and GCS_AVAILABLE
 
+# Mật khẩu truy cập dashboard. Trang này công khai toàn bộ IP bị chặn, cổng bị
+# nhắm và vector đặc trưng của từng cuộc tấn công — chính là bản đồ để attacker
+# biết cái gì lọt lưới. Trên Cloud Run nên đặt IAP phía trước; biến này là lớp
+# bảo vệ tối thiểu cho trường hợp deploy --allow-unauthenticated.
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+
+# Chỉ cho phép chạy không mật khẩu khi khai báo rõ ràng (dev trên máy cá nhân)
+ALLOW_ANONYMOUS = os.environ.get(
+    "DASHBOARD_ALLOW_ANONYMOUS", ""
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Giới hạn số file CSV đọc mỗi lần refresh. Không có giới hạn thì dashboard sẽ
+# tải TOÀN BỘ bucket mỗi 10 giây, và chi phí đó tăng tuyến tính mãi mãi.
+MAX_LOG_FILES = int(os.environ.get("DASHBOARD_MAX_LOG_FILES", "50"))
+
+# Chu kỳ tự làm mới, tính bằng giây
+REFRESH_INTERVAL_S = int(os.environ.get("DASHBOARD_REFRESH_S", "10"))
+
 
 # Multiclass model path
 MULTICLASS_MODEL_PATH = os.path.join(
@@ -60,28 +81,9 @@ LABEL_ENCODER_PATH = os.path.join(
 )
 
 
-# 19 feature columns used by the multiclass model
-FEATURE_COLUMNS = [
-    "Flow Duration",
-    "Flow Bytes/s",
-    "Flow Packets/s",
-    "Total Fwd Packets",
-    "Total Backward Packets",
-    "Down/Up Ratio",
-    "Total Length of Fwd Packets",
-    "Total Length of Bwd Packets",
-    "Fwd Packet Length Max",
-    "Fwd Packet Length Min",
-    "Fwd Packet Length Mean",
-    "Bwd Packet Length Mean",
-    "Flow IAT Mean",
-    "Flow IAT Std",
-    "Fwd IAT Total",
-    "Protocol",
-    "SYN Flag Count",
-    "ACK Flag Count",
-    "Init_Win_bytes_forward"
-]
+# Feature columns used by the multiclass model, shared with the training
+# pipeline so the dashboard cannot drift out of sync with the model
+FEATURE_COLUMNS = list(FEATURE_NAMES)
 
 
 # Core color palette, shared by the CSS theme and the charts
@@ -114,6 +116,10 @@ def _load_from_gcs(bucket_name, prefix):
     blobs = list(client.list_blobs(bucket_name, prefix=prefix))
     csv_blobs = [b for b in blobs if b.name.endswith(".csv")]
 
+    # Chỉ lấy các file mới nhất. Bản cũ tải toàn bộ bucket mỗi 10 giây.
+    csv_blobs.sort(key=lambda b: b.updated, reverse=True)
+    csv_blobs = csv_blobs[:MAX_LOG_FILES]
+
     if not csv_blobs:
         return pd.DataFrame(), []
 
@@ -133,7 +139,12 @@ def _load_from_gcs(bucket_name, prefix):
 
 # Read all CSV files from local disk
 def _load_from_local(log_dir):
-    csv_files = sorted(glob.glob(os.path.join(log_dir, "*.csv")))
+    csv_files = sorted(
+        glob.glob(os.path.join(log_dir, "*.csv")),
+        key=os.path.getmtime,
+        reverse=True
+    )[:MAX_LOG_FILES]
+
     if not csv_files:
         return pd.DataFrame(), csv_files
 
@@ -151,7 +162,7 @@ def _load_from_local(log_dir):
 
 
 # Load and merge all dirty flow CSV files
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=REFRESH_INTERVAL_S)
 def load_dirty_flows(log_dir, read_from_gcs, bucket_name, prefix):
     if read_from_gcs:
         df, sources = _load_from_gcs(bucket_name, prefix)
@@ -181,6 +192,24 @@ def load_multiclass_model():
         if os.path.exists(LABEL_ENCODER_PATH):
             label_encoder = joblib.load(LABEL_ENCODER_PATH)
 
+        # Đối chiếu hợp đồng feature ngay lúc nạp, giống gatekeeper làm với
+        # model nhị phân. Nếu multiclass.pkl là bản cũ, predict() sẽ ném lỗi ở
+        # MỌI lần gọi; bản trước chỉ hiện một dòng warning nhỏ giữa trang rồi
+        # âm thầm vẽ biểu đồ bằng cột `reason`. Người xem vẫn thấy một biểu đồ
+        # "phân loại tấn công" trông bình thường mà thực chất model đã chết.
+        n_model = getattr(model, "n_features_in_", None)
+
+        if n_model is not None and int(n_model) != len(FEATURE_COLUMNS):
+            st.error(
+                f"⚠️ `models/multiclass.pkl` nhận {int(n_model)} feature "
+                f"nhưng `features.py` khai báo {len(FEATURE_COLUMNS)}. "
+                "Model đã cũ so với bộ đặc trưng hiện tại — biểu đồ phân loại "
+                "sẽ dùng cột `reason` thay vì dự đoán. "
+                "Chạy lại `python3 src/trainer.py`."
+            )
+
+            return None, label_encoder
+
         return model, label_encoder
 
     # Handle model loading errors
@@ -189,7 +218,12 @@ def load_multiclass_model():
         return None, None
 
 
-# Classify detected attacks using the multiclass model
+# Classify detected attacks using the multiclass model.
+#
+# Chỉ suy luận trên những dòng THỰC SỰ có vector đặc trưng. Bản cũ gọi
+# .fillna(0) cho mọi dòng, kể cả dòng do rate limiter chặn với features=None —
+# vector toàn số 0 vẫn được model gán một nhãn nào đó, và biểu đồ
+# "Attack Type Distribution" hiển thị loại tấn công hoàn toàn bịa ra.
 def classify_attack_types(df, model, label_encoder):
     # Copy to avoid mutating the original DataFrame
     df = df.copy()
@@ -199,18 +233,32 @@ def classify_attack_types(df, model, label_encoder):
 
     # Keep the original labels when no model is available
     if model is None:
-        return df
+        return df, 0
 
     # Check whether all required feature columns exist
     has_feature_columns = set(FEATURE_COLUMNS).issubset(df.columns)
 
     if not has_feature_columns:
-        return df
+        return df, 0
 
-    # Fill missing feature values with 0 to ensure every row is classified into one of the 13 classes
-    X = df[FEATURE_COLUMNS].fillna(0).astype(np.float32)
+    # Dòng đủ điều kiện suy luận: có cờ has_features (log mới) hoặc, với log
+    # cũ chưa có cột đó, không có ô đặc trưng nào bị thiếu.
+    if "has_features" in df.columns:
+        eligible = pd.to_numeric(
+            df["has_features"], errors="coerce"
+        ).fillna(0).astype(int) == 1
 
-    # Run multiclass prediction on 100% of rows
+    else:
+        eligible = df[FEATURE_COLUMNS].notna().all(axis=1)
+
+    skipped = int((~eligible).sum())
+
+    if not eligible.any():
+        return df, skipped
+
+    X = df.loc[eligible, FEATURE_COLUMNS].astype(np.float32)
+
+    # Run multiclass prediction on the eligible rows only
     try:
         preds = model.predict(X)
 
@@ -219,7 +267,7 @@ def classify_attack_types(df, model, label_encoder):
             preds = label_encoder.inverse_transform(preds.astype(int))
 
         # Store the predicted attack types
-        df["attack_type"] = preds
+        df.loc[eligible, "attack_type"] = preds
 
     # Keep the original labels only when prediction fails
     except Exception as exc:
@@ -228,7 +276,9 @@ def classify_attack_types(df, model, label_encoder):
             "Using original labels instead."
         )
 
-    return df
+        return df, skipped
+
+    return df, skipped
 
 
 # Inject custom CSS for the whole dashboard theme
@@ -356,6 +406,60 @@ def inject_theme():
     )
 
 
+# Ngủ một nhịp rồi rerun.
+#
+# Nhánh "chưa có dữ liệu" của bản cũ gọi st.rerun() KHÔNG kèm sleep, tạo ra
+# vòng lặp quay tít: mỗi vòng là một lượt list_blobs() + download toàn bộ
+# bucket, chạy nhanh hết mức CPU cho phép. Trên Cloud Run đó vừa là hoá đơn
+# GCS tăng vọt vừa là một instance luôn ở 100% CPU.
+def schedule_refresh():
+    import time
+
+    time.sleep(REFRESH_INTERVAL_S)
+    st.rerun()
+
+
+# Chặn truy cập khi chưa nhập đúng mật khẩu.
+#
+# Trả về True nếu được phép xem. So sánh bằng hmac.compare_digest để không rò
+# rỉ độ dài/nội dung mật khẩu qua thời gian phản hồi.
+def check_password():
+    if ALLOW_ANONYMOUS:
+        return True
+
+    if not DASHBOARD_PASSWORD:
+        st.error(
+            "🔒 Dashboard chưa được cấu hình bảo mật.\n\n"
+            "Trang này công khai toàn bộ IP bị chặn, cổng bị nhắm và vector "
+            "đặc trưng của từng cuộc tấn công. Hãy đặt biến môi trường "
+            "`DASHBOARD_PASSWORD`, hoặc đặt Cloud IAP phía trước và bật "
+            "`DASHBOARD_ALLOW_ANONYMOUS=1`."
+        )
+
+        st.stop()
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("### 🔒 SOC Dashboard")
+
+    entered = st.text_input(
+        "Mật khẩu truy cập",
+        type="password",
+        key="password_input"
+    )
+
+    if entered:
+        if hmac.compare_digest(entered, DASHBOARD_PASSWORD):
+            st.session_state["authenticated"] = True
+
+            return True
+
+        st.error("Mật khẩu không đúng.")
+
+    st.stop()
+
+
 # Render the dashboard header along with the data source status line
 def render_header(source_label):
     st.markdown(
@@ -385,12 +489,15 @@ def main():
     # Apply the custom theme to the whole page
     inject_theme()
 
+    # Yêu cầu xác thực trước khi render bất cứ dữ liệu nào
+    check_password()
+
     # Sidebar configuration options
     with st.sidebar:
         st.markdown("##### ⚙️ Configuration")
 
         auto_refresh = st.checkbox(
-            "Automatically refresh every 10s",
+            f"Automatically refresh every {REFRESH_INTERVAL_S}s",
             value=True
         )
 
@@ -430,7 +537,7 @@ def main():
 
         # Refresh the dashboard when enabled
         if auto_refresh:
-            st.rerun()
+            schedule_refresh()
 
         return
 
@@ -445,12 +552,26 @@ def main():
         )
 
     # Classify attacks using the loaded model
-    df = classify_attack_types(df, model, label_encoder)
+    df, skipped = classify_attack_types(df, model, label_encoder)
 
-    # Apply the free-text search filter across all columns
+    # Nói rõ khi có dòng không suy luận được, thay vì gán nhãn bịa
+    if skipped:
+        st.caption(
+            f"ℹ️ {skipped:,} sự kiện không có vector đặc trưng "
+            f"(flow quá nhỏ, bị rate limiter chặn) nên giữ nguyên nhãn "
+            f"`reason` thay vì đoán loại tấn công."
+        )
+
+    # Apply the free-text search filter across all columns.
+    #
+    # regex=False là bắt buộc: mặc định str.contains coi chuỗi nhập vào là
+    # biểu thức chính quy, nên gõ "(" là crash và gõ "(a+)+$" là ReDoS treo
+    # nguyên instance.
     if search_term:
         mask = df.apply(
-            lambda col: col.astype(str).str.contains(search_term, case=False, na=False)
+            lambda col: col.astype(str).str.contains(
+                search_term, case=False, na=False, regex=False
+            )
         ).any(axis=1)
         df = df[mask]
 
@@ -569,15 +690,20 @@ def main():
     # Latest detailed security logs
     st.markdown("### Detailed Logs — Latest 100 Events")
 
-    # Columns shown in the dashboard
+    # Columns shown in the dashboard. Lọc theo cột thực có để log cũ (thiếu
+    # cột mới) không làm cả trang crash bằng KeyError.
     display_columns = [
-        "timestamp",
-        "src_ip",
-        "protocol",
-        "dst_port",
-        "pps",
-        "reason",
-        "attack_type"
+        column
+        for column in [
+            "timestamp",
+            "src_ip",
+            "protocol",
+            "dst_port",
+            "pps",
+            "reason",
+            "attack_type"
+        ]
+        if column in df.columns
     ]
 
     # Sort logs by newest timestamp
@@ -590,11 +716,9 @@ def main():
     # Render the detailed log table
     st.dataframe(latest_logs, use_container_width=True, hide_index=True)
 
-    # Refresh the dashboard every 10 seconds
+    # Refresh the dashboard on the configured interval
     if auto_refresh:
-        import time
-        time.sleep(10)
-        st.rerun()
+        schedule_refresh()
 
 
 # Run the dashboard application

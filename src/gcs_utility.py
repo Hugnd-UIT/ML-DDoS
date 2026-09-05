@@ -3,7 +3,9 @@ import io
 import os
 import threading
 import time
-from collections import Counter
+import uuid
+
+from features import FEATURE_NAMES
 
 
 # Check whether Google Cloud Storage is available
@@ -51,7 +53,13 @@ LOCAL_LOG_DIR = os.path.join(
 )
 
 
-# Define metadata fields for administrators
+# Define metadata fields for administrators.
+#
+# has_features cho biết dòng này CÓ vector đặc trưng hợp lệ hay không. Tuyến
+# rate limiter có thể chặn một flow quá nhỏ để mô tả (features=None), và khi
+# đó DictWriter ghi ô rỗng. Nếu dashboard cứ fillna(0) rồi đưa vào model thì
+# nó vẫn trả về một nhãn nào đó — tức là bịa ra loại tấn công. Cột này để
+# app.py phân biệt được hai trường hợp.
 METADATA_FIELDNAMES = [
     "timestamp",
     "src_ip",
@@ -62,32 +70,13 @@ METADATA_FIELDNAMES = [
     "fwd_len_mean",
     "reason",
     "signature_key",
-    "blocked_at_epoch"
+    "blocked_at_epoch",
+    "has_features"
 ]
 
 
-# Define the 19 AI feature fields
-FEATURE_FIELDNAMES = [
-    "Flow Duration",
-    "Flow Bytes/s",
-    "Flow Packets/s",
-    "Total Fwd Packets",
-    "Total Backward Packets",
-    "Down/Up Ratio",
-    "Total Length of Fwd Packets",
-    "Total Length of Bwd Packets",
-    "Fwd Packet Length Max",
-    "Fwd Packet Length Min",
-    "Fwd Packet Length Mean",
-    "Bwd Packet Length Mean",
-    "Flow IAT Mean",
-    "Flow IAT Std",
-    "Fwd IAT Total",
-    "Protocol",
-    "SYN Flag Count",
-    "ACK Flag Count",
-    "Init_Win_bytes_forward"
-]
+# AI feature columns, shared with the training pipeline and the extractor
+FEATURE_FIELDNAMES = list(FEATURE_NAMES)
 
 
 # Combine metadata and AI feature columns
@@ -141,12 +130,15 @@ class DirtyFlowEvent:
         )
 
 
-        # Store the 19 AI features when available
-        if (
+        # Store the AI feature vector when available
+        has_features = (
             features is not None
-            and len(features)
-            == len(FEATURE_FIELDNAMES)
-        ):
+            and len(features) == len(FEATURE_FIELDNAMES)
+        )
+
+        self.has_features = int(has_features)
+
+        if has_features:
             for col_name, value in zip(
                 FEATURE_FIELDNAMES,
                 features
@@ -276,9 +268,7 @@ class DirtyFlowCollector:
         self.buffer = []
         self.lock = threading.Lock()
         self.running = False
-
-        self.window_blocked = 0
-        self.window_ips = Counter()
+        self._stop_event = threading.Event()
 
 
     # Start the background flush thread
@@ -303,6 +293,7 @@ class DirtyFlowCollector:
     # Stop the collector and flush remaining data
     def stop(self):
         self.running = False
+        self._stop_event.set()
 
         print(
             "[*] Stopping collector "
@@ -341,14 +332,6 @@ class DirtyFlowCollector:
                 event
             )
 
-            # Update the current statistics
-            self.window_blocked += 1
-
-            self.window_ips[
-                event.src_ip
-            ] += 1
-
-
             # Flush immediately when the buffer reaches its limit
             if len(self.buffer) >= MAX_ROWS_PER_FILE:
                 print(
@@ -361,27 +344,34 @@ class DirtyFlowCollector:
                 self.buffer.clear()
 
 
-        # Flush outside the lock
+        # Flush ngoài lock VÀ ngoài luồng gọi.
+        #
+        # record_from_signature() được enforcer.block_ip() gọi đồng bộ ngay
+        # trong vòng bắt gói của gatekeeper. Nếu upload GCS chạy tại chỗ thì
+        # một lần flush chậm (100 000 dòng, mạng kém) sẽ treo toàn bộ khâu
+        # phát hiện tấn công.
         if batch is not None:
-            self.flush_batch(
-                batch
-            )
+            threading.Thread(
+                target=self.flush_batch,
+                args=(batch,),
+                daemon=True,
+                name="gcs-flush"
+            ).start()
 
 
     # Run the periodic background flush loop
     def flush_loop(self):
         while self.running:
-            # Wait until the next flush interval
-            time.sleep(
-                GCS_FLUSH_INTERVAL
-            )
+            # Wait until the next flush interval, nhưng tỉnh dậy ngay khi
+            # stop() được gọi thay vì ngủ hết chu kỳ
+            self._stop_event.wait(GCS_FLUSH_INTERVAL)
 
             # Flush only when the collector is still active
             if self.running:
                 self.do_flush()
 
 
-    # Flush the current buffer and send a digest alert
+    # Flush the current buffer
     def do_flush(self):
         # Safely extract the current batch
         with self.lock:
@@ -391,23 +381,6 @@ class DirtyFlowCollector:
             batch = self.buffer[:]
 
             self.buffer.clear()
-
-
-            # Capture statistics for the current window
-            window_blocked = (
-                self.window_blocked
-            )
-
-            top_ips = (
-                self.window_ips
-                .most_common(5)
-            )
-
-
-            # Reset the current statistics
-            self.window_blocked = 0
-            self.window_ips.clear()
-
 
         # Upload the collected batch
         self.flush_batch(
@@ -420,14 +393,18 @@ class DirtyFlowCollector:
         self,
         batch
     ):
-        # Generate a timestamped CSV filename
+        # Generate a timestamped CSV filename.
+        #
+        # Hậu tố ngẫu nhiên là bắt buộc: tên file cũ chỉ có độ phân giải giây,
+        # nên một lần flush theo chu kỳ trùng giây với một lần flush do đầy
+        # buffer sẽ GHI ĐÈ lên nhau trên GCS và mất trắng một lô log.
         timestamp = time.strftime(
             "%Y%m%dT%H%M%SZ",
             time.gmtime()
         )
 
         filename = (
-            f"dirty_flows_{timestamp}.csv"
+            f"dirty_flows_{timestamp}_{uuid.uuid4().hex[:8]}.csv"
         )
 
 
@@ -481,18 +458,26 @@ class DirtyFlowCollector:
 # Store the global collector instance
 collector_instance = None
 
+# Bảo vệ khâu khởi tạo singleton. Không có lock thì hai luồng cùng gọi
+# get_collector() lần đầu sẽ tạo ra HAI collector, mỗi cái một buffer và một
+# luồng flush riêng — log bị chia đôi ngẫu nhiên giữa hai cái.
+_collector_lock = threading.Lock()
+
 
 # Return the shared collector instance
 def get_collector():
     global collector_instance
 
-    # Create and start the collector when needed
-    if collector_instance is None:
-        collector_instance = (
-            DirtyFlowCollector()
-        )
+    if collector_instance is not None:
+        return collector_instance
 
-        collector_instance.start()
+    with _collector_lock:
+        # Kiểm tra lại bên trong lock (double-checked locking)
+        if collector_instance is None:
+            instance = DirtyFlowCollector()
+            instance.start()
+
+            collector_instance = instance
 
     return collector_instance
 

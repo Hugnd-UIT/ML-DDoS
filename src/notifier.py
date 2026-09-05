@@ -2,12 +2,18 @@
 notifier.py — Telegram SOC Alert System (State Machine Architecture)
 
 Kiến trúc tinh gọn theo State Machine toàn hệ thống:
-  IDLE (Bình yên) 
+  IDLE (Bình yên)
     │ [Có block đầu tiên] → 🚨 Gửi 1 tin phát hiện duy nhất cho trạm SOC
     ▼
-  UNDER_ATTACK (Đang xử lý tấn công) 
-    │ [Mỗi 3 phút nếu có thêm lượt ban] → 📊 Gửi 1 bản tin Digest tổng hợp TOÀN BỘ luồng/cổng/lý do
-    │ [Sau 3 chu kỳ liên tiếp không có lượt ban mới] → ✅ Gửi tin báo cáo "Lưu lượng đã bế mạc" & về IDLE
+  UNDER_ATTACK (Đang xử lý tấn công)
+    │ [Mỗi DIGEST_INTERVAL_S nếu có thêm lượt ban] → 📊 Gửi 1 bản tin Digest
+    │   tổng hợp TOÀN BỘ luồng/cổng/lý do
+    │ [Sau IDLE_CYCLES_TO_CLEAR chu kỳ liên tiếp không có lượt ban mới]
+    │   → ✅ Gửi tin "Lưu lượng đã bế mạc" & về IDLE
+
+Hai con số trên là hằng số ở dưới, KHÔNG phải "3 phút / 3 chu kỳ" như mô tả cũ:
+phần mô tả đó đã lệch khỏi code, và với một đồ án thì tài liệu sai còn khó chịu
+hơn là không có tài liệu — người đọc sẽ tin vào con số ghi trong docstring.
 
 Ưu điểm kiên định theo tiêu chuẩn Bảo mật kẽ giáp:
   1. KHÔNG BAO GIỜ có hiện tượng spam bị chẻ vụn thành 4-5 tin/3 phút.
@@ -25,16 +31,20 @@ import requests
 # ── Cấu hình Telegram & Tự động nạp tệp mật ──────────────────────────────────
 
 def _auto_load_dotenv():
+    # Chỉ tìm .env trong phạm vi dự án, cộng một đường dẫn do người dùng chỉ
+    # định rõ ràng. Bản cũ còn đọc ~/.env, /root/.env và một đường dẫn hardcode
+    # theo tên tài khoản của một máy cụ thể — vừa không portable, vừa kéo biến
+    # môi trường không liên quan của cả máy vào tiến trình IPS.
     env_candidate_paths = [
+        os.environ.get("GATEKEEPER_ENV_FILE", ""),
         os.path.join(os.path.dirname(__file__), "..", ".env"),
         os.path.join(os.getcwd(), ".env"),
-        os.path.expanduser("~/.env"),
-        os.path.expanduser("~/ML-DDoS/.env"),
-        "/home/hoangminh13022006/ML-DDoS/.env",
-        "/root/ML-DDoS/.env",
-        "/root/.env",
     ]
+
     for filepath in env_candidate_paths:
+        if not filepath:
+            continue
+
         filepath = os.path.abspath(filepath)
         if os.path.exists(filepath):
             print(f"[+] Notifier: Tự động phát hiện và nạp cấu hình từ {filepath}")
@@ -61,7 +71,11 @@ TG_TIMEOUT_S = int(os.environ.get("TG_TIMEOUT_S", "8"))
 
 TG_API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 
-DIGEST_INTERVAL_S = 60  # Chu kỳ 1 phút / lần báo cáo toàn hệ thống
+# Chu kỳ gửi báo cáo tổng hợp, tính bằng giây
+DIGEST_INTERVAL_S = int(os.environ.get("TG_DIGEST_INTERVAL_S", "60"))
+
+# Số chu kỳ liên tiếp không có lượt ban mới trước khi tuyên bố hết bão
+IDLE_CYCLES_TO_CLEAR = int(os.environ.get("TG_IDLE_CYCLES", "2"))
 
 KNOWN_PORTS = {
     22:   "SSH (22)",
@@ -119,6 +133,22 @@ def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
     return False
 
 
+def send_telegram_async(text: str, parse_mode: str = "HTML") -> None:
+    """
+    Gửi Telegram trong luồng nền.
+
+    send_telegram() có thể mất tới ~30 giây (3 lần retry × timeout 8s + backoff).
+    Mọi caller nằm trên đường bắt gói của gatekeeper phải dùng hàm này, nếu
+    không thì một sự cố mạng phía Telegram sẽ làm IPS ngừng phát hiện tấn công.
+    """
+    threading.Thread(
+        target=send_telegram,
+        args=(text, parse_mode),
+        daemon=True,
+        name="tg-send"
+    ).start()
+
+
 def _fmt_open_alert(sig) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     port_str = _port_label(int(sig.dst_port))
@@ -133,7 +163,7 @@ def _fmt_open_alert(sig) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🛡️ XDP eBPF đang cô lập chớp nhoáng tầng hạt nhân.\n"
         f"🔇 Hệ thống vào chế độ ngắt tiếng (Mute Mode) để chống bão Spam.\n"
-        f"📈 Báo cáo thực tế chiến sự sẽ gửi trung bình mỗi 1 phút."
+        f"📈 Báo cáo chiến sự sẽ gửi mỗi {DIGEST_INTERVAL_S}s."
     )
 
 
@@ -170,7 +200,8 @@ def _fmt_digest(duration_s: float, total_b: int) -> str:
     )
 
     return (
-        f"📊 <b>[SOC DIGEST] Báo cáo Toàn cảnh Chiến sự (Mỗi 1 phút)</b>\n\n"
+        f"📊 <b>[SOC DIGEST] Báo cáo Toàn cảnh Chiến sự "
+        f"(mỗi {DIGEST_INTERVAL_S}s)</b>\n\n"
         f"🕐 Thời điểm: <code>{ts}</code>\n"
         f"⏱ Thời gian tác chiến liên tục: <code>{dur_str}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -205,6 +236,16 @@ def _global_dispatcher():
     while True:
         time.sleep(DIGEST_INTERVAL_S)
 
+        # Soạn nội dung TRONG lock, gửi NGOÀI lock.
+        #
+        # send_telegram() retry 3 lần, mỗi lần timeout 8s cộng backoff 2**n,
+        # tức là có thể giữ lock tới ~30 giây. Mà send_block_alert() — được gọi
+        # đồng bộ ngay trong vòng `for flow in streamer` của gatekeeper — cũng
+        # cần chính cái lock đó. Kết quả ở bản cũ: Telegram chậm thì IPS ngừng
+        # phát hiện tấn công suốt 30 giây.
+        message = None
+        should_stop = False
+
         with _lock:
             if _state == "IDLE":
                 break
@@ -214,18 +255,24 @@ def _global_dispatcher():
 
             if cur_blocks > _last_digest_count:
                 # Có chém thêm từ lúc trước → gửi báo cáo gộp toàn cơ sở
-                send_telegram(_fmt_digest(duration_s, cur_blocks))
+                message = _fmt_digest(duration_s, cur_blocks)
                 _last_digest_count = cur_blocks
                 _idle_cycles = 0
             else:
                 _idle_cycles += 1
-                # Nếu 2 chu kỳ liền không có thêm IP nào phạm lỗi → Hết bão
-                if _idle_cycles >= 2:
-                    send_telegram(_fmt_clear(duration_s, cur_blocks))
+                # Đủ số chu kỳ liền không có thêm IP nào phạm lỗi → Hết bão
+                if _idle_cycles >= IDLE_CYCLES_TO_CLEAR:
+                    message = _fmt_clear(duration_s, cur_blocks)
                     _state = "IDLE"
                     _reset_state_unlocked()
                     print("[~] Hệ thống kết thúc đợt chiến, trở về IDLE.")
-                    break
+                    should_stop = True
+
+        if message is not None:
+            send_telegram(message)
+
+        if should_stop:
+            break
 
 
 def _reset_state_unlocked():
@@ -246,6 +293,9 @@ def send_block_alert(sig) -> bool:
     Hoạt động thuần khiết trên cỗ máy trạng thái (State Machine): IDLE -> UNDER_ATTACK -> IDLE.
     """
     global _state, _attack_start_time, _total_blocks, _dispatcher_thread
+    global _last_digest_count, _idle_cycles
+
+    open_message = None
 
     with _lock:
         now = time.time()
@@ -271,9 +321,14 @@ def send_block_alert(sig) -> bool:
             )
             _dispatcher_thread.start()
 
-            # Gửi ĐÚNG 1 tin còi khai màn
-            send_telegram(_fmt_open_alert(sig))
-            return True
+            # Soạn tin còi khai màn, nhưng CHƯA gửi khi còn giữ lock
+            open_message = _fmt_open_alert(sig)
 
-        # Nếu đang trong UNDER_ATTACK → Im lặng, để toàn bộ số liệu cho luồng Digest xử lý
-        return False
+    # Gọi mạng ngoài lock VÀ ngoài luồng gọi: hàm này chạy đồng bộ trong vòng
+    # bắt gói của gatekeeper, nên mọi giây chờ ở đây là một giây IPS bị mù.
+    if open_message is not None:
+        send_telegram_async(open_message)
+        return True
+
+    # Nếu đang trong UNDER_ATTACK → Im lặng, để toàn bộ số liệu cho luồng Digest xử lý
+    return False
