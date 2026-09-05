@@ -107,6 +107,33 @@ TOTAL_THRESHOLD = 3000
 MIN_PACKETS_FOR_AI = 10
 
 
+# ── Lưu lượng trả về cho kết nối do CHÍNH MÁY NÀY mở ra ─────────────────────
+#
+# NFStream gán hướng flow theo gói ĐẦU TIÊN nó bắt được. Gatekeeper gắn vào
+# giữa chừng, nên với một kết nối đi ra (pip install, apt update, đọc GCS) gói
+# đầu tiên nó thấy thường là gói máy chủ từ xa trả về — và máy chủ đó bị ghi
+# nhận thành bên khởi tạo. Kiểm tra `src_ip in local_ips` vì thế không bắt được
+# trường hợp này.
+#
+# Dấu hiệu đáng tin hơn là CỔNG ĐÍCH trên máy ta. Kết nối do ta mở ra luôn dùng
+# cổng nguồn ephemeral, nên gói trả về đi tới một cổng ephemeral. Ngược lại,
+# DDoS nhắm vào cổng dịch vụ (80, 443, 53...) vì mục tiêu là làm cạn dịch vụ;
+# gói bắn vào cổng ephemeral ngẫu nhiên nơi không có gì lắng nghe chỉ khiến
+# kernel trả RST với chi phí không đáng kể.
+#
+# Sự cố thật đã xảy ra: `pip install -r requirements.txt` trên VM1 kéo gói từ
+# Fastly CDN ở 1385 pps. Nhân với WINDOW_SECONDS=5 ra 6928 gói, vượt
+# TOTAL_THRESHOLD=3000, và 151.101.0.223 bị ban dù model đã phán đúng là BENIGN.
+# Mọi lượt tải nhanh hơn ~600 gói/giây đều dính lỗi này.
+TRUST_EPHEMERAL_REPLIES = os.environ.get(
+    "TRUST_EPHEMERAL_REPLIES", "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Dải cổng ephemeral, đọc từ kernel để khớp đúng máy đang chạy
+EPHEMERAL_PORT_MIN = 32768
+EPHEMERAL_PORT_MAX = 60999
+
+
 # ── Ngưỡng volumetric TOÀN CỤC (cộng dồn qua MỌI source) ────────────────────
 #
 # Các ngưỡng per-IP ở trên vô dụng trước flood có source giả mạo: attacker rải
@@ -162,6 +189,45 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+# Đọc dải cổng ephemeral thật của kernel, để không đoán sai trên máy đã chỉnh
+# net.ipv4.ip_local_port_range. Thất bại thì giữ mặc định Linux.
+def load_ephemeral_range():
+    global EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX
+
+    try:
+        with open(
+            "/proc/sys/net/ipv4/ip_local_port_range", encoding="utf-8"
+        ) as fh:
+            low, high = fh.read().split()
+
+        EPHEMERAL_PORT_MIN = int(low)
+        EPHEMERAL_PORT_MAX = int(high)
+
+    except Exception:
+        pass
+
+    return EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX
+
+
+# True nếu flow là lưu lượng trả về cho một kết nối do máy này chủ động mở.
+#
+# Điều kiện: cổng đích (phía ta) nằm trong dải ephemeral, còn cổng nguồn (phía
+# đối phương) thì không — tức đó là một cổng dịch vụ. Cả hai cùng ephemeral thì
+# không kết luận được nên trả về False, thà kiểm tra thừa còn hơn bỏ lọt.
+def is_reply_to_local_client(flow):
+    # Chỉ TCP và UDP mới có khái niệm cổng
+    if int(flow.protocol) not in (6, 17):
+        return False
+
+    dst_port = int(getattr(flow, "dst_port", 0))
+    src_port = int(getattr(flow, "src_port", 0))
+
+    if not (EPHEMERAL_PORT_MIN <= dst_port <= EPHEMERAL_PORT_MAX):
+        return False
+
+    return not (EPHEMERAL_PORT_MIN <= src_port <= EPHEMERAL_PORT_MAX)
 
 
 # Get all IP addresses assigned to the interface (cả IPv4 lẫn IPv6)
@@ -783,6 +849,21 @@ def main():
         "addresses will be ignored"
     )
 
+    # Dải cổng ephemeral quyết định flow nào được coi là gói trả về
+    eph_low, eph_high = load_ephemeral_range()
+
+    if TRUST_EPHEMERAL_REPLIES:
+        print(
+            f"  [+] Bỏ qua lưu lượng trả về tới cổng ephemeral "
+            f"{eph_low}-{eph_high} (pip, apt, GCS...)"
+        )
+
+    else:
+        print(
+            "  [!] TRUST_EPHEMERAL_REPLIES=0 — lượt tải ra ngoài "
+            "có thể bị ban nhầm"
+        )
+
     # Nói rõ trạng thái IPv6 thay vì âm thầm bỏ qua như bản cũ
     has_global_v6 = any(
         ":" in ip and not ip.startswith(("fe80", "::1"))
@@ -887,6 +968,19 @@ def main():
 
                 if flood_just_started:
                     _announce_flood(flood)
+
+
+                # Bỏ qua lưu lượng trả về cho kết nối do chính máy này mở ra.
+                #
+                # Đặt SAU flood.observe() là có chủ đích: những gói này vẫn phải
+                # được cộng vào bộ đếm toàn cục, nếu không hệ thống sẽ mù trước
+                # tấn công vắt kiệt băng thông nhắm vào cổng ephemeral. Chỉ miễn
+                # cho nó khỏi tuyến AI và rate limiter per-IP, vì đó là hai chỗ
+                # ra quyết định ban.
+                if TRUST_EPHEMERAL_REPLIES and is_reply_to_local_client(flow):
+                    packet_window.pop(flow.src_ip, None)
+
+                    continue
 
 
                 # Create a tracking entry for new source IPs

@@ -847,6 +847,84 @@ lỗi sửa được ở tầng code.
 
 ---
 
+## 7d. FIX-33 — Ban nhầm lưu lượng tải về của chính máy chủ
+
+**Hiện tượng.** Chạy `pip install -r requirements.txt` trên VM1 thì `151.101.0.223`
+(Fastly CDN, chính là dải phục vụ `files.pythonhosted.org`) bị ban ngay lập tức:
+
+```
+timestamp                  src_ip           protocol  dst_port  pps      reason                     attack_type
+2026-09-05 13:51:38+00:00  151.101.0.223    TCP       50350     1385.6   RATE_LIMIT (Volumetric)    BENIGN
+```
+
+Cột `attack_type` là **BENIGN** — model đã phán đúng. Rate limiter chặn đè lên.
+
+**Nguyên nhân.** `1385,6 pps × WINDOW_SECONDS 5 = 6928 gói`, vượt `TOTAL_THRESHOLD
+= 3000`. Rate limiter quyết định thuần theo khối lượng, không phân biệt được ai là
+bên mở kết nối.
+
+Chốt chặn duy nhất trước đó là `if flow.src_ip in local_ips: continue`, và nó
+không bắt được ca này. Lý do: **NFStream gán hướng flow theo gói đầu tiên nó bắt
+được**. Gatekeeper gắn vào interface giữa chừng, nên với một kết nối đi ra thì gói
+đầu tiên nó thấy là gói máy chủ từ xa trả về — và máy chủ đó bị ghi nhận thành bên
+khởi tạo. Hệ thống chưa hề có khái niệm "kết nối này do mình chủ động mở".
+
+Đây **không phải ca lẻ**: mọi lượt tải nhanh hơn `3000 / 5 = 600` gói/giây từ một
+host đều dính — `apt update`, `git clone`, `docker pull`, và cả lượt đọc GCS của
+chính dashboard.
+
+**Cách fix.** Dấu hiệu đáng tin là **cổng đích trên máy ta**, chứng cứ nằm ngay
+trong log: `dst_port = 50350` là cổng ephemeral của VM1, không phải cổng dịch vụ.
+
+Nguyên tắc: DDoS nhắm vào cổng dịch vụ (80, 443, 53...) vì mục tiêu là làm cạn
+dịch vụ. Gói bắn vào cổng ephemeral ngẫu nhiên nơi không có gì lắng nghe chỉ khiến
+kernel trả RST với chi phí không đáng kể.
+
+```python
+def is_reply_to_local_client(flow):
+    if int(flow.protocol) not in (6, 17):
+        return False
+
+    dst_port = int(getattr(flow, "dst_port", 0))
+    src_port = int(getattr(flow, "src_port", 0))
+
+    if not (EPHEMERAL_PORT_MIN <= dst_port <= EPHEMERAL_PORT_MAX):
+        return False
+
+    return not (EPHEMERAL_PORT_MIN <= src_port <= EPHEMERAL_PORT_MAX)
+```
+
+Dải ephemeral đọc từ `/proc/sys/net/ipv4/ip_local_port_range` lúc khởi động, không
+hard-code.
+
+Điểm đặt trong vòng lặp là **sau `flood.observe()`**, có chủ đích: những gói này
+vẫn phải cộng vào bộ đếm toàn cục, nếu không hệ thống sẽ mù trước tấn công vắt
+kiệt băng thông nhắm vào cổng ephemeral. Chỉ miễn cho nó khỏi tuyến AI và rate
+limiter per-IP — hai chỗ ra quyết định ban.
+
+**Kiểm chứng.**
+
+```
+OK  pip/Fastly tra ve                  src=443    dst=50350  -> bo qua=True
+OK  hping3 SYN vao web                 src=54321  dst=80     -> bo qua=False
+OK  UDP flood vao DNS                  src=40000  dst=53     -> bo qua=False
+OK  GCS doc log                        src=443    dst=44100  -> bo qua=True
+OK  ICMP flood                         src=0      dst=0      -> bo qua=False
+OK  Attack gia src 443 vao cong 80     src=443    dst=80     -> bo qua=False
+```
+
+Ca cuối quan trọng: attacker cố giả `src_port=443` để né vẫn bị bắt, vì cổng đích
+80 không phải ephemeral. Muốn né thì phải bắn vào cổng ephemeral — nơi không có
+dịch vụ nào để hạ.
+
+Tắt bằng `TRUST_EPHEMERAL_REPLIES=0` nếu cần chứng minh hành vi cũ.
+
+**Kèm theo.** `scripts/start.sh` vẫn kiểm tra `models/binary.pkl` tồn tại rồi mới
+chạy, trong khi FIX-31 đã đổi model deploy sang `models/binary_eval.pkl` — chạy qua
+script này sẽ tự abort. Đã sửa đường dẫn.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
@@ -884,6 +962,7 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `GLOBAL_PACKET_THRESHOLD` | `20000` | Ngưỡng tổng gói toàn cục / 5s |
 | `GLOBAL_SOURCE_THRESHOLD` | `500` | Ngưỡng số source khác nhau / 5s |
 | `FLOOD_MODE_DIVISOR` | `10` | Hệ số hạ ngưỡng per-IP khi vào FLOOD MODE |
+| `TRUST_EPHEMERAL_REPLIES` | `1` | Bỏ qua gói trả về cho kết nối máy tự mở (FIX-33) |
 | `TG_DIGEST_INTERVAL_S` | `60` | Chu kỳ gửi digest Telegram |
 | `TG_IDLE_CYCLES` | `2` | Số chu kỳ yên ắng trước khi báo hết bão |
 | `GATEKEEPER_ENV_FILE` | *(rỗng)* | Đường dẫn `.env` chỉ định rõ (FIX-21) |

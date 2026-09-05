@@ -34,8 +34,12 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 
-# Check whether the trained model exists
-MODEL_FILE="${PROJECT_ROOT}/models/binary.pkl"
+# Check whether the trained model exists.
+#
+# Phải là binary_eval.pkl, đúng file mà gatekeeper.py nạp. binary.pkl fit trên
+# 100% dữ liệu nên không còn dòng nào chưa thấy để hiệu chỉnh ngưỡng — xem
+# src/recalibrate.py.
+MODEL_FILE="${PROJECT_ROOT}/models/binary_eval.pkl"
 
 if [ ! -f "${MODEL_FILE}" ]; then
     echo "[-] Model file not found:"
