@@ -58,14 +58,29 @@ def proto_name(proto_num):
     )
 
 
-# Set the path to the binary XGBoost model
+# Model nhị phân được deploy.
+#
+# CỐ Ý dùng binary_eval.pkl chứ KHÔNG phải binary.pkl.
+#
+# binary.pkl được fit trên 100% dữ liệu (cả ngày 1 lẫn ngày 2), nên không còn
+# một dòng nào chưa thấy để hiệu chỉnh ngưỡng cho nó. Mọi ngưỡng gán cho nó đều
+# không kiểm chứng được. Bản trước cố lách bằng cách lấy phân vị trên chính dữ
+# liệu nó đã học — nhưng model chấm điểm rất thấp cho các dòng benign nó đã nhớ,
+# nên ngưỡng thu được thấp giả tạo. Đo thực tế trên đúng dữ liệu của dự án:
+#
+#     phân vị 0.99998  ngưỡng in-sample 0.9587  |  ngưỡng đúng 0.9996
+#     FPR kỳ vọng 0.002%          FPR thực tế 0.259%   (gấp 130 lần)
+#
+# binary_eval.pkl fit ngày 1, chấm ngày 2 chưa từng thấy. Ngưỡng và FPR/TPR của
+# nó là số đo thật, và model được deploy chính là model đã đo — không còn khoảng
+# cách nào giữa con số trong báo cáo và thứ đang chạy.
 MODEL_FILE = os.path.join(
     os.path.dirname(
         os.path.abspath(__file__)
     ),
     "..",
     "models",
-    "binary.pkl"
+    "binary_eval.pkl"
 )
 
 THRESHOLD_FILE = os.path.join(
@@ -419,18 +434,36 @@ def load_threshold():
         # Bản trước chỉ cảnh báo khi calibrated_on == "eval_model", nên đúng
         # cái file nguy hiểm nhất — threshold.json cũ, KHÔNG có trường này,
         # chứa ngưỡng lấy nguyên từ eval model — lại chạy hoàn toàn im lặng.
-        if meta.get("calibrated_on") != "production_model":
+        if meta.get("calibrated_on") != "deployed_model":
             print(
-                "  [!] threshold.json không xác nhận đã hiệu chỉnh trên model "
-                "production (calibrated_on="
+                "  [!] threshold.json không xác nhận đã hiệu chỉnh trên chính "
+                "model đang deploy (calibrated_on="
                 f"{meta.get('calibrated_on') or 'thiếu'})."
             )
 
             print(
-                "  [!] Giá trị xác suất KHÔNG mang cùng ý nghĩa giữa "
-                "binary_eval.pkl và binary.pkl, nên FPR/TPR thực tế có thể "
-                "khác xa số ghi ở trên. Chạy lại src/trainer.py."
+                "  [!] Ngưỡng có thể được suy ra từ một model khác, nên FPR/TPR "
+                "thực tế có thể khác xa số ghi ở trên. "
+                "Chạy lại src/recalibrate.py."
             )
+
+        # threshold.json phải mô tả ĐÚNG file model đang được nạp. Nếu lệch thì
+        # ngưỡng thuộc về một model khác — chính là lớp lỗi đã khiến hệ thống
+        # chặn nhầm lưu lượng CDN hợp lệ trong lần chạy thử đầu tiên.
+        declared_model = meta.get("model_file")
+
+        if declared_model:
+            if os.path.basename(declared_model) != os.path.basename(MODEL_FILE):
+                print(
+                    f"  [✗] threshold.json mô tả {declared_model} nhưng "
+                    f"gatekeeper đang nạp {os.path.basename(MODEL_FILE)}."
+                )
+
+                print("  [✗] Ngưỡng này thuộc về một model khác. Dừng.")
+
+                import sys
+
+                sys.exit(1)
 
         # Đối chiếu cả TÊN feature, không chỉ số lượng: hai bộ 18 feature khác
         # thứ tự vẫn đếm ra 18 mà vector đưa vào model thì sai hoàn toàn.

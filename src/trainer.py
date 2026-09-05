@@ -285,51 +285,33 @@ def choose_threshold(model, X_test, y_test, target_fpr=TARGET_FPR):
     return threshold, fpr, tpr
 
 
-# Chuyển ngưỡng từ model đánh giá sang model production.
+# ĐÃ GỠ BỎ: transfer_threshold()
 #
-# ĐÂY LÀ MỘT LỖ HỔNG PHƯƠNG PHÁP LUẬN CỦA BẢN CŨ: ngưỡng 0.9999 được chọn từ
-# phân phối xác suất của eval_model, rồi đem áp thẳng cho binary.pkl — một model
-# KHÁC, fit trên nhiều dữ liệu hơn, với calibration khác. Một giá trị xác suất
-# tuyệt đối không mang cùng ý nghĩa giữa hai model, nên FPR/TPR thực tế khi
-# deploy không hề là con số ghi trong threshold.json.
+# Hàm đó từng cố hiệu chỉnh ngưỡng cho binary.pkl bằng cách giữ nguyên *phân vị*
+# của ngưỡng eval trong phân phối điểm số benign của model production. Ý tưởng
+# nghe hợp lý nhưng SAI, vì phân phối đó được tính trên chính dữ liệu mà model
+# production đã học thuộc. Model chấm rất thấp cho các dòng benign nó đã nhớ,
+# nên phân vị cho ra ngưỡng thấp giả tạo. Đo trên đúng dữ liệu của dự án:
 #
-# Cách xử lý ở đây: giữ nguyên *phân vị* thay vì giữ nguyên *giá trị*. Ta lấy
-# ngưỡng của model production tại đúng phân vị mà ngưỡng của eval model chiếm
-# trong phân phối điểm số của lưu lượng benign. Nếu eval model chặn 0,1% cao
-# nhất trong nhóm benign, model production cũng sẽ chặn đúng 0,1% cao nhất.
+#     phân vị   ngưỡng in-sample   ngưỡng đúng (out-of-sample)
+#     0.999           0.906629              0.999389
+#     0.9999          0.936523              0.999389
+#     0.99998         0.958699              0.999611
 #
-# Lưu ý trung thực: model production ĐÃ NHÌN THẤY những dòng benign này trong
-# lúc huấn luyện, nên phân vị tính được là lạc quan. Nó chỉ dùng để căn ngưỡng,
-# KHÔNG dùng để báo cáo. Số liệu để báo cáo phải lấy từ binary_eval.pkl.
-def transfer_threshold(prod_model, X_benign, eval_threshold, eval_fpr):
-    if len(X_benign) == 0:
-        print("[!] Không có dòng benign để hiệu chỉnh lại; giữ nguyên ngưỡng.")
-
-        return float(eval_threshold)
-
-    proba = prod_model.predict_proba(X_benign)[:, 1]
-
-    # Phân vị cần giữ: chặn đúng eval_fpr phần benign ở phía trên
-    quantile = 1.0 - float(eval_fpr)
-
-    quantile = min(max(quantile, 0.0), 1.0)
-
-    prod_threshold = float(np.quantile(proba, quantile))
-
-    # Đừng bao giờ nới lỏng hơn 0.5, và cũng đừng vượt quá 1.0
-    prod_threshold = min(max(prod_threshold, 0.5), 1.0 - 1e-9)
-
-    achieved_fpr = float((proba >= prod_threshold).mean())
-
-    print(f"\n    Ngưỡng eval model      : {eval_threshold:.6f} "
-          f"(FPR {eval_fpr:.4%})")
-    print(f"    Phân vị benign tương ứng: {quantile:.6f}")
-    print(f"    Ngưỡng model production : {prod_threshold:.6f} "
-          f"(FPR in-sample {achieved_fpr:.4%})")
-    print("    [!] FPR in-sample là lạc quan — model đã thấy dữ liệu này.")
-    print("    [!] Số liệu để báo cáo phải lấy từ binary_eval.pkl.")
-
-    return prod_threshold
+#     Dùng ngưỡng in-sample 0.9587 (kỳ vọng FPR 0,002%)
+#     → FPR thực tế trên dữ liệu chưa thấy: 0,259%  — gấp 130 lần.
+#
+# Hậu quả thật: ngưỡng 0,9649 sinh ra theo cách đó đã chặn nhầm lưu lượng CDN
+# hợp lệ ngay trong lần chạy thử đầu tiên trên VM.
+#
+# Vấn đề gốc không nằm ở cách tính mà ở chính binary.pkl: nó fit trên 100% dữ
+# liệu nên KHÔNG CÒN dòng nào chưa thấy để hiệu chỉnh. Không tồn tại cách hiệu
+# chỉnh trung thực cho một model như vậy.
+#
+# Nên artifact được DEPLOY là binary_eval.pkl — fit ngày 1, đo ngày 2. Ngưỡng và
+# FPR/TPR của nó là số đo thật, và model chạy chính là model đã đo.
+# binary.pkl vẫn được huấn luyện và lưu lại để tham khảo, nhưng không được deploy.
+DEPLOYED_MODEL = "binary_eval.pkl"
 
 
 # Train, evaluate and export the binary model
@@ -467,51 +449,39 @@ def train_binary(sample_frac=None, force=False, cap=BINARY_CLASS_CAP):
 
     joblib.dump(model, _path("models", "binary.pkl"))
 
-    # Hiệu chỉnh lại ngưỡng cho ĐÚNG model sắp deploy.
-    _banner("BINARY — chuyển ngưỡng sang model production")
-
-    prod_threshold = transfer_threshold(
-        model,
-        X_all[y_all == 0],
-        threshold,
-        thr_fpr
-    )
-
-    # Publish the threshold next to the model so gatekeeper.py does not have
-    # to hardcode it, and so a retrain updates both together.
+    # threshold.json mô tả model ĐƯỢC DEPLOY, tức binary_eval.pkl — xem khối
+    # chú thích ở chỗ transfer_threshold đã gỡ bỏ. Ngưỡng và FPR/TPR dưới đây
+    # đều đo trên ngày 2 chưa từng thấy, nên chúng vừa là số để chạy vừa là số
+    # để báo cáo. Không còn hai bộ số nữa.
     with open(_path("models", "threshold.json"), "w", encoding="utf-8") as fh:
         json.dump(
             {
-                # Ngưỡng gatekeeper.py sẽ dùng, ứng với binary.pkl
-                "threshold": float(prod_threshold),
-                "calibrated_on": "production_model",
+                "threshold": float(threshold),
 
-                # Ngưỡng gốc và số liệu TRUNG THỰC, đo trên binary_eval.pkl
-                # với dữ liệu ngày 2 chưa từng thấy. Chỉ những con số này mới
-                # được đưa vào báo cáo đồ án.
-                "eval_threshold": float(threshold),
+                "model_file": f"models/{DEPLOYED_MODEL}",
+                "calibrated_on": "deployed_model",
+
                 "measured_fpr": float(thr_fpr),
                 "measured_tpr": float(thr_tpr),
                 "fpr_at_0.5": float(fpr),
                 "tpr_at_0.5": float(tpr),
-                "metrics_source": "models/binary_eval.pkl (day-1 fit, day-2 holdout)",
+                "metrics_source": f"models/{DEPLOYED_MODEL} (day-1 fit, day-2 holdout)",
 
                 "target_fpr": float(TARGET_FPR),
                 "n_features": len(FEATURE_NAMES),
                 "feature_names": list(FEATURE_NAMES),
-                "binary_sha256": sha256_file(_path("models", "binary.pkl")),
+                "binary_sha256": sha256_file(_path("models", DEPLOYED_MODEL)),
                 "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
             fh,
             indent=2
         )
 
-    print("\n[+] models/binary.pkl written.")
-    print("[+] models/binary_eval.pkl written (honest metrics live here).")
-    print(f"[+] models/threshold.json written: {prod_threshold:.6f} "
-          f"(chuyển từ ngưỡng eval {threshold:.6f})")
-    print(f"[+] FPR/TPR để BÁO CÁO (đo trên day-2 holdout, eval model): "
-          f"{thr_fpr:.4%} / {thr_tpr:.4%}")
+    print(f"\n[+] models/{DEPLOYED_MODEL} written — ĐÂY là model được deploy.")
+    print("[+] models/binary.pkl written — chỉ để tham khảo, KHÔNG deploy "
+          "(fit trên 100% dữ liệu nên không hiệu chỉnh ngưỡng trung thực được).")
+    print(f"[+] models/threshold.json written: ngưỡng {threshold:.6f}")
+    print(f"[+] FPR/TPR (đo trên day-2 holdout): {thr_fpr:.4%} / {thr_tpr:.4%}")
     print(f"[+] Time: {time.time() - start_time:.2f}s")
 
     return True

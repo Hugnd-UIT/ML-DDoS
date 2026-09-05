@@ -138,6 +138,7 @@ chết ngay ở dòng import.
 | 28 | Whitelist Canonical dựa vào DNS | Đúng đắn | enforcer.py |
 | 29 | Data plane hoàn toàn câm, không đếm được gói bị DROP | Đúng đắn | xdp_filter.c |
 | 30 | Dashboard không đối chiếu feature model multiclass | Nhỏ | app.py |
+| **31** | **Ngưỡng hiệu chỉnh trên dữ liệu model đã học → chặn nhầm CDN thật** | **Nguy hiểm** | trainer.py |
 
 ---
 
@@ -708,22 +709,90 @@ con số ghi trong docstring.
 
 ---
 
+## 7b. FIX-31 — Ngưỡng hiệu chỉnh trên dữ liệu model đã học thuộc
+
+`src/trainer.py · src/recalibrate.py · src/gatekeeper.py`
+
+> Phát hiện khi chạy thử thật trên VM1. Đây là lỗi do **FIX-11 gây ra**.
+
+**Hiện tượng.** Ngay lần chạy đầu trên VM, hệ thống chặn ba IP bằng tuyến AI với
+`p = 0,9993 / 0,9968 / 0,9938`. Trong đó `151.101.128.223` thuộc dải
+`151.101.0.0/16` của **Fastly CDN** — gần như chắc chắn là lưu lượng trả về từ
+dịch vụ mà chính VM gọi ra (pip, apt, API). Chặn nó làm hỏng kết nối ra ngoài
+của chính máy chủ.
+
+Cả ba đều **dưới** ngưỡng cũ 0,9999 và **trên** ngưỡng mới 0,9649 — tức là chúng
+bị chặn *chỉ vì* FIX-11 hạ ngưỡng.
+
+**Nguyên nhân.** `transfer_threshold()` giữ nguyên *phân vị* của ngưỡng eval
+trong phân phối điểm số benign của model production. Nhưng phân phối đó tính
+trên chính dữ liệu mà model production **đã học thuộc**. Model chấm rất thấp cho
+các dòng benign nó đã nhớ, nên phân vị cho ra ngưỡng thấp giả tạo.
+
+Đo trực tiếp trên dữ liệu của dự án, dùng cùng một model (`binary_eval.pkl`) và
+cùng một phân vị, chỉ khác dữ liệu là in-sample hay out-of-sample:
+
+```
+phân vị    ngưỡng IN-SAMPLE   ngưỡng ĐÚNG (out-of-sample)
+0.999          0.906629              0.999389
+0.9999         0.936523              0.999389
+0.99998        0.958699              0.999611
+
+Dùng ngưỡng in-sample 0.9587 (kỳ vọng FPR 0,002%)
+→ FPR thực tế trên dữ liệu chưa thấy: 0,259%   — gấp 130 lần
+```
+
+Vấn đề gốc không nằm ở cách tính mà ở chính `binary.pkl`: nó fit trên **100%**
+dữ liệu nên không còn dòng nào chưa thấy để hiệu chỉnh. **Không tồn tại** cách
+hiệu chỉnh trung thực cho một model như vậy.
+
+**Cách fix.** Deploy `binary_eval.pkl` — model fit ngày 1, đo ngày 2 chưa từng
+thấy.
+
+- `gatekeeper.py` nạp `binary_eval.pkl` thay vì `binary.pkl`.
+- Gỡ hẳn `transfer_threshold()` khỏi `trainer.py`, thay bằng khối chú thích ghi
+  lại số đo trên để không ai tái tạo lại lỗi này.
+- `threshold.json` thêm trường `model_file`; gatekeeper `sys.exit(1)` nếu file
+  đó không khớp model đang nạp — ngưỡng thuộc về model khác là dừng ngay.
+- `binary.pkl` vẫn được train và lưu để tham khảo, nhưng không deploy.
+
+**Lợi ích phụ cho đồ án:** model được deploy giờ **chính là** model đã đo. Không
+còn hai bộ số "để chạy" và "để báo cáo" — chỉ còn một, và nó trung thực.
+
+```
+Sau khi sửa:
+  Ngưỡng          : 0.9999
+  FPR / TPR THẬT  : 0.0018% / 76.4452%   (đo trên ngày 2)
+  Precision @ 0,1%: 97.73%
+
+  193.47.62.69     p=0.9993  -> KHÔNG ban nữa
+  2.57.121.112     p=0.9968  -> KHÔNG ban nữa
+  151.101.128.223  p=0.9938  -> KHÔNG ban nữa
+```
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
-**Số liệu FPR/TPR đưa vào báo cáo phải lấy từ `models/binary_eval.pkl`** — model fit
-trên dữ liệu ngày 1 và chấm trên ngày 2 chưa từng thấy. Số liệu từ `binary.pkl` không
-dùng để báo cáo được vì model đó đã nhìn thấy tập kiểm thử trong lúc huấn luyện.
-Trường `metrics_source` trong `threshold.json` ghi rõ điều này.
+Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
+/ chấm ngày 2). Nên chỉ còn **một** bộ số, dùng cho cả vận hành lẫn báo cáo:
 
-Trong `threshold.json` sau khi chạy `recalibrate.py`:
+| Chỉ số | Giá trị | Nguồn |
+|---|---|---|
+| Ngưỡng quyết định | **0.9999** | `threshold` |
+| FPR trên benign | **0,0018%** | day-2 holdout |
+| TPR trên attack | **76,45%** | day-2 holdout |
+| Precision @ tỉ lệ tấn công 1% | 99,77% | suy ra từ FPR/TPR |
+| Precision @ tỉ lệ tấn công 0,1% | 97,73% | suy ra từ FPR/TPR |
 
-| Trường | Dùng để làm gì |
-|---|---|
-| `threshold` | Gatekeeper dùng để chạy. **Không** đưa vào báo cáo như một chỉ số. |
-| `measured_fpr`, `measured_tpr` | **Đây là số để báo cáo.** Đo trên day-2 holdout. |
-| `eval_threshold` | Ngưỡng gốc trên eval model, để đối chiếu với `threshold`. |
-| `metrics_source` | Ghi rõ số liệu đến từ đâu. |
-| `binary_sha256` | Toàn vẹn model (FIX-22). |
+`binary.pkl` (fit trên 100% dữ liệu) **không** được deploy và **không** dùng để báo
+cáo — nó đã nhìn thấy tập kiểm thử nên không đo được gì trung thực. Xem FIX-31.
+
+Điểm đáng nói khi bảo vệ: đánh đổi có chủ ý ở ngưỡng 0,9999 là **bỏ ~20 điểm recall
+để hạ FPR xuống 1/500**. Với một thiết bị chặn inline thì đây là lựa chọn đúng, vì
+một false positive chặn nhầm người dùng thật, còn attack lọt qua vẫn còn tuyến rate
+limiter và global flood detector đỡ. Chính lần chạy thử trên VM đã chứng minh điều
+đó bằng thực nghiệm: ngưỡng thấp hơn (0,9649) lập tức chặn nhầm CDN thật.
 
 ---
 

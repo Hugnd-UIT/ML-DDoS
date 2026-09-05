@@ -1,7 +1,7 @@
 {
-  "threshold": 0.9648515582084656,
-  "calibrated_on": "production_model",
-  "eval_threshold": 0.9999,
+  "threshold": 0.9999,
+  "model_file": "models/binary_eval.pkl",
+  "calibrated_on": "deployed_model",
   "measured_fpr": 1.7760096614925586e-05,
   "measured_tpr": 0.7644524646673031,
   "fpr_at_0.5": 0.009661492558519518,
@@ -29,7 +29,7 @@
     "SYN Flag Count",
     "ACK Flag Count"
   ],
-  "binary_sha256": "8fd5afd5aa71bdf597ca87a2272ca06fba9d2777d72ce6ea61e7bfda4e3eb37b",
-  "trained_at": "2026-09-04T17:27:41Z",
+  "binary_sha256": "8f3425dd097f06777058aef7c3e38b48118ae520aff949b1217456deccead9b2",
+  "trained_at": "2026-09-05T03:00:09Z",
   "recalibrated_without_retrain": true
 }
