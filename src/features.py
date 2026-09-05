@@ -183,17 +183,38 @@ def extract_features(flow):
 
     # TCP flag features.
     #
-    # PHẢI là cờ NHỊ PHÂN 0/1, không phải số đếm gói. Trong toàn bộ 22 triệu
-    # dòng huấn luyện, "SYN Flag Count" và "ACK Flag Count" đều có giá trị lớn
-    # nhất đúng bằng 1.00 — CICFlowMeter ghi *sự hiện diện* của cờ, không đếm.
+    # HAI CỘT NÀY KHÔNG MANG Ý NGHĨA NHƯ TÊN GỌI. CICFlowMeter — công cụ sinh ra
+    # CICDDoS2019 — không điền chúng theo cờ TCP thật. Đo trên dữ liệu gốc:
     #
-    # Bản cũ nạp thẳng bidirectional_syn_packets / bidirectional_ack_packets từ
-    # NFStream, tức là số đếm có thể lên tới hàng nghìn. Riêng "ACK Flag Count"
-    # chiếm 32,47% tổng importance của multiclass.pkl — feature quan trọng nhất
-    # của model, và nó đang nhận giá trị nằm ngoài phân bố huấn luyện hàng nghìn
-    # lần. Đây là lý do chính khiến hệ thống không nhận đúng loại tấn công.
-    syn_count = 1.0 if float(_get(flow, "bidirectional_syn_packets")) > 0 else 0.0
-    ack_count = 1.0 if float(_get(flow, "bidirectional_ack_packets")) > 0 else 0.0
+    #   file gốc SYN-Flood.csv (capture của chính một cuộc SYN flood):
+    #       SYN Flag Count   mean = 0,0002    <- gần như luôn 0
+    #       ACK Flag Count   mean = 0,9996    <- gần như luôn 1
+    #
+    #   trên cả 11 file gốc:
+    #       SYN Flag Count  ≈ 0 ở MỌI lớp (lớn nhất 0,0008) — cột chết, không
+    #                       mang một bit thông tin nào
+    #       ACK Flag Count  bám sát Protocol == 6:
+    #                       SYN-Flood 0,9997 / 100,0% TCP
+    #                       TFTP      0,9990 /  99,9% TCP
+    #                       UDP-Lag   0,5626 /  57,8% TCP
+    #                       DNS       0,0040 /   1,4% TCP
+    #
+    # Nói cách khác "ACK Flag Count" chỉ là bản sao của Protocol == 6.
+    #
+    # Bản FIX-32 tính ack_count theo nghĩa thật ("flow có gói ACK không"). Với
+    # SYN flood bắn vào host không phản hồi thì không có gói ACK nào, nên
+    # ack_count = 0 — trái ngược hẳn dữ liệu huấn luyện. Hậu quả đo được trên
+    # 60.000 dòng thuộc lớp Syn:
+    #
+    #       nguyên bản dataset (SYN=0, ACK=1)   ->  nhận đúng Syn 40,84%
+    #       chỉ đảo ACK về 0                    ->  nhận đúng Syn  0,00%
+    #                                               98,4% bị gán BENIGN
+    #       chỉ đảo SYN lên 1                   ->  nhận đúng Syn 42,48%
+    #
+    # Nên bám đúng ngữ nghĩa mà dataset thực sự ghi, không bám theo tên cột.
+    # Cách gán dưới đây tái tạo đúng từng giá trị của dữ liệu huấn luyện.
+    syn_count = 0.0
+    ack_count = 1.0 if int(flow.protocol) == 6 else 0.0
 
     protocol = float(flow.protocol)
 

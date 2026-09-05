@@ -925,6 +925,150 @@ script này sẽ tự abort. Đã sửa đường dẫn.
 
 ---
 
+## 7e. FIX-34 & FIX-35 — Vẫn nhận sai loại: hai nguyên nhân độc lập
+
+**Hiện tượng.** `hping3 -S -p 80 -i u1000` từ VM3 bị chặn đúng, nhưng dashboard gán
+`attack_type = BENIGN`. Cùng một lệnh, lần trước ra `Syn`, lần sau ra `BENIGN`.
+
+### Nguyên nhân 1 — `ACK Flag Count` không mang nghĩa như tên gọi
+
+CICFlowMeter không điền hai cột cờ theo cờ TCP thật. Đo trên **dữ liệu gốc**:
+
+```
+file goc SYN-Flood.csv (capture cua chinh mot cuoc SYN flood):
+    SYN Flag Count   mean = 0.0002     <- gan nhu luon 0
+    ACK Flag Count   mean = 0.9996     <- gan nhu luon 1
+
+tren ca 11 file goc:
+    file             SYN mean  ACK mean  proto=6
+    DNS.csv            0.0003    0.0040     1.4%
+    LDAP.csv           0.0000    0.0001     0.1%
+    MSSQL.csv          0.0000    0.0012     0.4%
+    NTP.csv            0.0004    0.0295     8.8%
+    NetBIOS.csv        0.0000    0.0014     0.4%
+    SNMP.csv           0.0000    0.0001     0.0%
+    SSDP.csv           0.0001    0.0008     0.2%
+    SYN-Flood.csv      0.0001    0.9997   100.0%
+    TFTP.csv           0.0002    0.9990    99.9%
+    UDP-Flood.csv      0.0008    0.0050     1.0%
+    UDP-Lag.csv        0.0001    0.5626    57.8%
+```
+
+`SYN Flag Count` ≈ 0 ở **mọi** lớp — cột chết, không mang một bit thông tin nào.
+`ACK Flag Count` bám sát cột `Protocol == 6` — nó chỉ là **bản sao của Protocol**.
+
+Parser không sai: nó chọn cột theo tên (`chunk[FEATURES]`), không theo vị trí, nên
+không thể hoán vị. Dữ liệu gốc vốn như vậy.
+
+FIX-32 tính `ack_count` theo nghĩa thật ("flow có gói ACK không"). SYN flood bắn
+vào host không phản hồi thì không có gói ACK nào → `ack_count = 0`, trái ngược hẳn
+dữ liệu huấn luyện. Đo trên 60.000 dòng thuộc lớp `Syn`:
+
+```
+nguyen ban tu dataset (SYN=0, ACK=1)     Syn=40.84%
+nhu FIX-32 sinh ra    (SYN=1, ACK=0)     Syn= 5.81%  | BENIGN 84.3%
+chi dao ACK -> 0                         Syn= 0.00%  | BENIGN 98.4%
+chi dao SYN -> 1                         Syn=42.48%              <- cot chet
+```
+
+### Nguyên nhân 2 — dashboard dùng model không kiểm chứng được
+
+Đây là **FIX-31 lặp lại nguyên vẹn cho tuyến multiclass**. `app.py` nạp
+`multiclass.pkl`, model fit trên 100% dữ liệu.
+
+```
+                        Syn ngay 1        Syn ngay 2
+multiclass.pkl            40.84%            99.97%    <- dashboard dang dung
+multiclass_eval.pkl       99.72%            60.50%
+```
+
+`multiclass.pkl` sai **59,1% sang UDPLag** trên chính dữ liệu nó đã học thuộc.
+Nguyên nhân: `cap_classes` lấy ngẫu nhiên 3 triệu dòng/lớp từ 5,94 triệu dòng `Syn`
+gộp hai ngày, nên ~77% mẫu là ngày 2 và model bỏ rơi phân bố ngày 1.
+
+`multiclass_eval.pkl` fit ngày 1 / chấm ngày 2 chưa từng thấy, nên có số đo trung
+thực — trên mẫu 3,88 triệu dòng của tập kiểm tra:
+
+| lớp | số dòng | recall | nhầm nhiều nhất sang |
+|---|---:|---:|---|
+| MSSQL | 1.117.218 | 93,86% | SNMP 2,1% |
+| Syn | 911.924 | **88,17%** | BENIGN 6,8%, UDPLag 4,7% |
+| UDP | 758.336 | 75,84% | SSDP 22,0% |
+| NetBIOS | 704.611 | 99,72% | DNS 0,2% |
+| LDAP | 374.456 | 80,06% | SNMP 15,9% |
+| BENIGN | 11.400 | 96,49% | WebDDoS 2,4% |
+| UDPLag | 332 | 59,04% | MSSQL 19,3% |
+
+**Độ chính xác tổng: 88,73%.**
+
+### Chứng minh cần cả hai fix
+
+Dựng đúng vector NFStream sinh ra cho `hping3 -S -p 80 -i u1000`:
+
+```
+cach tinh 2 cot co                        multiclass.pkl    multiclass_eval.pkl
+FIX-32 hien tai (SYN=1, ACK=0)              BENIGN (46%)           BENIGN (42%)
+DE XUAT         (SYN=0, ACK=Protocol==6)    UDPLag (58%)              Syn (73%)
+```
+
+Sửa feature mà giữ `multiclass.pkl` → ra `UDPLag`. Đổi model mà không sửa feature →
+vẫn `BENIGN`. Phải cả hai.
+
+Cũng giải thích vì sao có lần ra `Syn`: lần đó lệnh có thêm `-d 120`, vector khác,
+rơi đúng phía biên giới một cách may rủi.
+
+### Cách fix
+
+**FIX-34** — `features.py`, bám đúng ngữ nghĩa dataset thực sự ghi:
+
+```python
+syn_count = 0.0
+ack_count = 1.0 if int(flow.protocol) == 6 else 0.0
+```
+
+**FIX-35** — `app.py` nạp `models/multiclass_eval.pkl` thay `models/multiclass.pkl`.
+
+Không phải huấn luyện lại.
+
+### Kiểm chứng
+
+Cách gán mới có tái tạo đúng giá trị dataset không — đo trên 4,85 triệu dòng tập
+kiểm tra:
+
+```
+ACK Flag Count == (Protocol==6) : 99.8402%
+SYN Flag Count == 0             : 99.9944%
+```
+
+Khớp gần như tuyệt đối, nên con số 88,73% đo offline chuyển thẳng sang lúc chạy
+thật — không còn khe hở train/serve ở hai cột này.
+
+Chạy qua `extract_features()` thật sau khi sửa:
+
+```
+hping3 -S -p 80 (khung 54B, ko payload)  SYN=0 ACK=1  eval=Syn 64%
+SYN flood 16 goi                         SYN=0 ACK=1  eval=Syn 75%
+UDP flood cong 53 (doi chung)            SYN=0 ACK=0  eval=LDAP 62%
+hping3 -S -p 80 -d 120                   SYN=0 ACK=1  eval=DNS 97%   <- xem duoi
+```
+
+**Hai giới hạn còn lại, cần nêu trong phần "hạn chế" của báo cáo.**
+
+1. `-d 120` cho ra `DNS`. Lớp `Syn` trong dữ liệu huấn luyện có
+   `Fwd Packet Length Mean` median = 0 — gói SYN không mang payload. Nhồi 120 byte
+   payload vào gói SYN là hành vi không tồn tại trong dataset. Khi demo nên dùng
+   `hping3 -S -p 80 -i u1000` không kèm `-d`.
+2. UDP flood cổng 53 ra `LDAP` thay vì `UDP`. Các lớp `DNS`/`LDAP`/`SNMP`/`MSSQL`
+   đều là tấn công phản xạ UDP với hồ sơ đặc trưng gần trùng nhau; trên 18 feature
+   hiện có chúng không tách được. Thấy rõ trong bảng recall: `LDAP` nhầm sang
+   `SNMP` 15,9%, `UDP` nhầm sang `SSDP` 22,0%.
+
+**Hướng làm sạch triệt để (chưa làm).** Bỏ hẳn hai cột cờ khỏi `FEATURE_NAMES` — một
+cột chết, một cột trùng `Protocol` — rồi chạy lại `parser.py` + `trainer.py`. Xoá
+vĩnh viễn cái bẫy lệch ngữ nghĩa này, nhưng tốn vài giờ.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1

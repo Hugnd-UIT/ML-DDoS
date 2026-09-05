@@ -63,12 +63,29 @@ MAX_LOG_FILES = int(os.environ.get("DASHBOARD_MAX_LOG_FILES", "50"))
 REFRESH_INTERVAL_S = int(os.environ.get("DASHBOARD_REFRESH_S", "10"))
 
 
-# Multiclass model path
+# Multiclass model path.
+#
+# PHẢI là multiclass_eval.pkl, không phải multiclass.pkl. Cùng một lý lẽ với
+# FIX-31 ở tuyến nhị phân: multiclass.pkl được fit trên 100% dữ liệu nên không
+# còn dòng nào chưa thấy để đo, mọi con số gán cho nó đều không kiểm chứng được.
+#
+# Ở đây hậu quả không chỉ là lý thuyết. Đo trên 60.000 dòng thuộc lớp Syn:
+#
+#                          Syn ngày 1     Syn ngày 2
+#       multiclass.pkl        40,84%         99,97%
+#       multiclass_eval.pkl   99,72%         60,50%
+#
+# multiclass.pkl sai 59,1% sang UDPLag trên chính dữ liệu nó đã học thuộc.
+# Nguyên nhân: cap 3 triệu dòng/lớp lấy ngẫu nhiên từ 5,94 triệu dòng Syn gộp
+# hai ngày, nên khoảng 77% mẫu là ngày 2 và model bỏ rơi phân bố ngày 1.
+#
+# multiclass_eval.pkl fit ngày 1 / chấm ngày 2 chưa từng thấy, nên có số đo
+# trung thực: tổng 88,73%, riêng lớp Syn 88,17%.
 MULTICLASS_MODEL_PATH = os.path.join(
     BASE_DIR,
     "..",
     "models",
-    "multiclass.pkl"
+    "multiclass_eval.pkl"
 )
 
 
@@ -193,7 +210,7 @@ def load_multiclass_model():
             label_encoder = joblib.load(LABEL_ENCODER_PATH)
 
         # Đối chiếu hợp đồng feature ngay lúc nạp, giống gatekeeper làm với
-        # model nhị phân. Nếu multiclass.pkl là bản cũ, predict() sẽ ném lỗi ở
+        # model nhị phân. Nếu multiclass_eval.pkl là bản cũ, predict() sẽ ném lỗi ở
         # MỌI lần gọi; bản trước chỉ hiện một dòng warning nhỏ giữa trang rồi
         # âm thầm vẽ biểu đồ bằng cột `reason`. Người xem vẫn thấy một biểu đồ
         # "phân loại tấn công" trông bình thường mà thực chất model đã chết.
@@ -201,7 +218,7 @@ def load_multiclass_model():
 
         if n_model is not None and int(n_model) != len(FEATURE_COLUMNS):
             st.error(
-                f"⚠️ `models/multiclass.pkl` nhận {int(n_model)} feature "
+                f"⚠️ `models/multiclass_eval.pkl` nhận {int(n_model)} feature "
                 f"nhưng `features.py` khai báo {len(FEATURE_COLUMNS)}. "
                 "Model đã cũ so với bộ đặc trưng hiện tại — biểu đồ phân loại "
                 "sẽ dùng cột `reason` thay vì dự đoán. "
@@ -547,7 +564,7 @@ def main():
     # Warn when the multiclass model is unavailable
     if model is None:
         st.warning(
-            "Unable to find `models/multiclass.pkl`. "
+            "Unable to find `models/multiclass_eval.pkl`. "
             "Attack charts will use the `reason` field instead of multiclass predictions."
         )
 
