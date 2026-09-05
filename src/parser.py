@@ -46,6 +46,36 @@ def canonicalize_labels(series):
     return series.astype(str).str.strip().replace(LABEL_CANON)
 
 
+# Lớp có quá ít dòng để học được, loại khỏi bài toán.
+#
+# WebDDoS chỉ có 439 dòng trên tổng 48.699.876 — 0,0009%. Với số đó không thể
+# huấn luyện lẫn đánh giá: đo trên mẫu, model chỉ chặn được 42,86% và độ chính
+# xác đặt tên dao động hoàn toàn theo may rủi của phép lấy mẫu. Giữ nó lại chỉ
+# khiến model đoán bừa một nhãn mà không có cơ sở nào.
+#
+# Loại thẳng và ghi rõ "không hỗ trợ" trung thực hơn là để nguyên.
+DROP_LABELS = {"WebDDoS"}
+
+# Tỉ lệ tách ra làm tập kiểm chứng cho những lớp CHỈ có ở ngày 1.
+#
+# CICDDoS2019 chia sẵn theo hai ngày capture, nhưng thư mục testing/ chỉ chứa
+# 6 lớp. Sáu lớp còn lại — DNS, NTP, SNMP, SSDP, TFTP, WebDDoS — không có một
+# dòng nào ở ngày 2, tức chiếm 68,5% dữ liệu huấn luyện mà KHÔNG BAO GIỜ được
+# kiểm chứng. Model vẫn xuất những nhãn đó lên dashboard, và các lớp có kiểm
+# chứng lại nhầm chính sang chúng (UDP -> SSDP 22%, LDAP -> SNMP 16%).
+#
+# Tách 20% số dòng của riêng các lớp đó sang tập kiểm tra để mọi lớp đều có số
+# đo out-of-sample.
+#
+# LƯU Ý VỀ PHƯƠNG PHÁP: đây là holdout CÙNG NGÀY, yếu hơn holdout chéo ngày mà
+# các lớp kia được hưởng. Phải ghi rõ khi báo cáo, đừng gộp hai loại số này làm
+# một.
+SAME_DAY_HOLDOUT_FRAC = 0.20
+
+# Hạt ngẫu nhiên cố định để lần chạy nào cũng cho cùng một phép chia
+HOLDOUT_SEED = 42
+
+
 # Columns pulled from the raw CSVs: the model's feature contract plus the
 # label. FEATURE_NAMES lives in features.py so the training pipeline and the
 # live extractor in gatekeeper.py cannot drift apart.
@@ -303,6 +333,74 @@ def save_data(df_train, df_test):
     joblib.dump(label, path)
 
 
+# Loại các lớp quá hiếm để học được, ở CẢ hai tập.
+def drop_rare_labels(df_train, df_test):
+    for name, df in (("ngày 1", df_train), ("ngày 2", df_test)):
+        present = set(df["Label"].unique()) & DROP_LABELS
+
+        for label in sorted(present):
+            n = int((df["Label"] == label).sum())
+
+            print(f"[!] Loại lớp {label} khỏi {name}: {n:,} dòng — quá ít để học")
+
+    return (
+        df_train[~df_train["Label"].isin(DROP_LABELS)].reset_index(drop=True),
+        df_test[~df_test["Label"].isin(DROP_LABELS)].reset_index(drop=True),
+    )
+
+
+# Chuyển 20% số dòng của những lớp CHỈ có ở ngày 1 sang tập kiểm tra.
+#
+# Không đụng tới các lớp đã có mặt ở cả hai ngày: chúng giữ nguyên holdout chéo
+# ngày, vốn là phép đánh giá mạnh hơn.
+def balance_class_coverage(df_train, df_test):
+    train_labels = set(df_train["Label"].unique())
+    test_labels = set(df_test["Label"].unique())
+
+    missing = sorted(train_labels - test_labels)
+
+    if not missing:
+        print("[+] Mọi lớp đều đã có mặt ở tập kiểm tra.")
+
+        return df_train, df_test
+
+    print(
+        f"\n[!] {len(missing)} lớp không có dòng nào ở tập kiểm tra: "
+        f"{', '.join(missing)}"
+    )
+
+    print(
+        f"[*] Tách {SAME_DAY_HOLDOUT_FRAC:.0%} mỗi lớp sang tập kiểm tra "
+        f"(holdout cùng ngày)"
+    )
+
+    moved = []
+
+    for label in missing:
+        rows = df_train[df_train["Label"] == label]
+
+        take = rows.sample(
+            frac=SAME_DAY_HOLDOUT_FRAC,
+            random_state=HOLDOUT_SEED
+        )
+
+        moved.append(take)
+
+        print(f"    {label:<10} {len(rows):>12,} -> giữ lại "
+              f"{len(rows) - len(take):>12,} / kiểm tra {len(take):>10,}")
+
+    holdout = pd.concat(moved, ignore_index=False)
+
+    df_train = df_train.drop(index=holdout.index).reset_index(drop=True)
+
+    df_test = pd.concat(
+        [df_test, holdout.reset_index(drop=True)],
+        ignore_index=True
+    )
+
+    return df_train, df_test
+
+
 # Run the complete data processing pipeline
 def main():
     # Show process header
@@ -333,6 +431,13 @@ def main():
     # Show raw dataset sizes
     print(f"\n[*] Raw Training samples: {len(df_train):,}")
     print(f"[*] Raw Testing samples : {len(df_test):,}")
+
+    # Loại lớp quá hiếm, rồi bảo đảm mọi lớp còn lại đều có tập kiểm chứng
+    df_train, df_test = drop_rare_labels(df_train, df_test)
+
+    df_train, df_test = balance_class_coverage(df_train, df_test)
+
+    print(f"\n[*] Sau khi cân bằng: {len(df_train):,} train / {len(df_test):,} test")
 
     # Save processed datasets
     save_data(

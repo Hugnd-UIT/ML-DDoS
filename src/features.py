@@ -46,6 +46,29 @@ FEATURE_NAMES = [
     "Protocol",
     "SYN Flag Count",
     "ACK Flag Count",
+
+    # Cổng nguồn và cổng đích.
+    #
+    # Thiếu hai cột này là nguyên nhân chính khiến model không phân biệt được
+    # các họ tấn công phản xạ UDP. Toàn bộ DNS/LDAP/SNMP/SSDP/MSSQL/NetBIOS/NTP
+    # đều là phản xạ UDP, và thứ duy nhất phân biệt chúng ngoài đời là cổng
+    # dịch vụ bị lợi dụng. Đo trên 937.614 dòng, 12 lớp cân bằng:
+    #
+    #     18 feature (không cổng)          62,84%
+    #     + Source Port, Destination Port  75,24%    (+12,40 điểm)
+    #     + 9 thống kê khác nữa            75,42%    (+0,18 — không đáng)
+    #
+    # Riêng NetBIOS đi từ 8,70% lên 77,10%, DNS từ 36,02% lên 74,81%.
+    #
+    # Không phải bảng tra: dùng RIÊNG hai cột cổng chỉ đạt 47,59%, nên chúng
+    # mang thông tin bổ sung thật chứ không thay thế các feature còn lại.
+    #
+    # HẠN CHẾ PHẢI NÊU TRONG BÁO CÁO: CICDDoS2019 dùng cổng tổng hợp của phòng
+    # lab — DNS bắn từ 564/634 chứ không phải 53, LDAP từ 900 chứ không phải
+    # 389. Model học cổng theo dữ liệu này sẽ KHÔNG nhận ra tấn công phản xạ
+    # thật ngoài đời, vốn đến từ cổng dịch vụ chuẩn.
+    "Source Port",
+    "Destination Port",
 ]
 
 N_FEATURES = len(FEATURE_NAMES)
@@ -218,6 +241,11 @@ def extract_features(flow):
 
     protocol = float(flow.protocol)
 
+    # Cổng, lấy thẳng từ NFStream. Xem chú thích ở FEATURE_NAMES về vì sao hai
+    # cột này quan trọng, và về hạn chế cổng tổng hợp của CICDDoS2019.
+    src_port = float(_get(flow, "src_port"))
+    dst_port = float(_get(flow, "dst_port"))
+
     features = np.array(
         [[
             duration_us,
@@ -238,6 +266,8 @@ def extract_features(flow):
             protocol,
             syn_count,
             ack_count,
+            src_port,
+            dst_port,
         ]],
         dtype=np.float32
     )

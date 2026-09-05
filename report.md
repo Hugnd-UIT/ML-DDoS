@@ -1242,6 +1242,126 @@ Nêu rõ điều này khi trình bày số liệu.
 
 ---
 
+## 7h. FIX-45 → 47 — Kiểm tra tổng thể: có nhận đủ và đúng các loại DDoS không?
+
+Các mục trước chỉ chứng minh lớp `Syn`. Mục này kiểm tra **toàn bộ 12 lớp tấn công**
+của CICDDoS2019, chạy đúng đường ống đang deploy.
+
+### A. Phát hiện — phần lớn ổn
+
+Tập ngày 2, ngưỡng TCP 0,90 / khác 0,9999:
+
+| lớp | số dòng | AI chặn | đặt tên | cả hai |
+|---|---:|---:|---:|---:|
+| MSSQL | 1.397.028 | 99,97% | 93,84% | 93,82% |
+| **Syn** | 1.139.828 | **29,93%** | 88,13% | **28,46%** |
+| UDP | 948.061 | 99,72% | 75,83% | 75,77% |
+| NetBIOS | 880.148 | 99,34% | 99,72% | 99,26% |
+| LDAP | 468.076 | 99,97% | 80,07% | 80,06% |
+| UDPLag | 438 | 93,15% | 59,82% | 59,13% |
+| BENIGN | 14.241 | 0,33% báo nhầm | — | — |
+
+Tổng chặn **83,29%**. Chỉ `Syn` tụt, do chữ ký hai ngày khác nhau (mục 7f).
+
+### B. Đặt tên — hỏng, và hỏng cả in-sample
+
+Đo trên dữ liệu **model đã học thuộc** — tức cận trên của năng lực:
+
+| lớp | AI chặn | đặt tên | nhầm sang |
+|---|---:|---:|---|
+| **DNS** | 97,38% | **26,18%** | LDAP 57%, SNMP 13% |
+| **SSDP** | 99,63% | **25,39%** | UDP 71% |
+| **UDPLag** | 96,28% | **20,71%** | Syn 65% |
+| LDAP | 99,98% | 67,26% | SNMP 27% |
+| UDP | 99,74% | 76,20% | SSDP 22% |
+| SNMP | 99,93% | 84,26% | LDAP 9% |
+| TFTP | 99,89% | 99,23% | Syn 1% |
+| NTP | 96,25% | 99,80% | — |
+| **WebDDoS** | **42,86%** | — | chỉ 439 dòng toàn bộ dữ liệu |
+
+Sai **in-sample** nghĩa là bộ đặc trưng không đủ để phân biệt — không phải lỗi khái
+quát hoá, không sửa được bằng cách đổi model hay đổi ngưỡng.
+
+### C. Nguyên nhân: `FEATURE_NAMES` không có cột cổng nào
+
+Mọi lớp hỏng đều là tấn công **phản xạ UDP**, và thứ duy nhất phân biệt chúng là
+cổng dịch vụ bị lợi dụng. Thực nghiệm trên 937.614 dòng, 12 lớp cân bằng, chia
+70/30:
+
+```
+18 feature hien tai              62.84%
++ Source Port, Destination Port  75.24%   (+12.40 diem)
++ 9 thong ke NFStream khac nua   75.42%   (+0.18  — khong dang doi)
+```
+
+Chi tiết theo lớp, trước → sau khi thêm 2 cột cổng:
+
+```
+NetBIOS   8.70% -> 77.10%      DNS      36.02% -> 74.81%
+Syn      43.31% -> 64.66%      SSDP     33.81% -> 54.97%
+MSSQL    62.88% -> 71.61%      UDPLag   34.28% -> 48.32%
+```
+
+Không phải bảng tra: dùng **riêng** hai cột cổng chỉ đạt 47,59%, nên chúng mang
+thông tin bổ sung thật chứ không thay thế các feature còn lại.
+
+Chín thống kê khác mà NFStream cấp được (`Packet Length Std`, `Fwd IAT Max/Min/Std`,
+`Average Packet Size`...) chỉ đóng góp +0,18 điểm — đã thử và bỏ, không đưa vào.
+
+### D. 6/12 lớp chưa bao giờ được kiểm chứng
+
+| lớp | ngày 1 | ngày 2 |
+|---|---:|---:|
+| DNS | 4.908.665 | **0** |
+| NTP | 1.195.690 | **0** |
+| SNMP | 5.149.261 | **0** |
+| SSDP | 2.568.569 | **0** |
+| TFTP | 19.515.971 | **0** |
+| WebDDoS | 439 | **0** |
+
+Chiếm **68,5% dữ liệu huấn luyện**. Thư mục `testing/` của CICDDoS2019 chỉ có 6 lớp.
+Model vẫn xuất những nhãn này lên dashboard mà không có dòng nào để kiểm chứng — và
+các lớp *có* kiểm chứng lại nhầm **chính sang chúng** (UDP→SSDP 22%, LDAP→SNMP 16%).
+
+### Ba thay đổi
+
+**FIX-45** — thêm `Source Port` và `Destination Port` vào `FEATURE_NAMES` (18 → 20).
+NFStream cấp sẵn cả hai qua `flow.src_port` / `flow.dst_port`.
+
+**FIX-46** — `parser.py` tách 20% số dòng của những lớp chỉ có ở ngày 1 sang tập kiểm
+tra, để mọi lớp đều có số đo out-of-sample. Các lớp đã có mặt ở cả hai ngày **không bị
+đụng tới**, giữ nguyên holdout chéo ngày vốn là phép đánh giá mạnh hơn.
+
+**FIX-47** — loại `WebDDoS` khỏi bài toán. 439 dòng trên 48.699.876 là 0,0009%; model
+chỉ chặn được 42,86% và độ chính xác đặt tên dao động hoàn toàn theo may rủi lấy mẫu.
+Ghi rõ "không hỗ trợ" trung thực hơn là để model đoán bừa.
+
+Kiểm thử logic chia dữ liệu trên dữ liệu giả — mọi ca đạt: WebDDoS bị loại khỏi cả hai
+tập, ba lớp thiếu được tách đúng 20%, và lớp đã có ở cả hai ngày không bị động tới.
+
+### Hai hạn chế phải nêu trong báo cáo
+
+**1. Cổng trong CICDDoS2019 là cổng tổng hợp của phòng lab.** Phân bố `Source Port`
+thực tế trong dữ liệu:
+
+```
+DNS       564:48%, 634:14%       <- khong phai 53
+LDAP      900:52%                <- khong phai 389
+NTP       634:56%                <- khong phai 123
+NetBIOS   648:32%
+SNMP      648:16%
+SSDP      672:14%
+```
+
+Model học cổng theo dữ liệu này sẽ **không** nhận ra tấn công phản xạ thật ngoài đời,
+vốn đến từ cổng dịch vụ chuẩn. Trong phạm vi đồ án — nhận đúng và đủ các loại trong
+CICDDoS2019 — đây là lựa chọn đúng, nhưng phải nói rõ giới hạn chuyển giao.
+
+**2. Holdout của 6 lớp kia là CÙNG NGÀY**, yếu hơn holdout chéo ngày mà 6 lớp còn lại
+được hưởng. Khi trình bày số liệu phải tách hai loại, đừng gộp làm một con số.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
