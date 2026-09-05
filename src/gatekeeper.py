@@ -35,7 +35,6 @@ from enforcer import XDPEnforcer, AttackSignature
 from features import (
     extract_features,
     FEATURE_NAMES,
-    MIN_DURATION_S,
     MIN_PACKETS_FOR_INFERENCE,
     N_FEATURES,
 )
@@ -95,6 +94,13 @@ THRESHOLD_FILE = os.path.join(
 
 # Cửa sổ trượt, dùng cho sổ phán quyết của AI và cho bộ đếm telemetry
 WINDOW_SECONDS = 5
+
+# Sàn thời lượng khi BÁO CÁO pps lên log/dashboard.
+#
+# Khác MIN_DURATION_S (1 µs) vốn dùng cho vector đưa vào model: con số đó khớp
+# độ phân giải của CICDDoS2019 nên đúng cho feature. Nhưng NFStream chỉ đo tới
+# mili-giây, nên chia cho 1 µs là bịa ra độ chính xác gấp 1000 lần thực tế.
+MIN_REPORTED_DURATION_S = 1e-3
 
 
 # ── AI LÀ BÊN DUY NHẤT RA QUYẾT ĐỊNH CHẶN ───────────────────────────────────
@@ -1274,9 +1280,19 @@ def main():
                 if features is None:
                     continue
 
+                # Sàn thời lượng dùng để BÁO CÁO pps, khác sàn dùng cho feature.
+                #
+                # MIN_DURATION_S là 1 µs vì đó là độ phân giải của CICDDoS2019
+                # — đúng cho vector đưa vào model. Nhưng NFStream chỉ đo được
+                # tới mili-giây, nên mọi flow dưới 1 ms về đây với duration = 0.
+                # Chia cho 1 µs là bịa ra độ chính xác gấp 1000 lần thực tế:
+                # một flow 3 gói hiện thành 3.000.000 pps trên dashboard, trong
+                # khi kẻ tấn công chỉ bắn 1.000 gói/giây.
+                #
+                # Dùng sàn 1 ms để con số báo cáo là cận trên thật sự đo được.
                 duration_s = max(
                     float(flow.bidirectional_duration_ms) / 1000.0,
-                    MIN_DURATION_S
+                    MIN_REPORTED_DURATION_S
                 )
 
                 batcher.add(

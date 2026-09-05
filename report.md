@@ -1207,6 +1207,41 @@ trong `threshold.json` do `recalibrate.py` sinh ra, điều chỉnh qua `TARGET_
 
 ---
 
+## 7g. FIX-44 — Cột `pps` trên dashboard sai 1000 lần
+
+**Hiện tượng.** Chạy `hping3 -S -p 80 -i u1000` (1.000 gói/giây), dashboard hiện:
+
+```
+src_ip        protocol  dst_port  pps        reason
+10.240.0.3    TCP       80        3000000    AI_INFERENCE (Binary Model)
+```
+
+Ba triệu gói/giây, sai 3000 lần so với thực tế.
+
+**Nguyên nhân.** `pps = bidirectional_packets / duration_s`, với sàn
+`MIN_DURATION_S = 1e-6`. Flow có 3 gói, NFStream báo `duration_ms = 0`, nên
+`3 / 0,000001 = 3.000.000`.
+
+Sàn 1 µs **đúng cho feature** — nó khớp độ phân giải của CICDDoS2019, tập dữ liệu
+mà model được fit trên đó. Nhưng NFStream chỉ đo tới **mili-giây**, nên mọi flow
+ngắn hơn 1 ms đều về đây với `duration = 0`. Dùng sàn 1 µs để hiển thị là bịa ra
+độ chính xác gấp 1000 lần thứ công cụ thật sự đo được.
+
+**Cách fix.** Tách hai hằng số: `MIN_DURATION_S = 1e-6` giữ nguyên cho vector đưa
+vào model, thêm `MIN_REPORTED_DURATION_S = 1e-3` cho con số báo cáo — cận trên
+thật sự đo được.
+
+```
+flow 3 goi, NFStream bao duration = 0 ms:
+   san 1 us (cu)    ->    3,000,000 pps
+   san 1 ms (moi)   ->        3,000 pps
+```
+
+Vẫn là cận trên chứ không phải giá trị đúng, vì NFStream không đo nổi dưới 1 ms.
+Nêu rõ điều này khi trình bày số liệu.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
