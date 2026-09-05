@@ -139,6 +139,7 @@ chết ngay ở dòng import.
 | 29 | Data plane hoàn toàn câm, không đếm được gói bị DROP | Đúng đắn | xdp_filter.c |
 | 30 | Dashboard không đối chiếu feature model multiclass | Nhỏ | app.py |
 | **31** | **Ngưỡng hiệu chỉnh trên dữ liệu model đã học → chặn nhầm CDN thật** | **Nguy hiểm** | trainer.py |
+| **32** | **Lệch ngữ nghĩa feature → không nhận đúng loại tấn công** | **Nguy hiểm** | features.py |
 
 ---
 
@@ -769,6 +770,72 @@ Sau khi sửa:
   2.57.121.112     p=0.9968  -> KHÔNG ban nữa
   151.101.128.223  p=0.9938  -> KHÔNG ban nữa
 ```
+
+---
+
+## 7c. FIX-32 — Không nhận đúng loại tấn công: lệch ngữ nghĩa feature
+
+`src/features.py · extract_features()`
+
+> Phát hiện khi test hping3 trên VM1: SYN flood chỉ ra nhãn chung
+> `RATE_LIMIT (Volumetric)`, không bao giờ ra `Syn`.
+
+**Hiện tượng.** Model multiclass biết 13 loại (`Syn`, `UDP`, `LDAP`, `MSSQL`,
+`NTP`, `DNS`, `SSDP`, `NetBIOS`, `SNMP`, `TFTP`, `UDPLag`, `WebDDoS`, `BENIGN`)
+và đạt **90,61%** trên dữ liệu CICDDoS2019 thật — **model không hỏng**. Nhưng
+với vector do `extract_features()` sinh ra từ NFStream, nó đoán sai gần hết.
+
+**Nguyên nhân — hai chỗ lệch ngữ nghĩa giữa CICFlowMeter và NFStream:**
+
+| Cột | CICFlowMeter (dữ liệu train) | NFStream (code đang nạp) |
+|---|---|---|
+| `SYN/ACK Flag Count` | **cờ nhị phân 0/1** (max toàn tập = 1.00) | **số đếm gói**, có thể hàng nghìn |
+| `Fwd/Bwd Packet Length` | độ dài **payload** | kích thước **cả khung** (+54B header) |
+
+Hai cột này không phải chi tiết nhỏ. Đọc importance của chính `multiclass.pkl`:
+
+```
+32.47%  ACK Flag Count            <- feature QUAN TRỌNG NHẤT, đang nạp sai
+14.61%  Fwd Packet Length Mean    <- lệch +54B
+12.36%  Fwd Packet Length Min     <- lệch +54B
+ 9.79%  Bwd Packet Length Mean    <- lệch +54B
+ ...
+Tổng nhóm độ dài gói : 47.74%
+Tổng nhóm thời gian  :  5.11%   <- nhóm NFStream không tái tạo được, nhưng vô hại
+```
+
+**80,2% sức mạnh quyết định của model đang được nạp giá trị sai.**
+
+Bằng chứng rõ nhất cho chỗ độ dài gói: lớp `Syn` trong tập huấn luyện có
+`Fwd Packet Length Mean` median = **0,00** — gói SYN không có payload. Nếu cột
+đó đo cả khung thì giá trị phải là 54+, không đời nào bằng 0.
+
+**Cách fix.**
+- `SYN/ACK Flag Count` → cờ nhị phân: `1.0 if count > 0 else 0.0`.
+- Trừ header khỏi mọi cột độ dài gói: 54 byte cho TCP (14 Eth + 20 IP + 20 TCP),
+  42 byte cho UDP. Tổng byte trừ header của **từng gói**, không phải một lần.
+- **Không** đụng `MIN_PACKETS_FOR_INFERENCE`: đã kiểm chứng trong 22 triệu dòng
+  huấn luyện không có dòng nào ≤ 1 gói, nên ngưỡng 2 là đúng.
+- **Không** bỏ nhóm feature thời gian: tuy NFStream chỉ có độ phân giải mili
+  giây trong khi CICFlowMeter dùng micro giây, nhóm này chỉ chiếm 5,11%
+  importance — không đáng để tái cấu trúc.
+
+```
+Kiểm chứng trên mẫu cân bằng theo lớp từ tập ngày 2:
+
+  extract_features CŨ  (đang chạy trên VM) : 49.88%
+  extract_features MỚI (đã sửa)            : 74.91%
+  [trần] dữ liệu CICFlowMeter nguyên bản   : 74.91%   <- phục hồi HOÀN TOÀN
+
+  Ví dụ lớp NetBIOS: nhận ra 49/800 dòng  ->  802/800 dòng
+```
+
+**Lưu ý còn lại.** Nếu tấn công dùng **một 5-tuple cố định** (`hping3 -s 5555 -k`),
+NFStream gộp thành flow dài hàng giây trong khi CICFlowMeter tách thành micro-flow
+2 gói — lúc đó `duration`/`rate` lệch 3 bậc và độ chính xác còn ~37,98%. Flood
+thật ngoài đời dùng source port ngẫu nhiên nên tạo flow nhỏ, khớp với dữ liệu
+huấn luyện. Đây là giới hạn cần nêu trong phần "hạn chế" của báo cáo, không phải
+lỗi sửa được ở tầng code.
 
 ---
 
