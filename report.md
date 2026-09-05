@@ -1,17 +1,22 @@
 # Báo cáo rà soát & gia cố Gatekeeper IPS
 
 Rà soát toàn bộ mã nguồn hệ thống phát hiện DDoS bằng Machine Learning + eBPF/XDP.
-**30 lỗi đã sửa** qua hai vòng, trên 13 file. Mỗi mục gồm *hiện tượng* và *cách fix*.
+**32 lỗi đã sửa** qua ba vòng, trên 13 file. Mỗi mục gồm *hiện tượng* và *cách fix*.
 
 Phần lớn không phải lỗi cú pháp — chúng là những chỗ hệ thống vẫn **chạy**, vẫn in
 log đẹp, nhưng không còn bảo vệ được gì.
 
 | | |
 |---|---|
-| Vòng 1 | 16/08/2026 — FIX-01 … FIX-22 |
-| Vòng 2 | 05/09/2026 — FIX-23 … FIX-30 (gồm 1 regression do vòng 1 gây ra) |
-| Kiểm chứng | 9 fix có test chạy thật, số liệu ghi kèm trong từng mục |
+| Vòng 1 | 16/08/2026 — FIX-01 … FIX-22, rà soát mã nguồn |
+| Vòng 2 | 05/09/2026 — FIX-23 … FIX-30, đọc lại (gồm 1 regression do vòng 1 gây ra) |
+| Vòng 3 | 05/09/2026 — FIX-31, FIX-32, phát hiện khi **chạy thật trên VM1** |
+| Kiểm chứng | 11 fix có test chạy thật, số liệu ghi kèm trong từng mục |
 | Chưa test được | Phần eBPF (FIX-04, FIX-19, FIX-29) — BCC chỉ có trên Linux |
+
+> **Hai lỗi nặng nhất chỉ lộ ra khi chạy thật, không phải khi đọc code:** FIX-31
+> (chặn nhầm CDN hợp lệ vì ngưỡng sai) và FIX-32 (không nhận đúng loại tấn công vì
+> lệch đơn vị đo feature). Cả hai đều "chạy bình thường" trên giấy.
 
 ---
 
@@ -46,16 +51,17 @@ không còn mô tả đúng file đang nằm trên đĩa.
 python src/recalibrate.py
 ```
 
-Script mới (`src/recalibrate.py`) dùng lại đúng hai model hiện có, chỉ làm ba việc
-cuối của `trainer.py`:
+Script mới (`src/recalibrate.py`) dùng lại đúng model hiện có:
 
-1. Quét ngưỡng trên `binary_eval.pkl` với dữ liệu ngày 2 chưa từng thấy → **nguồn của FPR/TPR trung thực để đưa vào báo cáo**
-2. Chuyển ngưỡng sang `binary.pkl` theo **phân vị** (xem FIX-11)
-3. Băm `binary.pkl` ghi vào `threshold.json` (xem FIX-22)
+1. Chấm `binary_eval.pkl` trên dữ liệu ngày 2 chưa từng thấy
+2. Chọn ngưỡng đạt mục tiêu FPR → **ngưỡng và FPR/TPR đều là số đo thật**
+3. Băm `binary_eval.pkl` ghi vào `threshold.json` (xem FIX-22)
+
+Model được deploy là `binary_eval.pkl`, **không phải** `binary.pkl` — xem FIX-31.
 
 Đọc dữ liệu theo chunk 1 triệu dòng nên không nổ RAM. Áp cùng cổng chất lượng như
 trainer (FPR ≤ 2%, TPR ≥ 70%) và **từ chối ghi file** nếu model không đạt.
-Thời gian: vài phút (đọc ~7 GB), không phải hàng chục phút như huấn luyện lại.
+Thời gian: dưới một phút (chỉ đọc `test_binary.csv`).
 
 ### Sau đó — kiểm tra trên VM1
 
@@ -70,15 +76,17 @@ Phải thấy đủ các dòng sau lúc khởi động:
 [+] XDP statistics counters ready            ← FIX-29
 [+] Successfully loaded N/M rules            ← FIX-02, N phải BẰNG M
 [+] Model integrity: sha256 khớp             ← FIX-22
+    Path: .../models/binary_eval.pkl         ← FIX-31, KHÔNG phải binary.pkl
 [+] Feature contract khớp: 18 feature        ← FIX-09
-[+] Decision threshold: 0.9xxxxx             ← FIX-11
+[+] Decision threshold: 0.9999               ← FIX-31
+    FPR 0.0018% / TPR 76.4452%
 ```
 
-**Không được** thấy hai dòng này nữa sau khi chạy `recalibrate.py`:
+**Không được** thấy dòng nào trong số này nữa sau khi chạy `recalibrate.py`:
 
 ```
 [!] threshold.json chưa có binary_sha256; bỏ qua bước kiểm tra toàn vẹn
-[!] threshold.json không xác nhận đã hiệu chỉnh trên model production
+[!] threshold.json không xác nhận đã hiệu chỉnh trên chính model đang deploy
 ```
 
 Chạy một lúc rồi `Ctrl+C`, chụp lại bảng `XDP DATA PLANE COUNTERS` — đó là số liệu
