@@ -1,5 +1,9 @@
 {
   "threshold": 0.9999,
+  "threshold_tcp": 0.9,
+  "measured_fpr_tcp": 0.0049437741745434055,
+  "measured_tpr_tcp": 0.29893350703168786,
+  "target_fpr_tcp": 0.005,
   "model_file": "models/binary_eval.pkl",
   "calibrated_on": "deployed_model",
   "measured_fpr": 1.7760096614925586e-05,
@@ -30,6 +34,6 @@
     "ACK Flag Count"
   ],
   "binary_sha256": "8f3425dd097f06777058aef7c3e38b48118ae520aff949b1217456deccead9b2",
-  "trained_at": "2026-09-05T03:00:09Z",
+  "trained_at": "2026-09-05T14:58:47Z",
   "recalibrated_without_retrain": true
 }

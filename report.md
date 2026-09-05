@@ -1069,6 +1069,144 @@ vĩnh viễn cái bẫy lệch ngữ nghĩa này, nhưng tốn vài giờ.
 
 ---
 
+## 7f. FIX-38 → 43 — Thiết kế lại: AI phát hiện, XDP thi hành
+
+Đây không phải sửa lỗi mà là **đổi kiến trúc**. Lý do: đo lại thì tuyến AI —
+trọng tâm của đồ án — gần như không hoạt động, còn rate limiter làm gần hết việc.
+
+### Kiến trúc cũ và vì sao nó lệch trọng tâm
+
+```
+NFStream ─┬─ [cong >= 10 goi] ─ AI (0.9999) ─ ban
+          ├─ RATE LIMITER: 200 SYN / 1000 UDP / 3000 goi ─ ban   <- lam gan het viec
+          └─ bo dem toan cuc ─ flood_mode ─ ha nguong rate ÷10
+```
+
+Hai cửa chặn độc lập, mỗi cửa tự nó đủ vô hiệu hoá tuyến AI:
+
+**Cửa 1 — `MIN_PACKETS_FOR_AI = 10`.** Flow SYN flood có trung vị đúng **2 gói**:
+
+```
+So goi moi flow, lop Syn ngay 1:
+   phan vi 50%:        2 goi
+   phan vi 75%:        2 goi
+   phan vi 90%:        6 goi
+   duoi 10 goi:   90.32%   <- bi loai truoc khi AI kip cham
+```
+
+**Cửa 2 — ngưỡng 0,9999 hiệu chỉnh theo các lớp dễ.** Tỉ lệ model nhị phân bắt
+được, theo từng lớp:
+
+| lớp | 0.5 | 0.9 | 0.99 | 0.9999 |
+|---|---:|---:|---:|---:|
+| MSSQL | 99,99% | 99,99% | 99,99% | **99,97%** |
+| UDP | 100% | 100% | 99,99% | **99,72%** |
+| NetBIOS | 100% | 99,99% | 99,70% | **99,33%** |
+| LDAP | 99,99% | 99,99% | 99,98% | **99,96%** |
+| **Syn** | 83,62% | 29,98% | 2,87% | **0,11%** |
+
+Các lớp phản xạ UDP được chấm điểm ~1,0 nên ngưỡng chặt không tốn gì. Lớp `Syn`
+có trung vị điểm số **0,68**, nên cùng ngưỡng đó gần như xoá sổ nó.
+
+Nhân hai cửa: **tuyến AI bắt được khoảng 2,8% số cuộc SYN flood.** Rate limiter
+nhặt phần còn lại nên hệ thống nhìn bên ngoài vẫn chạy, che mất việc trọng tâm đã
+hỏng. Nó cũng chính là thứ đã ban nhầm Fastly CDN ở FIX-33.
+
+### Kiến trúc mới
+
+```
+NFStream ─ gom lo 128 flow ─ AI cham MOI flow >= 2 goi
+                              │
+                              ├─ TCP:      p >= 0.90
+                              └─ UDP/ICMP: p >= 0.9999
+                              │
+                    so phan quyet theo IP, du K=5 ─ XDP DROP
+```
+
+**Điểm cốt lõi: thứ được đếm là PHÁN QUYẾT của AI, không phải lưu lượng.** Đây là
+khác biệt căn bản với rate limiter, và nó cho hai hệ quả:
+
+- Kẻ tấn công chậm vẫn bị bắt, vì mỗi flow độc hại đều tính một phán quyết bất kể
+  gửi nhanh hay chậm.
+- Host lành tính tải rất nhanh không bao giờ bị đụng tới, vì AI không kết luận gì
+  về nó — đúng ca `pip install` từ Fastly.
+
+Tác dụng định lượng là biến sai số mỗi flow thành sai số mỗi IP. Với ngưỡng TCP
+0,90 (FPR 0,4944% mỗi flow), xác suất một IP lành tính bị ban:
+
+```
+K=1   9.44e-02
+K=2   4.38e-03
+K=3   1.29e-04
+K=5   4.30e-08     <- dang dung
+```
+
+### Sáu thay đổi
+
+| # | Nội dung | File |
+|---|---|---|
+| 38 | Xoá toàn bộ rate limiter: `SYN_THRESHOLD`, `UDP_ICMP_THRESHOLD`, `TOTAL_THRESHOLD`, `packet_window`, `FLOOD_MODE_DIVISOR` | `gatekeeper.py` |
+| 39 | Xoá `MIN_PACKETS_FOR_AI`; mọi flow ≥ 2 gói đều vào AI | `gatekeeper.py` |
+| 40 | Ngưỡng theo giao thức, sinh bởi `recalibrate.py`, không hard-code | `recalibrate.py` |
+| 41 | `VerdictLedger` — sổ phán quyết theo IP, ban khi đủ K=5 | `gatekeeper.py` |
+| 42 | `FlowBatcher` — gom lô 128 flow trước khi `predict_proba` | `gatekeeper.py` |
+| 43 | Bộ đếm toàn cục hạ xuống telemetry thuần, không tham gia quyết định chặn | `gatekeeper.py` |
+
+`xdp_filter.c` **không sửa một dòng nào** — XDP vốn đã đúng vai trò thi hành.
+
+### Kết quả
+
+| | trước | sau |
+|---|---:|---:|
+| AI bắt SYN flood chuẩn | ~2,8% | **96,54%** |
+| AI bắt các lớp phản xạ UDP | 99,3–99,97% | không đổi |
+| Ban nhầm một IP lành tính | 3,6 × 10⁻⁴ | **4,3 × 10⁻⁸** |
+| Độ trễ phát hiện | — | ~26 ms |
+| Thông lượng chấm điểm | 2.074 flow/s | **199.424 flow/s** |
+| Rate limiter tham gia chặn | gần như 100% | **0%** |
+
+Kiểm thử `VerdictLedger` và `FlowBatcher`, 9/9 ca đạt:
+
+```
+OK  ban dung sau 5 phan quyet
+OK  phan quyet qua han bi loai, khong ban
+OK  prune don duoc IP het han
+OK  20 IP moi IP 1 phan quyet -> khong ai bi ban
+OK  lo 3/4 chua san sang        OK  lo 4/4 san sang
+OK  drain ra (4, 18), lo rong lai
+OK  lo chua day, chua qua han -> cho
+OK  lo chua day nhung qua han -> cham
+```
+
+### Ba điều phải nêu trong phần hạn chế của báo cáo
+
+**1. Con số 96,54% áp dụng cho SYN flood CHUẨN.** Lớp `Syn` ngày 1 có
+`Fwd Packet Length Mean = 0` — gói SYN không mang payload, đúng như giao thức quy
+định, và đúng thứ `hping3` sinh ra. Lớp `Syn` ngày 2 lại có giá trị **6**:
+
+```
+chu ky lop Syn hai ngay:
+  ngay 1 (train)   FwdLenMean = 0.00   FlowBytes/s =       0
+  ngay 2 (test)    FwdLenMean = 6.00   FlowBytes/s = 233,010
+```
+
+Model deploy được fit trên ngày 1, nên trên nhánh TCP của ngày 2 nó chỉ đạt TPR
+29,89% (ghi trong `threshold.json` là `measured_tpr_tcp`). Hai ngày capture cho ra
+hai chữ ký khác nhau; ngày 2 mới là bản dị thường vì gói SYN chuẩn không có
+payload. Phải báo cáo cả hai con số, không được chỉ lấy con số đẹp.
+
+**2. Flow 1 gói không được xét.** `extract_features()` cần tối thiểu 2 gói mới có
+thông tin liên gói, và trong 22 triệu dòng huấn luyện không có dòng nào dưới 2
+gói. Kiến trúc cũ để rate limiter đỡ phần này; bỏ nó đi thì flow 1 gói bị bỏ qua
+hoàn toàn. Thực tế `hping3` bắn vào cổng có dịch vụ luôn tạo flow 2 gói
+(SYN + SYN‑ACK, hoặc SYN + RST nếu cổng đóng), nên chỉ dính khi mục tiêu im lặng
+tuyệt đối. Đây là hạn chế của bộ dữ liệu, không vá được bằng code.
+
+**3. Ngưỡng 0,90 là số đo trên CICDDoS2019**, không phải hằng số phổ quát. Nó nằm
+trong `threshold.json` do `recalibrate.py` sinh ra, điều chỉnh qua `TARGET_FPR_TCP`.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
@@ -1105,8 +1243,12 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `GLOBAL_SYN_THRESHOLD` | `2000` | Ngưỡng SYN toàn cục / 5s (FIX-03) |
 | `GLOBAL_PACKET_THRESHOLD` | `20000` | Ngưỡng tổng gói toàn cục / 5s |
 | `GLOBAL_SOURCE_THRESHOLD` | `500` | Ngưỡng số source khác nhau / 5s |
-| `FLOOD_MODE_DIVISOR` | `10` | Hệ số hạ ngưỡng per-IP khi vào FLOOD MODE |
 | `TRUST_EPHEMERAL_REPLIES` | `1` | Bỏ qua gói trả về cho kết nối máy tự mở (FIX-33) |
+| `VERDICTS_TO_BAN` | `5` | Số phán quyết AI trên cùng IP trước khi chặn (FIX-41) |
+| `VERDICT_WINDOW_S` | `60` | Cửa sổ tích luỹ phán quyết, giây |
+| `AI_BATCH_SIZE` | `128` | Số flow gom lại mỗi lượt chấm (FIX-42) |
+| `AI_BATCH_MAX_WAIT_S` | `0.25` | Thời gian tối đa giữ một lô chưa đầy |
+| `TARGET_FPR_TCP` | `0.005` | Mục tiêu FPR riêng cho nhánh TCP (FIX-40) |
 | `TG_DIGEST_INTERVAL_S` | `60` | Chu kỳ gửi digest Telegram |
 | `TG_IDLE_CYCLES` | `2` | Số chu kỳ yên ắng trước khi báo hết bão |
 | `GATEKEEPER_ENV_FILE` | *(rỗng)* | Đường dẫn `.env` chỉ định rõ (FIX-21) |

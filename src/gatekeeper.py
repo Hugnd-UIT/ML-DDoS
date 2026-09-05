@@ -27,8 +27,8 @@ import warnings
 from collections import Counter, deque
 
 import joblib
+import numpy as np
 
-from cachetools import TTLCache
 from nfstream import NFStreamer
 
 from enforcer import XDPEnforcer, AttackSignature
@@ -93,18 +93,68 @@ THRESHOLD_FILE = os.path.join(
 )
 
 
-# Configure the multi-vector sliding window
+# Cửa sổ trượt, dùng cho sổ phán quyết của AI và cho bộ đếm telemetry
 WINDOW_SECONDS = 5
 
-SYN_THRESHOLD = 200
 
-UDP_ICMP_THRESHOLD = 1000
+# ── AI LÀ BÊN DUY NHẤT RA QUYẾT ĐỊNH CHẶN ───────────────────────────────────
+#
+# Bản trước có hai tuyến song song: AI, và một rate limiter đếm gói theo IP
+# (200 SYN / 1000 UDP / 3000 gói mỗi 5 giây). Đo lại thì rate limiter làm gần
+# như toàn bộ việc chặn, còn tuyến AI hầu như không bắn:
+#
+#   - MIN_PACKETS_FOR_AI = 10 loại bỏ 90,32% flow thuộc lớp Syn trước khi AI
+#     kịp chấm, vì flow SYN flood có trung vị đúng 2 gói.
+#   - Ngưỡng 0,9999 được hiệu chỉnh theo các lớp dễ (MSSQL/UDP/LDAP/NetBIOS
+#     đều chấm ~1,0) rồi áp chung cho lớp Syn, vốn có trung vị điểm số 0,68.
+#     Trong 9,68% flow lọt qua cửa trên, chỉ 28,47% vượt được ngưỡng.
+#
+#   => tuyến AI bắt được khoảng 2,8% số cuộc SYN flood.
+#
+# Rate limiter nhặt phần còn lại nên hệ thống nhìn bên ngoài vẫn hoạt động,
+# che mất việc trọng tâm đã hỏng. Nó cũng chính là thứ đã ban nhầm Fastly CDN
+# lúc máy chủ chạy `pip install` (xem TRUST_EPHEMERAL_REPLIES bên dưới).
+#
+# Kiến trúc hiện tại: AI chấm MỌI flow đủ 2 gói, không còn ngưỡng đếm gói nào.
+# Thứ được đếm là PHÁN QUYẾT của AI, không phải lưu lượng — nên kẻ tấn công
+# chậm vẫn bị bắt, còn host lành tính tải nhanh không bao giờ bị đụng tới.
 
-TOTAL_THRESHOLD = 3000
 
+# Số phán quyết "tấn công" mà AI phải đưa ra cho cùng một IP trước khi chặn.
+#
+# Đây KHÔNG phải rate limiter: nó không nhìn số gói, không nhìn pps, chỉ đếm
+# số lần model kết luận tấn công. Tác dụng là biến sai số trên mỗi flow thành
+# sai số trên mỗi IP. Đo trên tập kiểm tra, với ngưỡng TCP 0,90:
+#
+#     K=1  xác suất ban nhầm một IP lành tính  9,44e-02
+#     K=2                                      4,38e-03
+#     K=3                                      1,29e-04
+#     K=5                                      4,30e-08     <- đang dùng
+#
+# Kẻ tấn công sinh ~200 flow/giây nên chạm K=5 sau khoảng 26 ms.
+VERDICTS_TO_BAN = int(
+    os.environ.get("VERDICTS_TO_BAN", "5")
+)
 
-# Số gói tối thiểu để tuyến AI vào cuộc trong chế độ bình thường
-MIN_PACKETS_FOR_AI = 10
+# Cửa sổ tích luỹ phán quyết. Quá hạn thì sổ của IP đó được xoá.
+VERDICT_WINDOW_S = int(
+    os.environ.get("VERDICT_WINDOW_S", "60")
+)
+
+# Số flow gom lại trước khi gọi predict_proba một lần.
+#
+# XGBoost chấm từng dòng rất phí: đo trên chính model này, chấm lẻ đạt 2.074
+# flow/giây, gom lô 128 đạt 199.424 flow/giây — nhanh gấp 96 lần. Khi AI phải
+# chấm mọi flow thay vì 9,68% như trước, chênh lệch này là bắt buộc.
+AI_BATCH_SIZE = int(
+    os.environ.get("AI_BATCH_SIZE", "128")
+)
+
+# Thời gian tối đa giữ một lô chưa đầy trước khi chấm, tính bằng giây. Không có
+# nó thì flow cuối cùng của một đợt tấn công có thể nằm chờ vô hạn.
+AI_BATCH_MAX_WAIT_S = float(
+    os.environ.get("AI_BATCH_MAX_WAIT_S", "0.25")
+)
 
 
 # ── Lưu lượng trả về cho kết nối do CHÍNH MÁY NÀY mở ra ─────────────────────
@@ -136,9 +186,12 @@ EPHEMERAL_PORT_MAX = 60999
 
 # ── Ngưỡng volumetric TOÀN CỤC (cộng dồn qua MỌI source) ────────────────────
 #
-# Các ngưỡng per-IP ở trên vô dụng trước flood có source giả mạo: attacker rải
-# đều 1-2 gói trên hàng chục nghìn IP khác nhau thì không IP nào chạm ngưỡng,
-# mà tổng lưu lượng vẫn đủ giết server. Bộ đếm dưới đây nhìn tổng thể interface.
+# CHỈ LÀ TELEMETRY. Bộ đếm này KHÔNG được tham gia bất kỳ quyết định chặn nào —
+# nó chỉ trả lời câu hỏi "hiện có đang bị bão không" để báo Telegram và vẽ
+# dashboard. Toàn bộ việc chặn thuộc về AI.
+#
+# Bản trước dùng nó để hạ ngưỡng rate limiter xuống 1/10, tức là để nó gián
+# tiếp ban IP. Cơ chế đó đã bị gỡ cùng với rate limiter.
 GLOBAL_SYN_THRESHOLD = int(
     os.environ.get("GLOBAL_SYN_THRESHOLD", "2000")
 )
@@ -149,12 +202,6 @@ GLOBAL_PACKET_THRESHOLD = int(
 
 GLOBAL_SOURCE_THRESHOLD = int(
     os.environ.get("GLOBAL_SOURCE_THRESHOLD", "500")
-)
-
-# Khi ở FLOOD MODE, chia ngưỡng per-IP cho số này để những source nhỏ lẻ cũng
-# bị chặn. Ở chế độ bình thường thì không, vì đó chính là nguồn false positive.
-FLOOD_MODE_DIVISOR = int(
-    os.environ.get("FLOOD_MODE_DIVISOR", "10")
 )
 
 # Số giây yên ắng liên tục trước khi thoát FLOOD MODE (chống dao động bật/tắt)
@@ -547,7 +594,38 @@ def load_threshold():
 
             sys.exit(1)
 
-        return threshold
+        # Ngưỡng riêng cho TCP.
+        #
+        # Một ngưỡng chung không phục vụ được cả hai họ tấn công. Đo trên tập
+        # kiểm tra: các lớp phản xạ UDP (MSSQL/UDP/NetBIOS/LDAP) đều được chấm
+        # điểm ~1,0 nên ngưỡng 0,9999 không tốn gì, bắt 99,3–99,97%. Lớp Syn
+        # có trung vị điểm số chỉ 0,68, nên cùng ngưỡng đó chỉ bắt được 28,47%.
+        #
+        #     ngưỡng TCP   bắt Syn    FPR benign TCP
+        #        0,90       96,54%        0,4944%      <- mặc định
+        #        0,95       55,00%        0,3304%
+        #        0,99       49,51%        0,1896%
+        #        0,9999     28,47%        0,0000%
+        #
+        # Sai số 0,49% mỗi flow được VERDICTS_TO_BAN chuyển thành 4,3e-08 mỗi
+        # IP, nên đánh đổi này không làm tăng số IP bị ban nhầm.
+        tcp_threshold = meta.get("threshold_tcp")
+
+        if tcp_threshold is None:
+            tcp_threshold = threshold
+
+            print(
+                "  [!] threshold.json chưa có threshold_tcp — dùng chung "
+                f"{threshold:.4f} cho TCP. Tuyến AI sẽ bỏ lọt phần lớn SYN "
+                "flood. Chạy lại: python3 src/recalibrate.py"
+            )
+
+        else:
+            tcp_threshold = float(tcp_threshold)
+
+            print(f"  [+] Ngưỡng riêng cho TCP: {tcp_threshold:.4f}")
+
+        return threshold, tcp_threshold
 
     except Exception as exc:
         print(
@@ -559,7 +637,7 @@ def load_threshold():
             "  [!] Re-run src/trainer.py to generate a tuned threshold."
         )
 
-        return 0.5
+        return 0.5, 0.5
 
 
 # Bộ đếm volumetric toàn cục.
@@ -567,6 +645,125 @@ def load_threshold():
 # Cộng dồn SYN, tổng gói và SỐ SOURCE KHÁC NHAU trên toàn interface trong một
 # cửa sổ trượt. Đây là thứ duy nhất nhìn thấy được flood phân tán/giả mạo, vì
 # theo định nghĩa loại flood đó không có source nào nổi bật.
+class VerdictLedger:
+    """Sổ phán quyết của AI, tính theo từng IP nguồn.
+
+    Đây là thứ thay thế rate limiter, và khác nó ở chỗ căn bản: rate limiter
+    đếm GÓI, sổ này đếm số lần MODEL kết luận "tấn công". Hệ quả:
+
+      - Kẻ tấn công chậm vẫn bị bắt, vì mỗi flow độc hại đều tính một phán
+        quyết bất kể nó gửi nhanh hay chậm.
+      - Host lành tính tải rất nhanh không bao giờ bị đụng tới, vì AI không
+        kết luận gì về nó. Đúng ca `pip install` từ Fastly đã bị ban nhầm.
+
+    Tác dụng định lượng là biến sai số trên mỗi flow thành sai số trên mỗi IP.
+    Với ngưỡng TCP 0,90 (FPR 0,4944% mỗi flow), xác suất một IP lành tính bị
+    ban rơi từ 9,44e-02 ở K=1 xuống 4,30e-08 ở K=5.
+    """
+
+    def __init__(self, need=VERDICTS_TO_BAN, window_s=VERDICT_WINDOW_S):
+        self.need = max(1, int(need))
+        self.window_s = float(window_s)
+
+        # src_ip -> danh sách thời điểm các phán quyết còn hiệu lực
+        self.hits = {}
+
+    # Ghi nhận một phán quyết "tấn công" cho src_ip.
+    # Trả về (đủ_để_chặn, số_phán_quyết_hiện_có).
+    def record(self, src_ip, now):
+        stamps = self.hits.get(src_ip)
+
+        if stamps is None:
+            stamps = []
+            self.hits[src_ip] = stamps
+
+        stamps.append(now)
+
+        # Bỏ các phán quyết đã quá hạn cửa sổ
+        cutoff = now - self.window_s
+
+        while stamps and stamps[0] < cutoff:
+            stamps.pop(0)
+
+        if len(stamps) >= self.need:
+            del self.hits[src_ip]
+
+            return True, self.need
+
+        return False, len(stamps)
+
+    # Xoá sổ của một IP, gọi sau khi IP đó đã bị chặn
+    def forget(self, src_ip):
+        self.hits.pop(src_ip, None)
+
+    # Dọn các IP không còn phán quyết nào trong cửa sổ.
+    #
+    # Không có bước này thì `hits` lớn dần vô hạn trước một cuộc tấn công giả
+    # mạo source — đúng lớp lỗi mà FIX-26 đã sửa cho ban_registry.
+    def prune(self, now):
+        cutoff = now - self.window_s
+
+        dead = [
+            ip for ip, stamps in self.hits.items()
+            if not stamps or stamps[-1] < cutoff
+        ]
+
+        for ip in dead:
+            del self.hits[ip]
+
+        return len(dead)
+
+
+class FlowBatcher:
+    """Gom flow lại rồi chấm điểm một lượt.
+
+    Khi AI phải chấm mọi flow thay vì 9,68% như kiến trúc cũ, chi phí gọi
+    predict_proba từng dòng trở thành nút cổ chai. Đo trên chính model này:
+
+        chấm lẻ (batch 1)     2.074 flow/giây
+        gom lô 128          199.424 flow/giây     — nhanh gấp 96 lần
+
+    Lô được chấm khi đầy, hoặc khi flow cũ nhất đã chờ quá AI_BATCH_MAX_WAIT_S
+    để flow cuối của một đợt tấn công không nằm chờ vô hạn.
+    """
+
+    def __init__(self, size=AI_BATCH_SIZE, max_wait_s=AI_BATCH_MAX_WAIT_S):
+        self.size = max(1, int(size))
+        self.max_wait_s = float(max_wait_s)
+
+        self.vectors = []
+        self.payloads = []
+        self.opened_at = None
+
+    def add(self, vector, payload, now):
+        if not self.vectors:
+            self.opened_at = now
+
+        self.vectors.append(vector)
+        self.payloads.append(payload)
+
+    # True khi lô đã sẵn sàng để chấm
+    def ready(self, now):
+        if not self.vectors:
+            return False
+
+        return (
+            len(self.vectors) >= self.size
+            or now - self.opened_at >= self.max_wait_s
+        )
+
+    # Lấy nội dung lô ra và làm rỗng nó
+    def drain(self):
+        vectors = np.vstack(self.vectors)
+        payloads = self.payloads
+
+        self.vectors = []
+        self.payloads = []
+        self.opened_at = None
+
+        return vectors, payloads
+
+
 class GlobalFloodDetector:
 
     def __init__(
@@ -712,8 +909,9 @@ def _announce_flood(detector):
         f"{stats['sources']:,} source khác nhau"
     )
     print(
-        f"  [!] Hạ ngưỡng per-IP xuống 1/{FLOOD_MODE_DIVISOR} và cho AI "
-        f"phân tích cả flow nhỏ (>= {MIN_PACKETS_FOR_INFERENCE} gói)."
+        "  [!] Đây là CẢNH BÁO, không phải lệnh chặn. Việc chặn vẫn hoàn toàn "
+        f"do AI quyết định, mọi flow >= {MIN_PACKETS_FOR_INFERENCE} gói đều "
+        "được chấm như bình thường."
     )
     print(
         "  [!] LƯU Ý: nếu source bị giả mạo thì chặn theo src IP là vô nghĩa "
@@ -827,7 +1025,7 @@ def main():
 
     validate_model_contract(ai_model)
 
-    ai_threshold = load_threshold()
+    ai_threshold, tcp_threshold = load_threshold()
 
 
     # Configure the egress traffic filter
@@ -884,17 +1082,27 @@ def main():
         print("  [+] IPv6 enforcement: ENABLED")
 
 
-    # Create the sliding-window packet tracker
-    packet_window = TTLCache(
-        maxsize=100_000,
-        ttl=60
+    # Sổ phán quyết của AI — thứ duy nhất dẫn tới lệnh chặn
+    ledger = VerdictLedger()
+
+    # Bộ gom lô để chấm điểm hàng loạt
+    batcher = FlowBatcher()
+
+    print(
+        f"  [+] Chặn khi AI kết luận tấn công {VERDICTS_TO_BAN} lần "
+        f"trên cùng một IP trong {VERDICT_WINDOW_S}s"
     )
 
-    # Bộ đếm volumetric toàn cục
+    print(
+        f"  [+] Gom lô {AI_BATCH_SIZE} flow mỗi lượt chấm "
+        f"(chờ tối đa {AI_BATCH_MAX_WAIT_S:.2f}s)"
+    )
+
+    # Bộ đếm volumetric toàn cục — TELEMETRY, không tham gia quyết định chặn
     flood = GlobalFloodDetector()
 
     print(
-        f"  [+] Global flood thresholds: "
+        f"  [+] Bộ đếm toàn cục (chỉ cảnh báo, không chặn): "
         f"{GLOBAL_SYN_THRESHOLD:,} SYN / "
         f"{GLOBAL_PACKET_THRESHOLD:,} gói / "
         f"{GLOBAL_SOURCE_THRESHOLD:,} source mỗi {WINDOW_SECONDS}s"
@@ -920,10 +1128,96 @@ def main():
 
     # Vòng tiêu thụ flow, tách khỏi main() để supervisor bên dưới dựng lại
     # được NFStream mà vẫn giữ nguyên enforcer, whitelist, model và sổ ban.
+    # Chấm điểm một lô flow rồi ra quyết định.
+    #
+    # Tách khỏi consume() vì nó được gọi từ hai chỗ: khi lô đầy, và khi lô chưa
+    # đầy nhưng đã chờ quá lâu.
+    def score_batch(vectors, payloads):
+        # Một lần gọi cho cả lô. Chấm lẻ đạt 2.074 flow/giây, lô 128 đạt
+        # 199.424 flow/giây trên chính model này.
+        probabilities = ai_model.predict_proba(vectors)[:, 1]
+
+        for probability, item in zip(probabilities, payloads):
+            attack_proba = float(probability)
+
+            # Ngưỡng riêng cho TCP. Các lớp phản xạ UDP được model chấm ~1,0
+            # nên ngưỡng chặt không tốn gì; lớp Syn có trung vị 0,68 nên cùng
+            # ngưỡng đó chỉ bắt được 28,47%.
+            limit = (
+                tcp_threshold
+                if item["protocol_num"] == 6
+                else ai_threshold
+            )
+
+            if attack_proba < limit:
+                continue
+
+            src_ip = item["src_ip"]
+
+            if enforcer.is_whitelisted(src_ip) or enforcer.is_banned(src_ip):
+                continue
+
+            # Tích luỹ phán quyết thay vì chặn ngay. Đây là chỗ sai số trên mỗi
+            # flow được chuyển thành sai số trên mỗi IP: 0,4944% -> 4,30e-08.
+            enough, seen = ledger.record(src_ip, item["now"])
+
+            if not enough:
+                continue
+
+            sig = AttackSignature(
+                src_ip       = src_ip,
+                protocol     = item["protocol"],
+                dst_port     = item["dst_port"],
+                fwd_len_mean = item["fwd_len_mean"],
+                pps          = item["pps"],
+                reason       = "AI_INFERENCE (Binary Model)",
+                features     = item["features"]
+            )
+
+            count, ttl_secs = enforcer.block_ip(sig)
+
+            if count:
+                ttl_label = (
+                    f"{ttl_secs // 3600}h"
+                    if ttl_secs >= 3600
+                    else f"{ttl_secs // 60}m"
+                )
+
+                print(
+                    f"  [BLOCK] {src_ip:<20} "
+                    f"AI_INFERENCE (Binary) "
+                    f"│ p={attack_proba:.4f} "
+                    f"│ {seen} phán quyết "
+                    f"│ ban {ttl_label:<4} "
+                    f"│ offense #{count}"
+                )
+
+
+    # Vòng tiêu thụ flow, tách khỏi main() để supervisor bên dưới dựng lại
+    # được NFStream mà vẫn giữ nguyên enforcer, whitelist, model và sổ ban.
+    #
+    # KIẾN TRÚC: AI là bên duy nhất ra quyết định chặn, XDP chỉ thi hành.
+    # Không còn tuyến rate limiter nào — xem chú thích ở VERDICTS_TO_BAN.
     def consume(streamer):
+        last_prune = time.time()
+
         # Process each detected network flow
         for flow in streamer:
             try:
+                now = time.time()
+
+                # Dọn sổ phán quyết định kỳ. Không có bước này thì `hits` lớn
+                # dần vô hạn trước một cuộc tấn công giả mạo source.
+                if now - last_prune >= VERDICT_WINDOW_S:
+                    ledger.prune(now)
+
+                    last_prune = now
+
+                # Chấm lô đang chờ nếu nó đã quá hạn, kể cả khi flow hiện tại
+                # không được đưa vào lô.
+                if batcher.ready(now):
+                    score_batch(*batcher.drain())
+
                 # Ignore traffic originating from local IPs
                 if flow.src_ip in local_ips:
                     continue
@@ -936,33 +1230,17 @@ def main():
                     continue
 
 
-                # Get the current timestamp
-                now = time.time()
-
-
-                # Get SYN and total packet counts
-                syn_count = (
-                    flow.bidirectional_syn_packets
-                )
-
-                total_count = (
-                    flow.bidirectional_packets
-                )
-
-
-                # Count UDP and ICMP packets separately
-                if flow.protocol in (1, 17, 58):
-                    udp_icmp_count = total_count
-                else:
-                    udp_icmp_count = 0
-
-
-                # Cập nhật bộ đếm toàn cục TRƯỚC mọi quyết định per-IP.
-                # Đây là chỗ duy nhất nhìn thấy flood phân tán.
-                flood_mode, flood_just_started = flood.observe(
+                # Bộ đếm toàn cục — TELEMETRY THUẦN.
+                #
+                # Nó chỉ trả lời "hiện có đang bị bão không" để báo Telegram và
+                # vẽ dashboard. Bản trước dùng kết quả này để hạ ngưỡng rate
+                # limiter xuống 1/10, tức là để nó gián tiếp ban IP; cơ chế đó
+                # đã bị gỡ cùng rate limiter. Giá trị trả về không được dùng
+                # cho bất kỳ quyết định chặn nào.
+                _, flood_just_started = flood.observe(
                     now,
-                    syn_count,
-                    total_count,
+                    flow.bidirectional_syn_packets,
+                    flow.bidirectional_packets,
                     flow.src_ip
                 )
 
@@ -975,213 +1253,49 @@ def main():
                 # Đặt SAU flood.observe() là có chủ đích: những gói này vẫn phải
                 # được cộng vào bộ đếm toàn cục, nếu không hệ thống sẽ mù trước
                 # tấn công vắt kiệt băng thông nhắm vào cổng ephemeral. Chỉ miễn
-                # cho nó khỏi tuyến AI và rate limiter per-IP, vì đó là hai chỗ
-                # ra quyết định ban.
+                # cho nó khỏi tuyến AI, vì đó là chỗ ra quyết định ban.
                 if TRUST_EPHEMERAL_REPLIES and is_reply_to_local_client(flow):
-                    packet_window.pop(flow.src_ip, None)
-
                     continue
 
 
-                # Create a tracking entry for new source IPs
-                if flow.src_ip not in packet_window:
-                    packet_window[
-                        flow.src_ip
-                    ] = []
+                # ── AI XGBoost: BÊN DUY NHẤT PHÁT HIỆN ──────────────────────
+                #
+                # Mọi flow đủ 2 gói đều được chấm. Bản trước đặt cửa
+                # MIN_PACKETS_FOR_AI = 10 ở đây, loại bỏ 90,32% flow thuộc lớp
+                # Syn trước khi AI kịp nhìn — flow SYN flood có trung vị đúng
+                # 2 gói. Ngưỡng dưới đây là ngưỡng của extract_features(), tức
+                # là giới hạn thật của dữ liệu chứ không phải một lựa chọn.
+                features = extract_features(flow)
 
-
-                # Get the packet history for this IP
-                window = packet_window[
-                    flow.src_ip
-                ]
-
-
-                # Add the current flow to the sliding window
-                window.append(
-                    (
-                        now,
-                        syn_count,
-                        udp_icmp_count,
-                        total_count
-                    )
-                )
-
-
-                # Keep only entries inside the time window
-                filtered = [
-                    (
-                        timestamp,
-                        syn,
-                        udp_icmp,
-                        packets
-                    )
-                    for (
-                        timestamp,
-                        syn,
-                        udp_icmp,
-                        packets
-                    ) in window
-                    if now - timestamp <= WINDOW_SECONDS
-                ]
-
-
-                # Remove empty tracking entries
-                if not filtered:
-                    packet_window.pop(
-                        flow.src_ip,
-                        None
-                    )
-
+                # extract_features trả None cho flow dưới 2 gói: không có thông
+                # tin liên gói nào để mô tả. Kiến trúc này không có tuyến thứ
+                # hai để đỡ, nên những flow đó được bỏ qua — hạn chế đã biết,
+                # ghi rõ trong report.md.
+                if features is None:
                     continue
 
-
-                # Save the filtered sliding window
-                packet_window[
-                    flow.src_ip
-                ] = filtered
-
-
-                # Calculate total SYN traffic
-                total_syn = sum(
-                    syn
-                    for _, syn, _, _ in filtered
+                duration_s = max(
+                    float(flow.bidirectional_duration_ms) / 1000.0,
+                    MIN_DURATION_S
                 )
 
-
-                # Calculate total UDP and ICMP traffic
-                total_udp_icmp = sum(
-                    udp_icmp
-                    for _, _, udp_icmp, _ in filtered
+                batcher.add(
+                    features,
+                    {
+                        "src_ip":       flow.src_ip,
+                        "protocol":     proto_name(flow.protocol),
+                        "protocol_num": int(flow.protocol),
+                        "dst_port":     int(getattr(flow, "dst_port", 0)),
+                        "fwd_len_mean": float(getattr(flow, "src2dst_mean_ps", 0.0)),
+                        "pps":          float(flow.bidirectional_packets) / duration_s,
+                        "features":     features[0].tolist(),
+                        "now":          now,
+                    },
+                    now
                 )
 
-
-                # Calculate total packets
-                total_pkts = sum(
-                    packets
-                    for _, _, _, packets in filtered
-                )
-
-
-                # ── TUYẾN 1: AI XGBoost (Trọng tâm phát hiện chính) ─────────────────────
-                # Chỉ phân tích flow đủ lớn để AI có dữ liệu ý nghĩa.
-                # Trong FLOOD MODE, hạ yêu cầu xuống mức tối thiểu mà
-                # extract_features() còn mô tả được, để không bỏ lọt flow nhỏ.
-                min_packets = (
-                    MIN_PACKETS_FOR_INFERENCE
-                    if flood_mode
-                    else MIN_PACKETS_FOR_AI
-                )
-
-                features = None
-
-                if flow.bidirectional_packets >= min_packets:
-                    features = extract_features(flow)
-
-                # extract_features returns None for flows too small to
-                # describe. Feeding the model a placeholder vector there
-                # produced confident nonsense, so fall through to the rate
-                # limiter instead.
-                if features is not None:
-                    # Score against the tuned threshold rather than
-                    # predict()'s implicit 0.5. Benign traffic outnumbers
-                    # attacks in production, so a cut-off chosen for balanced
-                    # data floods the dashboard with false positives.
-                    attack_proba = float(
-                        ai_model.predict_proba(features)[0][1]
-                    )
-
-                    if attack_proba >= ai_threshold:
-                        if not enforcer.is_whitelisted(flow.src_ip):
-                            duration_s = max(
-                                float(flow.bidirectional_duration_ms) / 1000.0,
-                                MIN_DURATION_S
-                            )
-
-                            sig = AttackSignature(
-                                src_ip       = flow.src_ip,
-                                protocol     = proto_name(flow.protocol),
-                                dst_port     = int(getattr(flow, "dst_port", 0)),
-                                fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                                pps          = float(flow.bidirectional_packets) / duration_s,
-                                reason       = "AI_INFERENCE (Binary Model)",
-                                features     = features[0].tolist()
-                            )
-
-                            count, ttl_secs = enforcer.block_ip(sig)
-
-                            if count:
-                                ttl_label = (
-                                    f"{ttl_secs // 3600}h"
-                                    if ttl_secs >= 3600
-                                    else f"{ttl_secs // 60}m"
-                                )
-
-                                print(
-                                    f"  [BLOCK] {flow.src_ip:<20} "
-                                    f"AI_INFERENCE (Binary) "
-                                    f"│ p={attack_proba:.4f} "
-                                    f"│ ban {ttl_label:<4} "
-                                    f"│ offense #{count}"
-                                )
-
-                        # Đã xử lý qua AI, không cần Rate Limiter kiểm tra lại
-                        packet_window.pop(flow.src_ip, None)
-                        continue
-
-                # ── TUYẾN 2: Rate Limiter (Lưới an toàn cho bão cực lớn) ─────────────────
-                # Kích hoạt khi khối lượng gói tin trong cửa sổ trượt của MỘT
-                # source vượt ngưỡng volumetric. Trong FLOOD MODE ngưỡng được
-                # hạ xuống 1/FLOOD_MODE_DIVISOR vì lúc đó tổng thể đã bất
-                # thường, nên rủi ro false positive được đánh đổi có chủ đích.
-                divisor = FLOOD_MODE_DIVISOR if flood_mode else 1
-
-                syn_limit = max(SYN_THRESHOLD // divisor, 1)
-                udp_limit = max(UDP_ICMP_THRESHOLD // divisor, 1)
-                pkt_limit = max(TOTAL_THRESHOLD // divisor, 1)
-
-                threshold_exceeded = (
-                    total_syn > syn_limit
-                    or total_udp_icmp > udp_limit
-                    or total_pkts > pkt_limit
-                )
-
-                if threshold_exceeded:
-                    if not enforcer.is_whitelisted(flow.src_ip):
-                        rule_reason = (
-                            "RATE_LIMIT (Flood Mode)"
-                            if flood_mode
-                            else "RATE_LIMIT (Volumetric)"
-                        )
-
-                        rl_features = extract_features(flow)
-
-                        sig = AttackSignature(
-                            src_ip       = flow.src_ip,
-                            protocol     = proto_name(flow.protocol),
-                            dst_port     = int(getattr(flow, "dst_port", 0)),
-                            fwd_len_mean = float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                            pps          = total_pkts / WINDOW_SECONDS,
-                            reason       = rule_reason,
-                            features     = rl_features[0].tolist() if rl_features is not None else None
-                        )
-
-                        count, ttl_secs = enforcer.block_ip(sig)
-
-                        packet_window.pop(flow.src_ip, None)
-
-                        if count:
-                            ttl_label = (
-                                f"{ttl_secs // 3600}h"
-                                if ttl_secs >= 3600
-                                else f"{ttl_secs // 60}m"
-                            )
-
-                            print(
-                                f"  [BLOCK] {flow.src_ip:<20} "
-                                f"{rule_reason:<24} "
-                                f"│ ban {ttl_label:<4} "
-                                f"│ offense #{count}"
-                            )
+                if batcher.ready(now):
+                    score_batch(*batcher.drain())
 
 
             # Handle errors from individual flows
@@ -1198,6 +1312,11 @@ def main():
                     f"  [-] Flow error "
                     f"({who}): {flow_err}"
                 )
+
+        # Chấm nốt lô còn dở khi luồng flow kết thúc
+        if batcher.vectors:
+            score_batch(*batcher.drain())
+
 
 
     # Supervisor: dựng lại NFStream khi nó chết.

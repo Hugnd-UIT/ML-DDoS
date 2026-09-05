@@ -60,6 +60,25 @@ CHUNK_ROWS = 1_000_000
 # File model được deploy và được mô tả bởi threshold.json
 DEPLOYED_MODEL = "binary_eval.pkl"
 
+# Mục tiêu FPR cho riêng nhánh TCP.
+#
+# Lỏng hơn TARGET_FPR chung một cách có chủ đích. Lớp Syn được model chấm điểm
+# thấp hơn hẳn các lớp phản xạ UDP (trung vị 0,68 so với ~1,0), nên ép nó vào
+# cùng mục tiêu FPR đồng nghĩa với bỏ lọt gần hết SYN flood:
+#
+#     ngưỡng TCP   bắt Syn    FPR benign TCP
+#        0,90       96,54%        0,4944%
+#        0,95       55,00%        0,3304%
+#        0,99       49,51%        0,1896%
+#        0,9999     28,47%        0,0000%
+#
+# Chi phí này không rơi xuống người dùng cuối, vì gatekeeper chỉ chặn sau
+# VERDICTS_TO_BAN phán quyết trên cùng một IP. Ở K=5, FPR 0,4944% mỗi flow
+# tương ứng 4,30e-08 mỗi IP — thấp hơn kiến trúc cũ khoảng 8.400 lần.
+TARGET_FPR_TCP = float(
+    os.environ.get("TARGET_FPR_TCP", "0.005")
+)
+
 
 # Chấm điểm một CSV theo chunk, trả về xác suất tách riêng benign / attack.
 #
@@ -70,6 +89,10 @@ def score_csv(model, path):
 
     parts_benign = []
     parts_attack = []
+
+    # Tách riêng theo giao thức để hiệu chỉnh ngưỡng TCP độc lập
+    parts_benign_tcp = []
+    parts_attack_tcp = []
 
     rows = 0
     t0 = time.time()
@@ -90,13 +113,23 @@ def score_csv(model, path):
         parts_benign.append(proba[y == 0])
         parts_attack.append(proba[y == 1])
 
+        tcp = chunk["Protocol"].to_numpy() == 6
+
+        parts_benign_tcp.append(proba[(y == 0) & tcp])
+        parts_attack_tcp.append(proba[(y == 1) & tcp])
+
         rows += len(chunk)
 
         print(f"    đã chấm {rows:,} dòng ({time.time() - t0:.0f}s)", end="\r")
 
     print(" " * 70, end="\r")
 
-    return np.concatenate(parts_benign), np.concatenate(parts_attack)
+    return (
+        np.concatenate(parts_benign),
+        np.concatenate(parts_attack),
+        np.concatenate(parts_benign_tcp),
+        np.concatenate(parts_attack_tcp),
+    )
 
 
 # Quét lưới ngưỡng trên điểm số đã tính sẵn.
@@ -177,14 +210,34 @@ def main():
     # những con số dưới đây đáng tin.
     print("\n[*] Chấm trên dữ liệu ngày 2 (chưa từng thấy)...")
 
-    benign, attack = score_csv(model, _path("data", "test_binary.csv"))
+    benign, attack, benign_tcp, attack_tcp = score_csv(
+        model, _path("data", "test_binary.csv")
+    )
 
     print(f"[+] Ngày 2: {benign.size:,} dòng benign / {attack.size:,} dòng attack")
+    print(f"[+] Riêng TCP: {benign_tcp.size:,} benign / {attack_tcp.size:,} attack")
 
     fpr_05 = float((benign >= 0.5).mean()) if benign.size else 0.0
     tpr_05 = float((attack >= 0.5).mean()) if attack.size else 0.0
 
     threshold, fpr, tpr = sweep(benign, attack)
+
+    # Ngưỡng riêng cho TCP.
+    #
+    # Một ngưỡng chung không phục vụ được cả hai họ tấn công. Các lớp phản xạ
+    # UDP (MSSQL/UDP/NetBIOS/LDAP) được model chấm ~1,0 nên ngưỡng rất chặt
+    # không tốn gì, bắt được 99,3–99,97%. Lớp Syn có trung vị điểm số chỉ 0,68,
+    # nên cùng ngưỡng đó chỉ bắt được 28,47% — tức là tuyến AI gần như không
+    # phát hiện được SYN flood.
+    #
+    # Sai số mỗi flow tăng lên được VERDICTS_TO_BAN bù lại: gatekeeper chỉ chặn
+    # sau K phán quyết trên cùng một IP, nên FPR 0,4944% mỗi flow tương ứng
+    # 4,30e-08 mỗi IP ở K=5.
+    print("\n[*] Hiệu chỉnh ngưỡng RIÊNG cho TCP (nơi chứa SYN flood)...")
+
+    threshold_tcp, fpr_tcp, tpr_tcp = sweep(
+        benign_tcp, attack_tcp, target_fpr=TARGET_FPR_TCP
+    )
 
     # Cùng cổng chất lượng mà trainer.py áp dụng
     failures = []
@@ -210,6 +263,12 @@ def main():
 
     payload = {
         "threshold": float(threshold),
+
+        # Ngưỡng riêng cho TCP — nơi duy nhất chứa SYN flood. Xem TARGET_FPR_TCP.
+        "threshold_tcp": float(threshold_tcp),
+        "measured_fpr_tcp": float(fpr_tcp),
+        "measured_tpr_tcp": float(tpr_tcp),
+        "target_fpr_tcp": float(TARGET_FPR_TCP),
 
         # Model nào được mô tả bởi file này. gatekeeper.py nạp đúng file này.
         "model_file": f"models/{DEPLOYED_MODEL}",
@@ -239,8 +298,10 @@ def main():
     print("\n" + "=" * 68)
     print(f"[+] Đã ghi {out_path}")
     print(f"[+] Model deploy   : models/{DEPLOYED_MODEL}")
-    print(f"[+] Ngưỡng         : {threshold:.6f}")
+    print(f"[+] Ngưỡng UDP/khác: {threshold:.6f}")
+    print(f"[+] Ngưỡng TCP     : {threshold_tcp:.6f}")
     print(f"[+] FPR / TPR THẬT : {fpr:.4%} / {tpr:.4%}  (đo trên ngày 2)")
+    print(f"[+] FPR / TPR TCP  : {fpr_tcp:.4%} / {tpr_tcp:.4%}")
     print(f"[+] sha256         : {payload['binary_sha256'][:16]}...")
     print("=" * 68)
 
