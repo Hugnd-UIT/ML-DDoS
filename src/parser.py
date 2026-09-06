@@ -177,6 +177,19 @@ def clean_data(folder, dataset="DATASET"):
             # Remove rows containing missing values
             df_chunk.dropna(inplace=True)
 
+            # Loại lớp quá hiếm ngay tại đây thay vì lọc lại trên bảng đầy đủ
+            # sau khi ghép. Lọc muộn tạo thêm một bản sao của 48,7 triệu dòng.
+            if DROP_LABELS:
+                df_chunk = df_chunk[~df_chunk["Label"].isin(DROP_LABELS)]
+
+            # Hạ float64 xuống float32 NGAY tại chunk.
+            #
+            # Đây là khác biệt giữa chạy được và bị kernel giết vì hết RAM:
+            # 48,7 triệu dòng × 20 cột ở float64 chiếm 7,8 GB, ở float32 còn
+            # 3,9 GB. Không mất gì: mô hình vẫn nhận float32, và extract_features()
+            # cũng sinh ra float32.
+            df_chunk[FEATURE_NAMES] = df_chunk[FEATURE_NAMES].astype(np.float32)
+
             # Save non-empty chunks
             if not df_chunk.empty:
                 data_frame_list.append(df_chunk)
