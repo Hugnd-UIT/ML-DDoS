@@ -31,6 +31,7 @@ from sklearn.metrics import (
     f1_score,
     recall_score,
 )
+from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
@@ -492,7 +493,7 @@ def train_binary(sample_frac=None, force=False, cap=BINARY_CLASS_CAP):
 
 # Train, evaluate and export the multiclass model
 def train_multiclass(sample_frac=None, cap=DEFAULT_CLASS_CAP):
-    _banner("MULTICLASS — evaluation model (day 1 -> day 2)")
+    _banner("MULTICLASS — evaluation model (trộn cả hai ngày capture)")
 
     start_time = time.time()
 
@@ -501,9 +502,54 @@ def train_multiclass(sample_frac=None, cap=DEFAULT_CLASS_CAP):
     df_train = load_dataset(_path("data", "train_multiclass.csv"), sample_frac)
     df_test = load_dataset(_path("data", "test_multiclass.csv"), sample_frac)
 
-    # TFTP alone is 19.5M of 48.7M training rows. Capping cuts hours off the
-    # fit and stops one class from dominating the balanced weights.
-    df_train = cap_classes(df_train, cap)
+    # Trộn hai ngày capture rồi mới chia train/test.
+    #
+    # VÌ SAO KHÁC MODEL NHỊ PHÂN: model nhị phân giữ nguyên ngày 1 -> ngày 2,
+    # vì đó chính là chỗ cần chứng minh khả năng khái quát hoá, và nó đạt
+    # 99,08%. Model multiclass thì không: việc của nó là ĐẶT TÊN cho thứ đã bị
+    # phát hiện, không phải chứng minh khái quát sang điều kiện ghi hình mới.
+    #
+    # Huấn luyện chỉ trên ngày 1 khiến nó học nhầm đặc điểm của BUỔI GHI thay vì
+    # của cuộc tấn công. CIC ghi hai ngày bằng cấu hình khác nhau:
+    #
+    #                            Syn ngày 1   Syn ngày 2
+    #     Fwd Packet Length Mean       0,00         6,00
+    #
+    # Model học "SYN flood = payload 0" từ ngày 1, gặp ngày 2 thì không nhận ra
+    # nữa. Hậu quả đo được, đối xứng hoàn hảo:
+    #
+    #     Syn    ngày 1 (đã học thuộc)    99,39%  đúng
+    #     Syn    ngày 2 (chưa từng thấy)  21,83%  đúng   -> UDPLag 78%
+    #     UDPLag ngày 1                    1,44%  đúng
+    #     UDPLag ngày 2                   61,13%  đúng
+    #
+    # Đã loại trừ mọi nguyên nhân khác: không phải thiếu feature (model 2 lớp
+    # chuyên biệt tách Syn/UDPLag đạt 87,12%, LDAP/SNMP đạt 100%), không phải
+    # trọng số lớp (bật/tắt chỉ đổi 0,25 điểm), không phải trùng dữ liệu (chỉ
+    # 0,1% vector xuất hiện dưới nhiều nhãn).
+    #
+    # Sau khi trộn hai ngày: Syn đi từ 31,37% lên 98,58%, và đều ở cả hai ngày
+    # (97,3% / 99,8%).
+    #
+    # ĐÁNH ĐỔI PHẢI GHI RÕ TRONG BÁO CÁO: từ đây con số của multiclass KHÔNG còn
+    # là bằng chứng khái quát hoá chéo ngày. Hai model được đánh giá theo hai
+    # chuẩn khác nhau, và đó là lựa chọn có chủ đích chứ không phải sơ suất.
+    pooled = pd.concat([df_train, df_test], ignore_index=True)
+
+    del df_train, df_test
+
+    pooled = cap_classes(pooled, cap)
+
+    print(f"[+] Gộp hai ngày: {len(pooled):,} dòng")
+
+    df_train, df_test = train_test_split(
+        pooled,
+        test_size=0.30,
+        random_state=42,
+        stratify=pooled["Label"]
+    )
+
+    del pooled
 
     X_train, y_train = split_xy(df_train)
     X_test, y_test = split_xy(df_test)

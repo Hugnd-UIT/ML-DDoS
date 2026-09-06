@@ -1362,6 +1362,103 @@ CICDDoS2019 — đây là lựa chọn đúng, nhưng phải nói rõ giới h�
 
 ---
 
+## 7i. FIX-48 & 49 — Model học đặc điểm buổi ghi hình, không phải cuộc tấn công
+
+Sau khi train lại với 20 feature (FIX-45→47), **phát hiện đã tốt hẳn**:
+
+| | trước | sau |
+|---|---:|---:|
+| Tổng chặn tấn công | 83,29% | **99,08%** |
+| `Syn` bị chặn | 29,93% | **95,49%** |
+| Số lớp có tập kiểm chứng | 6/12 | **11/11** |
+| Báo động nhầm trên BENIGN | 0,33% | 0,28% |
+
+Nhưng đặt tên vẫn chỉ 77,23%, và `Syn` chỉ 31,37% — 68% bị gọi thành `UDPLag`.
+
+### Bằng chứng: model phân biệt theo NGÀY CAPTURE
+
+```
+Syn    NGAY 1 (da hoc thuoc)    99.39% dung
+Syn    NGAY 2 (chua tung thay)  21.83% dung   -> UDPLag 78%
+
+UDPLag NGAY 1                    1.44% dung   <- sai gan het
+UDPLag NGAY 2                   61.13% dung
+```
+
+Đối xứng hoàn hảo. Nguyên nhân nằm ở chỗ CIC ghi hai ngày bằng cấu hình khác nhau:
+
+```
+                          Syn ngay1  Syn ngay2  UDPLag ngay1  UDPLag ngay2
+Fwd Packet Length Mean         0.00       6.00        349.50        377.00
+Protocol                       6.00       6.00         17.00         17.00
+```
+
+Model train trên ngày 1 học được *"SYN flood = payload 0"*. Gặp ngày 2 (payload 6)
+thì không nhận ra nữa, quăng sang `UDPLag`. Nó học **đặc điểm của buổi ghi hình**,
+không phải đặc điểm của cuộc tấn công.
+
+### Đã loại trừ ba nguyên nhân khác
+
+| giả thuyết | phép đo | kết luận |
+|---|---|---|
+| Thiếu feature | model 2 lớp chuyên biệt: `Syn` vs `UDPLag` **87,12%**, `LDAP` vs `SNMP` **100%** | bác bỏ — feature đủ dùng |
+| Trọng số lớp `balanced` | bật 67,27% / tắt 67,02% | bác bỏ — chênh 0,25 điểm |
+| Trùng dữ liệu giữa các nhãn | chỉ 0,1% vector xuất hiện dưới nhiều nhãn, cặp `Syn`↔`UDPLag` không có mặt | bác bỏ |
+
+Một manh mối nữa: bản sao **thu nhỏ 20 lần** của chính công thức trong `trainer.py`
+cho `Syn` 76,41% / tổng 84,36% — tốt hơn model đầy đủ (31,37% / 77,23%). Ít dữ liệu
+hơn mà tốt hơn là dấu hiệu điển hình của học vẹt.
+
+### FIX-48 — Multiclass train trên cả hai ngày
+
+```
+lop        dat ten dung     ngay1   ngay2
+Syn              98.58%     97.3%   99.8%     <- truoc: 31.37%
+MSSQL            98.87%
+NetBIOS          99.05%
+NTP              99.86%
+TFTP             99.21%
+SNMP             86.37%
+LDAP             76.15%
+UDP              62.21%
+DNS              40.49%     40.9%   40.1%     <- van hong
+SSDP             40.47%     40.4%   40.5%     <- van hong
+```
+
+`Syn` đi từ 31,37% lên **98,58%**, và đều ở cả hai ngày.
+
+Lý lẽ: việc của model multiclass là **đặt tên cho thứ đã bị phát hiện**, không phải
+chứng minh khái quát hoá sang điều kiện ghi hình mới. Model **nhị phân giữ nguyên
+ngày 1 → ngày 2**, vì đó mới là chỗ cần chứng minh khái quát hoá, và nó đạt 99,08%.
+
+> ⚠️ **ĐÁNH ĐỔI PHẢI NÊU TRONG BÁO CÁO:** từ đây con số của multiclass **không còn là
+> bằng chứng khái quát hoá chéo ngày**. Hai model được đánh giá theo hai chuẩn khác
+> nhau. Đây là lựa chọn có chủ đích, không phải sơ suất, và phải nói rõ khi trình bày.
+
+### FIX-49 — Loại `UDPLag`
+
+`UDPLag` không phải một vector tấn công riêng mà là **hệ quả**: độ trễ do UDP flood
+gây ra. Hồ sơ đặc trưng là hỗn hợp TCP lẫn UDP nên phần TCP trùng lên lớp `Syn`.
+Ngày 2 chỉ còn 1.873 dòng. Kể cả sau FIX-48 nó cũng chỉ đạt 23,58%.
+
+Loại cùng cách với `WebDDoS` ở FIX-47. Còn lại **10 lớp tấn công**.
+
+### Giới hạn không sửa được: `DNS` / `SSDP` / `UDP`
+
+Ba lớp này sai đều nhau ở **cả hai ngày** (`DNS` 40,9% / 40,1%; `SSDP` 40,4% / 40,5%),
+nên không phải lỗi ngày capture mà là trùng lặp thật trong không gian đặc trưng. Trần
+lý thuyết đo được bằng model 2 lớp chuyên biệt:
+
+```
+DNS  vs LDAP   71.97%
+SSDP vs UDP    60.86%
+```
+
+Không có cách nào vượt trần đó với bộ đặc trưng mà NFStream cấp được. Đây là hạn chế
+của dữ liệu, phải ghi vào phần "hạn chế" của báo cáo chứ không phải thứ vá bằng code.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1

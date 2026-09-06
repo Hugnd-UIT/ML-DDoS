@@ -46,15 +46,20 @@ def canonicalize_labels(series):
     return series.astype(str).str.strip().replace(LABEL_CANON)
 
 
-# Lớp có quá ít dòng để học được, loại khỏi bài toán.
+# Lớp bị loại khỏi bài toán vì không thể học lẫn đánh giá được.
 #
-# WebDDoS chỉ có 439 dòng trên tổng 48.699.876 — 0,0009%. Với số đó không thể
-# huấn luyện lẫn đánh giá: đo trên mẫu, model chỉ chặn được 42,86% và độ chính
-# xác đặt tên dao động hoàn toàn theo may rủi của phép lấy mẫu. Giữ nó lại chỉ
-# khiến model đoán bừa một nhãn mà không có cơ sở nào.
+# WebDDoS — 439 dòng trên tổng 48.699.876, tức 0,0009%. Với số đó không huấn
+# luyện nổi mà cũng không đánh giá nổi: model chỉ chặn được 42,86% và độ chính
+# xác đặt tên dao động hoàn toàn theo may rủi của phép lấy mẫu.
 #
-# Loại thẳng và ghi rõ "không hỗ trợ" trung thực hơn là để nguyên.
-DROP_LABELS = {"WebDDoS"}
+# UDPLag — không phải một vector tấn công riêng mà là HỆ QUẢ: độ trễ do UDP
+# flood gây ra. Hồ sơ đặc trưng của nó là hỗn hợp TCP lẫn UDP, nên phần TCP
+# trùng lên lớp Syn. Ngày 2 chỉ còn 1.873 dòng. Kể cả khi đã cho model thấy cả
+# hai ngày capture, nó cũng chỉ đạt 23,58%, và là nơi hứng phần lớn các dự đoán
+# Syn bị sai.
+#
+# Loại thẳng và ghi rõ "không hỗ trợ" trung thực hơn là để model đoán bừa.
+DROP_LABELS = {"WebDDoS", "UDPLag"}
 
 # Tỉ lệ tách ra làm tập kiểm chứng cho những lớp CHỈ có ở ngày 1.
 #
