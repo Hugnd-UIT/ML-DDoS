@@ -1459,6 +1459,84 @@ của dữ liệu, phải ghi vào phần "hạn chế" của báo cáo chứ kh
 
 ---
 
+## 7j. KẾT QUẢ CUỐI CÙNG — đo bằng `src/test_classes.py`
+
+Chạy trên tập kiểm tra thật, qua đúng đường ống đang deploy
+(`binary_eval.pkl` quyết định chặn, `multiclass_eval.pkl` đặt tên):
+
+```
+[*] Nguong chan: TCP 0.95 / khac 0.9999
+
+loai          so dong   AI CHAN   DAT TEN  nham sang
+--------------------------------------------------------------
+MSSQL       1,117,218   100.0%    99.3%   SSDP 0%, UDP 0%
+Syn           911,938    94.7%   100.0%   MSSQL 0%, UDP 0%
+TFTP          780,873    99.9%    99.3%   Syn 1%, NTP 0%
+UDP           758,336    99.9%    67.4%   SSDP 31%, MSSQL 1%
+NetBIOS       704,611    99.7%    99.8%   DNS 0%, Syn 0%
+LDAP          374,456    99.9%    83.5%   SNMP 13%, DNS 3%
+SNMP          205,980    99.8%    86.2%   LDAP 8%, NetBIOS 4%
+DNS           196,280    99.7%    39.7%   LDAP 49%, SNMP 11%
+SSDP          102,656    99.8%    41.2%   UDP 56%, MSSQL 1%
+NTP            47,570    99.6%   100.0%   DNS 0%, BENIGN 0%
+
+BENIGN         11,366     0.3%            <- CHAN = bao dong nham
+
+[+] Tong tan cong bi chan: 98.96%
+[+] Tong dat ten dung    : 89.78%
+```
+
+### Toàn bộ chặng đường
+
+| chỉ số | ban đầu | cuối cùng |
+|---|---:|---:|
+| Tổng chặn tấn công | 83,29% | **98,96%** |
+| Tổng đặt tên đúng | 77,23% | **89,78%** |
+| `Syn` đặt tên đúng | 31,37% | **100%** |
+| Báo động nhầm trên BENIGN | 0,33% | **0,3%** |
+| Số lớp có tập kiểm chứng | 6/12 | **10/10** |
+| Rate limiter tham gia chặn | ~100% | **0%** |
+
+### Ba lớp còn yếu — nguyên nhân và mức độ sửa được
+
+**`SSDP` ↔ `UDP` (nhầm đối xứng 56% / 31%) — KHÔNG sửa được.**
+Trong CICDDoS2019 hai lớp này **dùng chung cổng nguồn 672**, cùng giao thức UDP,
+cùng cấu trúc flow 2 gói. Không feature nào mà NFStream cấp được có thể tách hai
+lớp giống nhau ở mọi chiều quan sát. Trần đo bằng model 2 lớp chuyên biệt: 60,86%.
+
+**`DNS` ↔ `LDAP` (49%) — sửa được một phần.**
+Cổng nguồn khác nhau (564 so với 900) nhưng payload giống hệt (1472 byte) và phân
+bố cổng bị trải rộng (DNS 564:48%, 634:14%, ...). Trần đo được: 71,97%.
+
+**`LDAP` ↔ `SNMP` (13% / 8%) — sai số nhỏ, chấp nhận được.**
+
+### Cách trình bày khi bảo vệ
+
+Tách bạch hai con số, đừng gộp:
+
+1. **Phát hiện tấn công: 98,96%**, báo động nhầm 0,3%. Đây là chức năng chính của
+   IPS và nó đạt mức triển khai được.
+2. **Phân loại tấn công: 89,78%** trên 10 lớp, trong đó 5 lớp đạt 99–100%.
+
+Nêu rõ phần yếu và lý do: hai lớp `SSDP`/`UDP` không tách được vì trùng cổng trong
+chính bộ dữ liệu — đây là hạn chế của CICDDoS2019, không phải của mô hình.
+
+### Giới hạn của việc kiểm thử trực tiếp
+
+`hping3` **không** tái hiện được các lớp phản xạ UDP. Flow của chúng là 2 gói
+(yêu cầu + phản hồi từ máy phản xạ thật), cổng nguồn cố định là cổng dịch vụ, cổng
+đích ngẫu nhiên. Một công cụ bắn một chiều vào máy không phản hồi không tạo được
+cấu trúc đó — dùng `-k` để ép cổng thì NFStream gộp thành một flow hàng nghìn gói
+và model trả về `UDP` thay vì lớp đúng.
+
+Chỉ `Syn` tái hiện trung thực được bằng `hping3 -S`, vì nó được nhận diện qua giao
+thức + cờ + payload rỗng chứ không qua cổng.
+
+Vì vậy bằng chứng phân loại phải lấy từ `src/test_classes.py` chạy trên dữ liệu
+thật, còn demo trực tiếp chỉ dùng `Syn`. Đây là cách làm chuẩn, không phải né tránh.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
