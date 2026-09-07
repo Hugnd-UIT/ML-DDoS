@@ -1649,3 +1649,4 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `DASHBOARD_ALLOW_ANONYMOUS` | `0` | Cho phép không mật khẩu (chỉ khi có Cloud IAP) |
 | `DASHBOARD_MAX_LOG_FILES` | `50` | Số file CSV đọc mỗi lần refresh (FIX-15) |
 | `DASHBOARD_REFRESH_S` | `10` | Chu kỳ tự làm mới dashboard |
+| `DASHBOARD_MIN_CONFIDENCE` | `0.70` | Ngưỡng tự tin để hiện tên loại cụ thể (FIX-50) |
