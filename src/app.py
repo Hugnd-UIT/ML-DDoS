@@ -145,6 +145,30 @@ LABEL_ENCODER_PATH = os.path.join(
 FEATURE_COLUMNS = list(FEATURE_NAMES)
 
 
+# Ngưỡng tự tin tối thiểu để hiển thị TÊN LOẠI cụ thể.
+#
+# Các họ tấn công phản xạ UDP (DNS/LDAP/SNMP/SSDP/UDP...) chồng lấn nhau trong
+# CICDDoS2019 — đo được: dự đoán có độ tự tin >= 0,70 thì đúng 99%, còn dưới
+# ngưỡng chỉ đúng 65%. Đây chính là chỗ một UDP flood bị gán nhầm thành "DNS"
+# với độ tự tin chỉ ~55%.
+#
+# Thay vì in một tên cụ thể mà model đang đoán mò, gộp về nhãn HỌ khi độ tự tin
+# thấp: trung thực hơn, và một UDP flood sẽ hiện "UDP-DDoS" thay vì "DNS" sai.
+MULTICLASS_MIN_CONFIDENCE = float(
+    os.environ.get("DASHBOARD_MIN_CONFIDENCE", "0.70")
+)
+
+# Các lớp thuộc họ phản xạ/khuếch đại UDP. Khi độ tự tin thấp, mọi lớp trong
+# nhóm này được gộp về một nhãn chung thay vì đoán bừa lớp cụ thể.
+UDP_FAMILY = {
+    "DNS", "LDAP", "MSSQL", "NetBIOS", "SNMP", "SSDP", "NTP", "TFTP", "UDP"
+}
+
+# Nhãn hiển thị khi model không đủ tự tin về lớp cụ thể
+UDP_FAMILY_LABEL = "UDP-DDoS (loại chưa chắc)"
+GENERIC_LOWCONF_LABEL = "DDoS (loại chưa chắc)"
+
+
 # Core color palette, shared by the CSS theme and the charts
 # Modeled after the CloudWatch dashboard: near-black canvas, dark navy
 # panels, and an amber/gold accent for data
@@ -319,14 +343,37 @@ def classify_attack_types(df, model, label_encoder):
 
     # Run multiclass prediction on the eligible rows only
     try:
-        preds = model.predict(X)
+        # Dùng predict_proba để biết độ tự tin, không chỉ nhãn thắng cuộc.
+        # Đây là chỗ chặn việc in một tên loại cụ thể mà model đang đoán mò.
+        proba = model.predict_proba(X)
+
+        idx = proba.argmax(axis=1)
+        confidence = proba.max(axis=1)
 
         # Convert numeric predictions back to attack names
         if label_encoder is not None:
-            preds = label_encoder.inverse_transform(preds.astype(int))
+            preds = label_encoder.inverse_transform(idx.astype(int))
+
+        else:
+            preds = idx.astype(str)
+
+        # Gộp về nhãn họ khi độ tự tin dưới ngưỡng. Một dự đoán "DNS" ở mức 55%
+        # là đoán mò trong nhóm phản xạ UDP chồng lấn — hiện "UDP-DDoS" trung
+        # thực hơn. Dự đoán chắc chắn (>= ngưỡng) vẫn giữ tên cụ thể, đúng 99%.
+        labelled = []
+
+        for name, conf in zip(preds, confidence):
+            if conf >= MULTICLASS_MIN_CONFIDENCE:
+                labelled.append(name)
+
+            elif name in UDP_FAMILY:
+                labelled.append(UDP_FAMILY_LABEL)
+
+            else:
+                labelled.append(GENERIC_LOWCONF_LABEL)
 
         # Store the predicted attack types
-        df.loc[eligible, "attack_type"] = preds
+        df.loc[eligible, "attack_type"] = labelled
 
     # Keep the original labels only when prediction fails
     except Exception as exc:

@@ -1537,6 +1537,68 @@ thật, còn demo trực tiếp chỉ dùng `Syn`. Đây là cách làm chuẩn,
 
 ---
 
+## 7k. FIX-50 — UDP flood bị gán nhầm "DNS": gộp nhãn theo độ tự tin
+
+**Hiện tượng.** `hping3 --udp -p 80 -d 300 -i u1000` — một UDP flood cơ bản — hiện
+`attack_type = DNS` trên dashboard.
+
+**Nguyên nhân.** Lớp `UDP` trong CICDDoS2019 là **thùng chứa "UDP linh tinh"**, không
+có cổng đặc trưng:
+
+```
+Lop UDP: 474,480 dong
+Source Port pho bien nhat: 61850 chi 0.48%   <- khong co chu ky
+Destination Port: ngau nhien hoan toan
+```
+
+Khác hẳn `DNS` (cổng nguồn 564), `LDAP` (900)... `UDP` chỉ phân biệt với 7 lớp phản
+xạ qua payload/tốc độ, vốn chồng lấn nặng. Đã xác nhận **không phải lỗi train**: train
+kỹ cỡ nào (both-days, mẫu cân bằng, cây sâu hơn) thì `UDP` vẫn 61%, `DNS` 41%, `SSDP`
+42%. Đây là bản chất dataset — ba lớp này không tách được.
+
+**Điểm mấu chốt để sửa được:** model *biết* khi nào nó lưỡng lự.
+
+```
+Du doan co do tu tin >= 0.70:  chiem 73%,  DUNG 99%
+Du doan do tu tin  < 0.70   :             chi dung 65%
+```
+
+UDP flood bị gán "DNS" ở độ tự tin chỉ ~55% — tức đoán mò. Bản cũ vẫn in "DNS" đầy
+tự tin ra dashboard.
+
+**Cách fix.** `app.py` chuyển từ `predict()` sang `predict_proba()`, và:
+
+- độ tự tin **≥ 0,70** → giữ tên loại cụ thể (đúng 99%),
+- **< 0,70** và thuộc họ UDP → hiện `UDP-DDoS (loại chưa chắc)`,
+- **< 0,70** khác → hiện `DDoS (loại chưa chắc)`.
+
+```python
+if conf >= MULTICLASS_MIN_CONFIDENCE:
+    labelled.append(name)
+elif name in UDP_FAMILY:
+    labelled.append(UDP_FAMILY_LABEL)
+else:
+    labelled.append(GENERIC_LOWCONF_LABEL)
+```
+
+**Kết quả.** UDP flood không còn bị gán nhầm "DNS" đầy tự tin — nó hiện
+`UDP-DDoS (loại chưa chắc)`, trung thực với điều model thực sự biết. Tấn công DNS
+thật (độ tự tin 89%) vẫn hiện `DNS`. Đo lại:
+
+```
+Khi dashboard hien TEN CU THE: 73% du doan, dung 99.0%
+Khi gop ve nhan HO           : 27% du doan (dung nhom UDP/DNS/SSDP/LDAP/SNMP)
+```
+
+Ngưỡng chỉnh qua `DASHBOARD_MIN_CONFIDENCE` (mặc định 0,70).
+
+**Ý nghĩa cho báo cáo.** Đây là cách xử lý trung thực khi mô hình chạm giới hạn của
+dữ liệu: thay vì che giấu bằng một con số tổng đẹp, hệ thống **thừa nhận** khi không
+chắc chắn, và chỉ khẳng định tên loại khi thật sự đáng tin (99%). Chức năng chính —
+phát hiện tấn công — vẫn ở mức 98,96%.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
