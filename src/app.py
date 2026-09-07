@@ -32,6 +32,48 @@ BASE_DIR = os.path.dirname(
 )
 
 
+# Tự nạp .env ngay khi khởi động.
+#
+# Biến môi trường KHÔNG sống qua phiên SSH: mở một terminal mới rồi chạy thẳng
+# `streamlit run src/app.py` là DASHBOARD_PASSWORD rỗng, và trang chỉ hiện màn
+# hình "chưa được cấu hình bảo mật". Đọc .env tại đây khiến dashboard tự đủ,
+# chạy kiểu gì cũng có mật khẩu mà không cần nhớ `source .env`.
+#
+# Không ghi đè biến đã có sẵn trong môi trường, để lệnh `export` tạm thời vẫn
+# thắng file .env khi cần.
+def _load_dotenv():
+    env_path = os.environ.get(
+        "GATEKEEPER_ENV_FILE",
+        os.path.join(BASE_DIR, "..", ".env")
+    )
+
+    try:
+        with open(env_path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+
+    except OSError:
+        return
+
+    for raw in lines:
+        line = raw.strip()
+
+        # Bỏ dòng trống và dòng chú thích
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, _, value = line.partition("=")
+        key = key.strip()
+
+        # Bỏ dấu nháy bao quanh giá trị nếu có
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
+
+
 # Directory containing unprocessed flow logs
 LOG_DIR = os.path.join(
     BASE_DIR,
