@@ -145,28 +145,47 @@ LABEL_ENCODER_PATH = os.path.join(
 FEATURE_COLUMNS = list(FEATURE_NAMES)
 
 
-# Ngưỡng tự tin tối thiểu để hiển thị TÊN LOẠI cụ thể.
+# ── ĐẶT TÊN LOẠI TẤN CÔNG: BẰNG CHỨNG CỔNG + MÔ HÌNH ────────────────────────
 #
-# Các họ tấn công phản xạ UDP (DNS/LDAP/SNMP/SSDP/UDP...) chồng lấn nhau trong
-# CICDDoS2019 — đo được: dự đoán có độ tự tin >= 0,70 thì đúng 99%, còn dưới
-# ngưỡng chỉ đúng 65%. Đây chính là chỗ một UDP flood bị gán nhầm thành "DNS"
-# với độ tự tin chỉ ~55%.
+# Model học trên CICDDoS2019, nơi CIC dùng CỔNG TỔNG HỢP của phòng lab: tấn công
+# DNS bắn từ cổng 564/634 chứ không phải 53, LDAP từ 900 chứ không phải 389. Nên
+# khi gặp lưu lượng THẬT dùng cổng dịch vụ chuẩn, model không nhận ra.
 #
-# Thay vì in một tên cụ thể mà model đang đoán mò, gộp về nhãn HỌ khi độ tự tin
-# thấp: trung thực hơn, và một UDP flood sẽ hiện "UDP-DDoS" thay vì "DNS" sai.
-MULTICLASS_MIN_CONFIDENCE = float(
-    os.environ.get("DASHBOARD_MIN_CONFIDENCE", "0.70")
-)
-
-# Các lớp thuộc họ phản xạ/khuếch đại UDP. Khi độ tự tin thấp, mọi lớp trong
-# nhóm này được gộp về một nhãn chung thay vì đoán bừa lớp cụ thể.
-UDP_FAMILY = {
-    "DNS", "LDAP", "MSSQL", "NetBIOS", "SNMP", "SSDP", "NTP", "TFTP", "UDP"
+# Đó là lý do `hping3 --udp -p 80` từng bị gán nhầm thành "DNS": model đoán mò
+# trong nhóm phản xạ chồng lấn.
+#
+# Cách xử lý: tách hai câu hỏi vốn khác nhau.
+#
+#   "Dịch vụ nào bị lợi dụng?"  -> XÁC ĐỊNH được từ cổng, không cần đoán.
+#   "Lưu lượng có hình dạng gì?" -> việc của mô hình.
+#
+# Mọi hệ thống phát hiện DDoS thực tế đều dùng cổng dịch vụ để định danh họ tấn
+# công. Dataset không dạy được điều đó vì cổng của nó là cổng giả.
+#
+# Cổng dịch vụ chuẩn (IANA) của các họ tấn công phản xạ/khuếch đại.
+REFLECTION_SERVICE_PORTS = {
+    53: "DNS",
+    123: "NTP",
+    161: "SNMP",
+    389: "LDAP",
+    1434: "MSSQL",
+    1900: "SSDP",
+    137: "NetBIOS",
+    69: "TFTP",
 }
 
-# Nhãn hiển thị khi model không đủ tự tin về lớp cụ thể
-UDP_FAMILY_LABEL = "UDP-DDoS (loại chưa chắc)"
-GENERIC_LOWCONF_LABEL = "DDoS (loại chưa chắc)"
+# Ngưỡng tự tin dưới mức này thì mô hình bị coi là đang đoán mò.
+#
+# Đo trên tập kiểm tra: tổng độ chính xác 89,79% (chỉ mô hình) -> 93,29% khi
+# thêm hai tầng bằng chứng cổng bên dưới.
+MULTICLASS_MIN_CONFIDENCE = float(
+    os.environ.get("DASHBOARD_MIN_CONFIDENCE", "0.60")
+)
+
+# Ranh giới cổng ephemeral. Cổng nguồn lớn hơn mức này thì KHÔNG THỂ là máy phản
+# xạ, vì máy phản xạ luôn trả lời từ cổng dịch vụ của nó (< 1024 với DNS, NTP,
+# SNMP, LDAP, NetBIOS, TFTP).
+SERVICE_PORT_MAX = 1024
 
 
 # Core color palette, shared by the CSS theme and the charts
@@ -357,20 +376,52 @@ def classify_attack_types(df, model, label_encoder):
         else:
             preds = idx.astype(str)
 
-        # Gộp về nhãn họ khi độ tự tin dưới ngưỡng. Một dự đoán "DNS" ở mức 55%
-        # là đoán mò trong nhóm phản xạ UDP chồng lấn — hiện "UDP-DDoS" trung
-        # thực hơn. Dự đoán chắc chắn (>= ngưỡng) vẫn giữ tên cụ thể, đúng 99%.
+        # Ba tầng, theo thứ tự bằng chứng mạnh dần xuống yếu dần.
+        sub = df.loc[eligible]
+
+        src_port = pd.to_numeric(
+            sub["Source Port"], errors="coerce"
+        ).fillna(0).astype(int).to_numpy()
+
+        dst_port = pd.to_numeric(
+            sub["Destination Port"], errors="coerce"
+        ).fillna(0).astype(int).to_numpy()
+
+        protocol = pd.to_numeric(
+            sub["Protocol"], errors="coerce"
+        ).fillna(0).astype(int).to_numpy()
+
         labelled = []
 
-        for name, conf in zip(preds, confidence):
-            if conf >= MULTICLASS_MIN_CONFIDENCE:
+        for name, conf, sp, dp, proto in zip(
+            preds, confidence, src_port, dst_port, protocol
+        ):
+            service = (
+                REFLECTION_SERVICE_PORTS.get(int(sp))
+                or REFLECTION_SERVICE_PORTS.get(int(dp))
+            )
+
+            # TẦNG 1 — bằng chứng xác định. Một luồng UDP dính cổng dịch vụ
+            # phản xạ thì chính dịch vụ đó bị lợi dụng, không cần mô hình đoán.
+            if proto == 17 and service:
+                labelled.append(service)
+
+            # TẦNG 2 — mô hình đủ tự tin thì tin mô hình.
+            elif conf >= MULTICLASS_MIN_CONFIDENCE:
                 labelled.append(name)
 
-            elif name in UDP_FAMILY:
-                labelled.append(UDP_FAMILY_LABEL)
+            # TẦNG 3 — luồng UDP, cổng nguồn ephemeral, mô hình đang đoán mò.
+            #
+            # Tấn công phản xạ BẮT BUỘC trả lời từ cổng dịch vụ của máy phản xạ.
+            # Cổng nguồn ephemeral thì loại trừ được toàn bộ họ phản xạ, chỉ còn
+            # lại UDP flood thường. Đây là suy luận theo giao thức, không phải
+            # đoán: nó sửa đúng ca `hping3 --udp -p 80` từng ra "DNS".
+            elif proto == 17 and sp > SERVICE_PORT_MAX:
+                labelled.append("UDP")
 
+            # Còn lại (chủ yếu TCP) thì giữ nguyên dự đoán của mô hình.
             else:
-                labelled.append(GENERIC_LOWCONF_LABEL)
+                labelled.append(name)
 
         # Store the predicted attack types
         df.loc[eligible, "attack_type"] = labelled

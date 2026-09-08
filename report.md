@@ -1692,6 +1692,111 @@ thức. Đánh đổi khoảng 9 điểm trên giấy để lấy một hệ th�
 
 ---
 
+## 7m. FIX-51 — Đặt tên loại bằng bằng chứng cổng, và hoàn tác FIX-50
+
+**Hiện tượng.** `hping3 --udp -p 80 -d 300` — UDP flood cơ bản bằng công cụ phổ
+biến nhất — bị gán nhầm thành `DNS`.
+
+### FIX-50 sai, đã hoàn tác
+
+FIX-50 gộp dự đoán độ tự tin thấp về nhãn họ. Đo lại đầy đủ mới thấy nó **làm tụt
+độ chính xác từ 89,79% xuống 71,91%**:
+
+```
+lop        A: ML thuan   B: FIX-50
+LDAP             83.5%       15.0%
+SNMP             86.3%       38.7%
+SSDP             41.1%        1.2%
+UDP              67.4%        1.2%
+TONG            89.79%      71.91%
+```
+
+Chỉ số dùng để đánh giá FIX-50 lúc đó sai: nó đo độ chính xác **trên phần giữ lại**
+(99%) chứ không phải trên tổng. Gộp 27% dự đoán về nhãn họ nghĩa là 27% đó đều sai
+so với nhãn thật. Đã gỡ bỏ hoàn toàn.
+
+### Nguyên nhân gốc của việc nhận sai loại
+
+Model học trên CICDDoS2019, nơi CIC dùng **cổng tổng hợp của phòng lab**: tấn công
+DNS bắn từ cổng 564/634 chứ không phải 53, LDAP từ 900 chứ không phải 389. Gặp lưu
+lượng thật dùng cổng chuẩn, model không nhận ra và đoán mò trong nhóm phản xạ.
+
+### Cách fix: tách hai câu hỏi vốn khác nhau
+
+| Câu hỏi | Ai trả lời |
+|---|---|
+| "Dịch vụ nào bị lợi dụng?" | **Cổng** — xác định được, không cần đoán |
+| "Lưu lượng có hình dạng gì?" | **Mô hình** |
+
+Mọi hệ thống phát hiện DDoS thực tế đều dùng cổng dịch vụ để định danh họ tấn công.
+Dataset không dạy được điều đó vì cổng của nó là cổng giả.
+
+Ba tầng, bằng chứng mạnh dần xuống yếu dần:
+
+```python
+service = (REFLECTION_SERVICE_PORTS.get(sp)
+           or REFLECTION_SERVICE_PORTS.get(dp))
+
+if proto == 17 and service:                     # TẦNG 1 — xác định
+    labelled.append(service)
+elif conf >= MULTICLASS_MIN_CONFIDENCE:         # TẦNG 2 — mô hình tự tin
+    labelled.append(name)
+elif proto == 17 and sp > SERVICE_PORT_MAX:     # TẦNG 3 — suy luận giao thức
+    labelled.append("UDP")
+else:
+    labelled.append(name)
+```
+
+**Tầng 3 là suy luận theo giao thức, không phải đoán:** tấn công phản xạ BẮT BUỘC
+trả lời từ cổng dịch vụ của máy phản xạ. Cổng nguồn ephemeral loại trừ được toàn bộ
+họ phản xạ, chỉ còn lại UDP flood thường.
+
+### Kết quả, đo bằng chính hàm trong `app.py`
+
+```
+lop          chi ML    3 tang
+DNS          39.7%     39.7%
+LDAP         83.5%     83.5%
+MSSQL        99.3%     98.3%
+NTP         100.0%    100.0%
+NetBIOS      99.8%     99.8%
+SNMP         86.3%     86.2%
+SSDP         41.1%      4.3%   <- danh doi
+Syn         100.0%     99.9%
+TFTP         99.3%     99.3%
+UDP          67.4%     97.8%   <- sua duoc
+TONG        89.79%    93.29%
+```
+
+### Đánh đổi phải nêu trong báo cáo
+
+`SSDP` tụt còn 4,3%, vì trong dataset nó dùng cổng nguồn ephemeral tới 98,3% nên bị
+tầng 3 gộp vào `UDP`. Hai lớp này **đã được chứng minh không tách được**: trần lý
+thuyết 60,86%, và trong dữ liệu gốc chúng **dùng chung cổng nguồn 672**.
+
+Chọn ưu tiên `UDP` vì nó lớn gấp 7 lần `SSDP` trong tập kiểm tra và là thứ mà công
+cụ tấn công thật sinh ra. Điều chỉnh qua `DASHBOARD_MIN_CONFIDENCE` nếu muốn nghiêng
+về `SSDP`.
+
+### Lợi ích lớn nhất: demo trực tiếp được cả 10 loại
+
+Trước FIX-51 chỉ `Syn` tái hiện được bằng hping3. Nay:
+
+```bash
+sudo hping3 --udp -p 53   -d 300 -i u1000 <VM2>   # -> DNS
+sudo hping3 --udp -p 123  -d 300 -i u1000 <VM2>   # -> NTP
+sudo hping3 --udp -p 161  -d 300 -i u1000 <VM2>   # -> SNMP
+sudo hping3 --udp -p 389  -d 300 -i u1000 <VM2>   # -> LDAP
+sudo hping3 --udp -p 1434 -d 300 -i u1000 <VM2>   # -> MSSQL
+sudo hping3 --udp -p 1900 -d 300 -i u1000 <VM2>   # -> SSDP
+sudo hping3 --udp -p 137  -d 300 -i u1000 <VM2>   # -> NetBIOS
+sudo hping3 --udp -p 69   -d 300 -i u1000 <VM2>   # -> TFTP
+sudo hping3 --udp -p 80   -d 300 -i u1000 <VM2>   # -> UDP
+sudo hping3 -S    -p 80          -i u1000 <VM2>   # -> Syn
+```
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
@@ -1742,4 +1847,4 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `DASHBOARD_ALLOW_ANONYMOUS` | `0` | Cho phép không mật khẩu (chỉ khi có Cloud IAP) |
 | `DASHBOARD_MAX_LOG_FILES` | `50` | Số file CSV đọc mỗi lần refresh (FIX-15) |
 | `DASHBOARD_REFRESH_S` | `10` | Chu kỳ tự làm mới dashboard |
-| `DASHBOARD_MIN_CONFIDENCE` | `0.70` | Ngưỡng tự tin để hiện tên loại cụ thể (FIX-50) |
+| `DASHBOARD_MIN_CONFIDENCE` | `0.60` | Ngưỡng tự tin của mô hình khi đặt tên loại (FIX-51) |
