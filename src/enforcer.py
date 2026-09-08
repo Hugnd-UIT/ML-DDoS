@@ -223,10 +223,17 @@ class AttackSignature:
         fwd_len_mean=0.0,
         pps=0.0,
         reason="AI_INFERENCE (Binary Model)",
-        features=None
+        features=None,
+        src_port=0
     ):
         self.src_ip = src_ip
         self.protocol = protocol
+
+        # Cổng nguồn: bằng chứng để app.py định danh họ tấn công phản xạ.
+        # Không tham gia signature_key vì kẻ tấn công đổi cổng nguồn liên tục,
+        # đưa nó vào khoá sẽ làm mỗi gói thành một "chữ ký" riêng.
+        self.src_port = src_port
+
         self.dst_port = dst_port
         self.fwd_len_mean = fwd_len_mean
         self.pps = pps

@@ -1778,6 +1778,11 @@ Chọn ưu tiên `UDP` vì nó lớn gấp 7 lần `SSDP` trong tập kiểm tra
 cụ tấn công thật sinh ra. Điều chỉnh qua `DASHBOARD_MIN_CONFIDENCE` nếu muốn nghiêng
 về `SSDP`.
 
+> **CẢNH BÁO: mục 7m đã bị FIX-52 thay thế một phần.** Tầng 2 (ngưỡng tự tin) và
+> tầng 3 (gộp về `UDP`) đã bị gỡ bỏ, và biến `DASHBOARD_MIN_CONFIDENCE` không còn
+> tồn tại. Các lệnh hping3 bên dưới cũng **sai**: chúng dùng `-p` (đặt cổng ĐÍCH),
+> trong khi tấn công phản xạ phải giả lập bằng `-s` (đặt cổng NGUỒN). Xem mục 7n.
+
 ### Lợi ích lớn nhất: demo trực tiếp được cả 10 loại
 
 Trước FIX-51 chỉ `Syn` tái hiện được bằng hping3. Nay:
@@ -1797,6 +1802,274 @@ sudo hping3 -S    -p 80          -i u1000 <VM2>   # -> Syn
 
 ---
 
+## 7n. FIX-52 — Gỡ cổng khỏi mô hình
+
+FIX-51 chữa triệu chứng. Khi truy đến gốc thì lỗi không phải "đặt tên sai loại",
+mà là **hệ thống bỏ lọt 83% tấn công phản xạ thật**. Nặng hơn nhiều.
+
+### Bằng chứng 1 — cổng trong CICDDoS2019 là cổng giả, và không thành luật
+
+Đo trên dữ liệu gốc, cổng nguồn hay gặp nhất của mỗi lớp kèm tỉ lệ phủ:
+
+| Lớp | Cổng nguồn phổ biến nhất | Tỉ lệ | Cổng thật phải là |
+|---|---|---|---|
+| DNS | 564 | 8,9% | 53 |
+| LDAP | 900 | 12,8% | 389 |
+| NTP | 634 | 16,0% | 123 |
+| SNMP | 672 | 8,5% | 161 |
+| SSDP | 672 | 1,8% | 1900 |
+| UDP | 672 | 0,6% | *(không có)* |
+
+Hai điều đáng chú ý. Thứ nhất, **không cổng nào là cổng dịch vụ thật**. Thứ hai,
+cổng "đặc trưng" nhất cũng chỉ phủ 8–16% số dòng, và `SSDP` với `UDP` **dùng chung
+cổng 672**. Đây không phải một luật để học, mà là nhiễu.
+
+### Bằng chứng 2 — với XGBoost, cổng chỉ là mã định danh để học thuộc
+
+Trần lý thuyết đo bằng cách gom các vector trùng khít trên 409.119 dòng (không mô
+hình nào vượt qua được con số này):
+
+| Bộ đặc trưng | Trần | Số vector khác nhau |
+|---|---|---|
+| 18 đặc trưng hình dạng | 75,03% | 114.970 |
+| 18 + 21 cột NFStream chưa dùng | 75,04% | 116.457 |
+| có thêm 2 cột cổng | **99,96%** | 408.755 |
+
+Thêm 21 cột thống kê nữa chỉ đổi trần đi **0,01 điểm** — tức khả năng phân loại
+không bị giới hạn bởi việc thiếu đặc trưng. Còn hai cột cổng đẩy trần lên 99,96%
+đơn giản vì chúng làm gần như mỗi dòng thành duy nhất: đó là **sức chứa để ghi nhớ**,
+không phải thông tin.
+
+### Bằng chứng 3 — cái giá thật: bỏ lọt 83%
+
+Lấy 40.000 luồng tấn công UDP **thật** trong dataset, chỉ đổi hai số cổng, mọi đặc
+trưng khác giữ nguyên, rồi hỏi lại chính model đang deploy:
+
+| Cổng nguồn | Bị chặn | **Lọt lưới** |
+|---|---|---|
+| cổng giả của dataset | 99,8% | 0,2% |
+| 53 (phản xạ DNS thật) | 17,0% | **83,0%** |
+| 123 (NTP thật) | 17,0% | **83,0%** |
+| 161 (SNMP thật) | 17,0% | **83,0%** |
+| 389 (LDAP thật) | 17,0% | **83,0%** |
+| 137 (NetBIOS thật) | 17,0% | **83,0%** |
+| 69 (TFTP thật) | 17,0% | **83,0%** |
+
+Model multiclass còn gán thẳng nhãn `BENIGN` cho 41–52% số luồng đó. Nguyên nhân:
+cổng 53/123/389 **chưa từng xuất hiện lúc huấn luyện** nên rơi vào nhánh cây trống.
+
+Đây chính là lỗi quan sát được với hping3, nhưng biểu hiện qua dashboard chỉ là
+"tên loại sai" nên trước đó bị chẩn đoán nhầm thành lỗi hiển thị.
+
+### Bằng chứng 4 — một lỗ hổng thứ hai, cùng gốc
+
+`TRUST_EPHEMERAL_REPLIES` (mặc định BẬT) khiến gatekeeper `continue`, **bỏ qua hẳn
+tuyến AI**, với mọi luồng có cổng nguồn là cổng dịch vụ và cổng đích ephemeral.
+
+Đó **đúng là khuôn dạng của mọi tấn công phản xạ**: máy phản xạ trả lời từ cổng
+53/123/161/389/1900 về một cổng ephemeral của nạn nhân. Nghĩa là 8 trong 10 lớp
+tấn công không bao giờ được đưa vào AI để chấm.
+
+Lý do tồn tại của luật này cũng đã biến mất từ lâu: thủ phạm ban nhầm Fastly CDN là
+**rate limiter**, tuyến đã bị gỡ bỏ hoàn toàn. Chú thích cũ trong mã còn ghi rõ
+"model đã phán đúng là BENIGN" — mô hình chưa bao giờ là vấn đề.
+
+Đã đổi mặc định sang **TẮT**. Chỗ đúng để chống báo động nhầm là bộ tích luỹ phán
+quyết (`VERDICTS_TO_BAN=5`, xác suất ban nhầm mỗi IP 4,3e-08), tức chặn theo bằng
+chứng tích luỹ — không phải bằng cách bịt mắt bộ phát hiện.
+
+### Bốn phương án, chọn theo số đo
+
+| | A: bỏ cổng | B: nhóm cổng | C: +21 cột | D: cổng thô |
+|---|---|---|---|---|
+| Chính xác trên dataset | 70,24% | 71,32% | 70,74% | **73,44%** |
+| src 53 → vẫn nhận UDP | **53%** | 14% | 54% | **0%** |
+| src 123 → vẫn nhận UDP | **53%** | 14% | 54% | **0%** |
+| src 1900 → vẫn nhận UDP | **53%** | 62% | 54% | **0%** |
+
+D (bản đang chạy) hơn 3,2 điểm trên giấy nhưng **sụp hoàn toàn** khi gặp cổng thật.
+B vẫn dính artifact vì trong dataset "cổng hệ thống" tương quan với nhóm DNS/LDAP/NTP.
+C bền tương đương A nhưng thêm 21 cột chỉ để lấy +0,5 điểm.
+
+**Chọn A.** Dự đoán trở nên bất biến theo cổng — đúng như phải thế, vì hình dạng
+luồng có đổi đâu.
+
+### Kiến trúc sau khi sửa: hai câu hỏi, hai cơ chế
+
+| Câu hỏi | Ai trả lời | Vì sao |
+|---|---|---|
+| Lưu lượng có hình dạng gì? | **Mô hình** | học được từ dữ liệu |
+| Dịch vụ nào bị lợi dụng? | **Luật tất định** | suy ra từ giao thức |
+
+Luật này không phải mẹo lách. Định nghĩa của tấn công khuếch đại DNS **chính là**
+lưu lượng đến từ cổng 53 của máy phản xạ — cổng nguồn không phải manh mối thống kê
+để đoán, nó là bản thân định nghĩa. Ở tầng thống kê luồng thì thông tin phân biệt
+đơn giản là không tồn tại:
+
+| Lớp | Payload trung vị | Gói/luồng |
+|---|---|---|
+| DNS | **1472** | 2 |
+| LDAP | **1472** | 2 |
+| SSDP | **375** | 2 |
+| UDP | **375** | 4 |
+
+DNS và LDAP đều là gói lấp đầy MTU (1472 = 1500 − 20 IP − 8 UDP). Không mô hình nào
+tách nổi hai cặp đó.
+
+**Chỉ dùng cổng NGUỒN, không dùng cổng đích.** Máy phản xạ trả lời *từ* cổng dịch vụ.
+Ngược lại, lưu lượng đi *tới* cổng 53 là UDP flood nhắm vào máy chủ DNS — đó là UDP
+flood, không phải tấn công phản xạ DNS. FIX-51 gộp chung hai chiều nên gọi nhầm.
+
+### Sửa thêm một lỗi đo lường
+
+`test_classes.py` trước đây chấm trên nguyên `data/test_multiclass.csv`. Nhưng sau
+khi trainer trộn hai ngày capture rồi chia ngẫu nhiên 70/30, **khoảng 70% số dòng ấy
+nằm trong chính tập huấn luyện**. Con số 89,79% ở mục 7m vì thế có phần là học thuộc.
+
+Nay trainer ghi riêng `data/holdout_multiclass.csv` gồm các dòng model **chưa từng
+thấy**, và `test_classes.py` chấm trên đó.
+
+### Một lỗi thứ ba, lộ ra nhờ lần đo lại này
+
+Sau khi huấn luyện lại, `Syn` **gọi tên đúng 99,9% nhưng chỉ bị chặn 9,2%**. Nguyên
+nhân nằm ở quy tắc chọn ngưỡng, và nó **có từ trước, không liên quan việc gỡ cổng**.
+
+Nhánh TCP có một vách đứng:
+
+| ngưỡng | FPR benign | bắt tấn công |
+|---|---|---|
+| 0,50 | 0,8581% | **81,45%** |
+| 0,70 | 0,7864% | 78,08% |
+| 0,80 | 0,7403% | 71,65% |
+| 0,90 | 0,5149% | **7,86%** ← vách |
+| 0,95 | 0,3074% | 2,46% |
+
+Quy tắc cũ là "lấy ngưỡng lỏng nhất còn đạt mục tiêu FPR". Điều đó chỉ đúng khi
+recall giảm đều theo ngưỡng. Với mục tiêu 0,5% thì 0,50/0,70/0,80 đều trượt, và
+ngưỡng đầu tiên lọt là 0,95 — nơi recall chỉ còn 2,46%. `threshold.json` ghi ra
+trông hoàn toàn bình thường, cổng chất lượng vẫn báo ĐẠT, và hệ thống lặng lẽ
+ngừng chặn SYN flood.
+
+**Nguồn gốc của vách là artifact hai ngày capture**, không phải model yếu. Cùng model
+đó chấm `Syn` ngày 1 (phân bố nó đã học) cho trung vị 0,906 và phân vị 75% là 0,9996;
+chấm `Syn` ngày 2 chỉ còn trung vị 0,844. Lý do đã biết: `Fwd Packet Length Mean` của
+`Syn` là **0 ở ngày 1 và 6 ở ngày 2** — đúng cái artifact đã buộc model multiclass
+phải trộn hai ngày.
+
+Đã sửa hai chỗ: `TARGET_FPR_TCP` 0,005 → 0,01 (chọn ra ngưỡng 0,50), và thêm **sàn
+recall** `MIN_TPR_TCP = 0,40` để một lần hiệu chỉnh rơi sau vách sẽ báo động thay vì
+im lặng.
+
+**Vì sao recall mỗi flow không phải thứ quyết định.** Gatekeeper chỉ chặn sau 5 phán
+quyết trên cùng một IP trong 60 giây. SYN flood ở 1000 pps sinh ~1000 flow mỗi giây
+(mỗi cặp SYN+RST là một flow), nên ở 81% nó tạo ~814 phán quyết mỗi giây — đủ 5 phán
+quyết trong chưa tới 10 mili giây. Một IP lành tính sinh 60 flow mỗi phút ở FPR
+0,86% chỉ có xác suất 1,7e-04 mỗi phút. Kẻ tấn công tích luỹ nhanh gấp hàng vạn lần.
+
+### Kết quả
+
+Mô hình nhị phân — chỗ quyết định chặn hay không — **tốt lên** dù bỏ bớt đặc trưng:
+
+| | Cũ (20 đặc trưng) | Mới (18, bỏ cổng) |
+|---|---|---|
+| Ngưỡng chung | 0,9999 | 0,995 |
+| Ngưỡng TCP | 0,95 | 0,50 |
+| FPR trên benign | 0,0018% | 0,0036% |
+| **TPR trên tấn công** | 76,45% | **82,61%** |
+| **TPR riêng TCP** | 94,68%\* | **81,45%** |
+
+\* Con số 94,68% của model cũ chỉ đạt được trên cổng giả của dataset. Xem bảng độ bền
+bên dưới.
+
+Đo trên holdout chéo ngày, cùng phương pháp. Phát hiện chung tăng **6,2 điểm** —
+bằng chứng trực tiếp rằng hai cột cổng là nhiễu gây học tủ theo ngày capture.
+
+**Độ bền trên TCP với cổng thật** — lấy luồng tấn công TCP ngày 2, chỉ đổi cổng đích:
+
+| Tình huống | CŨ chặn @0,95 | MỚI chặn @0,70 |
+|---|---|---|
+| cổng ngẫu nhiên của dataset | 89,6% | 64,3% |
+| **cổng đích 80** (`hping3 -S -p 80`) | **36,5%** | 64,3% |
+| **cổng đích 443** (HTTPS flood) | **7,0%** | 64,3% |
+| cổng đích 22 (SSH flood) | 42,1% | 64,3% |
+
+Model cũ chỉ hơn trên cổng giả. Gặp SYN flood thật nhắm cổng 443 nó chặn được 7%.
+Model mới bất biến ở mọi giá trị cổng — **tốt lên gấp 9 lần** trong tình huống thật.
+
+### Kết quả phân loại, đo trên 330.000 dòng holdout chưa từng thấy
+
+```
+loại      số dòng   AI CHẶN   ĐẶT TÊN  +song sinh   nhầm sang
+SSDP       30,000   100.0%     28.8%      96.5%     UDP 68%, MSSQL 2%
+UDP        30,000   100.0%     73.9%      98.3%     SSDP 24%, MSSQL 1%
+MSSQL      30,000   100.0%     95.1%      95.1%     SNMP 2%, LDAP 1%
+SNMP       30,000   100.0%     84.4%      84.4%     LDAP 9%, NetBIOS 4%
+LDAP       30,000   100.0%     73.3%      78.2%     SNMP 21%, DNS 5%
+TFTP       30,000    99.9%     99.2%      99.2%     Syn 1%
+NetBIOS    30,000    99.6%     99.0%      99.0%     MSSQL 1%
+NTP        30,000    99.0%     99.9%      99.9%     -
+DNS        30,000    98.3%     27.1%      82.8%     LDAP 56%, SNMP 13%
+Syn        30,000    84.9%     99.9%      99.9%     -
+
+BENIGN     30,000     0.5%                          <- báo động nhầm
+
+Tấn công bị chặn        : 98.16%
+Mô hình đặt đúng tên    : 78.06%
+Đúng tên hoặc lớp song sinh: 93.33%
+```
+
+Cột "+song sinh" gộp `DNS`↔`LDAP` và `SSDP`↔`UDP`. **Chênh lệch giữa 78,06% và 93,33%
+chính là phần mà tầng luật cổng xử lý ngoài thực tế** — hai cặp đó không tách được ở
+tầng thống kê luồng, nhưng cổng dịch vụ nguồn tách chúng dứt khoát.
+
+**So sánh với con số cũ phải kèm cảnh báo.** Mục 7j/7m ghi 89,79%, nhưng con số đó
+chấm trên `test_multiclass.csv` mà ~70% số dòng nằm trong chính tập huấn luyện. 78,06%
+ở đây đo trên dòng model chưa từng thấy, nên **hai con số không so sánh trực tiếp
+được** — cái sau mới là số trung thực.
+
+### Cách demo đúng bằng hping3
+
+Lệnh ở mục 7m **sai**: `-p` đặt cổng ĐÍCH, tức mô phỏng flood *nhắm vào* một cổng.
+Tấn công phản xạ phải đặt cổng NGUỒN bằng `-s`, và cần `-k` để hping3 không tăng
+cổng sau mỗi gói.
+
+```bash
+# Phản xạ / khuếch đại — cổng NGUỒN là cổng dịch vụ
+sudo hping3 --udp -s 53   -k -p 40000 -d 1400 -i u1000 <VM2>   # -> DNS
+sudo hping3 --udp -s 123  -k -p 40000 -d 440  -i u1000 <VM2>   # -> NTP
+sudo hping3 --udp -s 161  -k -p 40000 -d 1400 -i u1000 <VM2>   # -> SNMP
+sudo hping3 --udp -s 389  -k -p 40000 -d 1400 -i u1000 <VM2>   # -> LDAP
+sudo hping3 --udp -s 1434 -k -p 40000 -d 500  -i u1000 <VM2>   # -> MSSQL
+sudo hping3 --udp -s 1900 -k -p 40000 -d 375  -i u1000 <VM2>   # -> SSDP
+sudo hping3 --udp -s 137  -k -p 40000 -d 229  -i u1000 <VM2>   # -> NetBIOS
+sudo hping3 --udp -s 69   -k -p 40000 -d 516  -i u1000 <VM2>   # -> TFTP
+
+# Không phải phản xạ — mô hình quyết định
+sudo hping3 --udp -p 80 -d 375 -i u1000 <VM2>                  # -> UDP
+sudo hping3 -S    -p 80        -i u1000 <VM2>                  # -> Syn
+```
+
+Tham số `-d` đặt payload khớp kích thước phản hồi thật của từng dịch vụ, để hình
+dạng luồng cũng hợp lý chứ không chỉ đúng mỗi cổng.
+
+### Phải nói gì khi bảo vệ
+
+Đây là **kết quả âm có giá trị**, nên trình bày thẳng chứ đừng giấu:
+
+1. Một đặc trưng nâng điểm trên tập kiểm tra vẫn có thể **phá hệ thống** ngoài thực
+   tế, khi mức nâng đó đến từ artifact của dữ liệu. Đây là ví dụ đo được, không phải
+   lý thuyết: +3,2 điểm trên giấy, đổi lấy bỏ lọt 83% tấn công thật.
+2. Cách phát hiện ra nó là **thí nghiệm can thiệp**: giữ nguyên mọi thứ, chỉ đổi một
+   biến (số cổng) sang giá trị thực tế. Chỉ nhìn độ chính xác trên tập kiểm tra thì
+   không bao giờ thấy được.
+3. CICDDoS2019 có **khiếm khuyết cột cổng** chưa được ghi nhận rộng rãi. Cùng với hai
+   khiếm khuyết đã ghi ở mục 7l (`SYN Flag Count` chết, `min_seg_size_forward` sai
+   vật lý), đây là đóng góp riêng của đồ án.
+4. Giới hạn `DNS`/`LDAP` và `SSDP`/`UDP` là **giới hạn của dữ liệu, không phải của mô
+   hình** — đã chứng minh bằng trần lý thuyết chứ không phải phỏng đoán.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
@@ -1804,11 +2077,16 @@ Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pk
 
 | Chỉ số | Giá trị | Nguồn |
 |---|---|---|
-| Ngưỡng quyết định | **0.9999** | `threshold` |
-| FPR trên benign | **0,0018%** | day-2 holdout |
-| TPR trên attack | **76,45%** | day-2 holdout |
-| Precision @ tỉ lệ tấn công 1% | 99,77% | suy ra từ FPR/TPR |
-| Precision @ tỉ lệ tấn công 0,1% | 97,73% | suy ra từ FPR/TPR |
+| Ngưỡng quyết định (UDP/khác) | **0.995** | `threshold` |
+| Ngưỡng quyết định (TCP) | **0.50** | `threshold_tcp` |
+| FPR trên benign | **0,0036%** | day-2 holdout |
+| TPR trên attack | **82,61%** | day-2 holdout |
+| FPR / TPR riêng TCP | **0,8581% / 81,45%** | day-2 holdout |
+| Precision @ tỉ lệ tấn công 1% | 99,58% | suy ra từ FPR/TPR |
+| Precision @ tỉ lệ tấn công 0,1% | 95,88% | suy ra từ FPR/TPR |
+
+Số của FIX-52, đo lại sau khi gỡ hai cột cổng. Bộ số cũ (ngưỡng 0.9999, FPR 0,0018%,
+TPR 76,45%) thuộc về model 20 đặc trưng đã bị thay thế — xem mục 7n.
 
 `binary.pkl` (fit trên 100% dữ liệu) **không** được deploy và **không** dùng để báo
 cáo — nó đã nhìn thấy tập kiểm thử nên không đo được gì trung thực. Xem FIX-31.
@@ -1833,12 +2111,12 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `GLOBAL_SYN_THRESHOLD` | `2000` | Ngưỡng SYN toàn cục / 5s (FIX-03) |
 | `GLOBAL_PACKET_THRESHOLD` | `20000` | Ngưỡng tổng gói toàn cục / 5s |
 | `GLOBAL_SOURCE_THRESHOLD` | `500` | Ngưỡng số source khác nhau / 5s |
-| `TRUST_EPHEMERAL_REPLIES` | `1` | Bỏ qua gói trả về cho kết nối máy tự mở (FIX-33) |
+| `TRUST_EPHEMERAL_REPLIES` | `0` | Bỏ qua gói trả về cho kết nối máy tự mở. **Đổi mặc định sang tắt ở FIX-52** — bật lại là mở lỗ hổng phản xạ |
 | `VERDICTS_TO_BAN` | `5` | Số phán quyết AI trên cùng IP trước khi chặn (FIX-41) |
 | `VERDICT_WINDOW_S` | `60` | Cửa sổ tích luỹ phán quyết, giây |
 | `AI_BATCH_SIZE` | `128` | Số flow gom lại mỗi lượt chấm (FIX-42) |
 | `AI_BATCH_MAX_WAIT_S` | `0.25` | Thời gian tối đa giữ một lô chưa đầy |
-| `TARGET_FPR_TCP` | `0.005` | Mục tiêu FPR riêng cho nhánh TCP (FIX-40) |
+| `TARGET_FPR_TCP` | `0.01` | Mục tiêu FPR riêng cho nhánh TCP. **Nới từ 0.005 ở FIX-52** — mức cũ chọn phải ngưỡng sau vách đứng, chỉ bắt 2,46% |
 | `TG_DIGEST_INTERVAL_S` | `60` | Chu kỳ gửi digest Telegram |
 | `TG_IDLE_CYCLES` | `2` | Số chu kỳ yên ắng trước khi báo hết bão |
 | `GATEKEEPER_ENV_FILE` | *(rỗng)* | Đường dẫn `.env` chỉ định rõ (FIX-21) |
@@ -1847,4 +2125,6 @@ Xem `.env.example` để biết đầy đủ. Các biến thêm trong hai vòng 
 | `DASHBOARD_ALLOW_ANONYMOUS` | `0` | Cho phép không mật khẩu (chỉ khi có Cloud IAP) |
 | `DASHBOARD_MAX_LOG_FILES` | `50` | Số file CSV đọc mỗi lần refresh (FIX-15) |
 | `DASHBOARD_REFRESH_S` | `10` | Chu kỳ tự làm mới dashboard |
-| `DASHBOARD_MIN_CONFIDENCE` | `0.60` | Ngưỡng tự tin của mô hình khi đặt tên loại (FIX-51) |
+
+`DASHBOARD_MIN_CONFIDENCE` (thêm ở FIX-51) **đã bị gỡ bỏ ở FIX-52** cùng với tầng
+ngưỡng tự tin. Đặt biến này không còn tác dụng gì.

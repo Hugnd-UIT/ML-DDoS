@@ -68,8 +68,17 @@ DEFAULT_CLASS_CAP = 3_000_000
 
 BINARY_CLASS_CAP = 0
 
-# Decision thresholds explored when picking the live operating point
-THRESHOLD_GRID = [0.5, 0.7, 0.9, 0.95, 0.99, 0.995, 0.999, 0.9999]
+# Số dòng mỗi lớp ghi ra data/holdout_multiclass.csv để đánh giá về sau.
+# 30.000 dòng cho sai số chuẩn dưới 0,3 điểm cho mỗi lớp, quá đủ, mà file vẫn
+# nhỏ hơn 100 MB thay vì vài GB.
+HOLDOUT_ROWS_PER_CLASS = 30_000
+
+# Decision thresholds explored when picking the live operating point.
+#
+# 0.6 và 0.8 thêm vào để nhìn được vách đứng của nhánh TCP: giữa 0.8 và 0.9 khả
+# năng bắt tấn công TCP rơi từ 58% xuống 8%. Lưới thưa hơn thì vách nằm lọt giữa
+# hai điểm đo và không ai thấy. Xem MIN_TPR_TCP trong recalibrate.py.
+THRESHOLD_GRID = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.995, 0.999, 0.9999]
 
 # Target false positive rate for the deployed threshold. 0.5 (the default
 # predict() cut-off) yields ~0.64% FPR, which sounds small but is not: real
@@ -140,23 +149,32 @@ def load_dataset(path, sample_frac=None):
     # Validate the header before reading gigabytes of rows. A model fitted on
     # a different column set than features.py declares would silently mismatch
     # the live extractor, which is what this shared contract exists to prevent.
+    #
+    # Chỉ đòi feature contract là TẬP CON của header, không đòi trùng khít. Nhờ
+    # vậy khi một cột bị gỡ khỏi FEATURE_NAMES (như hai cột cổng ở FIX-52) thì
+    # không phải chạy lại parser.py trên 48,7 triệu dòng — chỉ cần đọc ít cột đi.
+    # Cột thừa được liệt kê ra chứ không bỏ qua im lặng.
     expected = list(FEATURE_NAMES) + ["Label"]
     header = list(pd.read_csv(path, nrows=0).columns)
 
-    if header != expected:
-        missing = [c for c in expected if c not in header]
-        extra = [c for c in header if c not in expected]
+    missing = [c for c in expected if c not in header]
 
+    if missing:
         raise SystemExit(
-            f"\n[-] {os.path.basename(path)} does not match the current "
-            f"feature contract.\n"
-            f"    expected {len(expected)} columns, found {len(header)}\n"
-            f"    missing: {missing or 'none'}\n"
-            f"    unexpected: {extra or 'none'}\n"
-            f"[-] Re-run: python src/parser.py"
+            f"\n[-] {os.path.basename(path)} thiếu cột so với feature "
+            f"contract hiện tại.\n"
+            f"    cần {len(expected)} cột, file có {len(header)}\n"
+            f"    thiếu: {missing}\n"
+            f"[-] Chạy lại: python src/parser.py"
         )
 
-    df = pd.read_csv(path, low_memory=False)
+    ignored = [c for c in header if c not in expected]
+
+    if ignored:
+        print(f"[*] Bỏ qua {len(ignored)} cột không còn dùng: {ignored}")
+
+    # usecols giảm luôn bộ nhớ đỉnh: pandas không dựng cột rồi mới vứt đi
+    df = pd.read_csv(path, low_memory=False, usecols=expected)[expected]
 
     # Halve memory use; every feature is numeric
     df = df.astype(np.float32)
@@ -550,6 +568,27 @@ def train_multiclass(sample_frac=None, cap=DEFAULT_CLASS_CAP):
     )
 
     del pooled
+
+    # Ghi tập holdout ra đĩa để đánh giá về sau chấm đúng dòng model CHƯA thấy.
+    #
+    # Trước đây test_classes.py chấm trên nguyên data/test_multiclass.csv, mà
+    # sau khi trộn hai ngày thì ~70% số dòng đó nằm trong chính tập huấn luyện.
+    # Con số in ra vì thế có phần là học thuộc chứ không phải khái quát hoá.
+    # Lấy mẫu để file đủ nhỏ mà vẫn đủ dòng cho ước lượng theo từng lớp.
+    holdout = pd.concat(
+        [
+            g.sample(n=min(len(g), HOLDOUT_ROWS_PER_CLASS), random_state=42)
+            for _, g in df_test.groupby("Label", sort=False)
+        ],
+        ignore_index=True
+    )
+
+    holdout_path = _path("data", "holdout_multiclass.csv")
+    holdout.to_csv(holdout_path, index=False)
+
+    print(f"[+] Holdout để đánh giá: {holdout_path} ({len(holdout):,} dòng)")
+
+    del holdout
 
     X_train, y_train = split_xy(df_train)
     X_test, y_test = split_xy(df_test)

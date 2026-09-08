@@ -65,6 +65,7 @@ METADATA_FIELDNAMES = [
     "src_ip",
     "dst_ip",
     "protocol",
+    "src_port",
     "dst_port",
     "pps",
     "fwd_len_mean",
@@ -101,7 +102,8 @@ class DirtyFlowEvent:
         reason,
         signature_key,
         blocked_at,
-        features=None
+        features=None,
+        src_port=0
     ):
         # Store the event timestamp in UTC
         self.timestamp = time.strftime(
@@ -115,6 +117,12 @@ class DirtyFlowEvent:
         self.src_ip = src_ip
         self.dst_ip = dst_ip
         self.protocol = protocol
+
+        # Cổng NGUỒN là bằng chứng định danh tấn công phản xạ: máy phản xạ luôn
+        # trả lời TỪ cổng dịch vụ của nó. Nó không phải feature của model (xem
+        # features.py), nhưng app.py cần nó để đặt tên loại tấn công.
+        self.src_port = src_port
+
         self.dst_port = dst_port
         self.pps = pps
         self.fwd_len_mean = fwd_len_mean
@@ -318,6 +326,7 @@ class DirtyFlowCollector:
                 src_ip=sig.src_ip,
                 dst_ip=dst_ip,
                 protocol=sig.protocol,
+                src_port=getattr(sig, "src_port", 0),
                 dst_port=sig.dst_port,
                 pps=sig.pps,
                 fwd_len_mean=sig.fwd_len_mean,

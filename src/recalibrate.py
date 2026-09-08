@@ -62,22 +62,60 @@ DEPLOYED_MODEL = "binary_eval.pkl"
 
 # Mục tiêu FPR cho riêng nhánh TCP.
 #
-# Lỏng hơn TARGET_FPR chung một cách có chủ đích. Lớp Syn được model chấm điểm
-# thấp hơn hẳn các lớp phản xạ UDP (trung vị 0,68 so với ~1,0), nên ép nó vào
-# cùng mục tiêu FPR đồng nghĩa với bỏ lọt gần hết SYN flood:
+# Lỏng hơn TARGET_FPR chung một cách có chủ đích. Model chấm điểm tấn công TCP
+# thấp hơn hẳn các lớp phản xạ UDP, nên ép nó vào cùng mục tiêu FPR đồng nghĩa
+# với bỏ lọt gần hết SYN flood.
 #
-#     ngưỡng TCP   bắt Syn    FPR benign TCP
-#        0,90       96,54%        0,4944%
-#        0,95       55,00%        0,3304%
-#        0,99       49,51%        0,1896%
-#        0,9999     28,47%        0,0000%
+# CÓ MỘT VÁCH ĐỨNG, và phải đặt ngưỡng ở đúng phía. Đo trên TCP ngày 2 với model
+# 18 feature:
 #
-# Chi phí này không rơi xuống người dùng cuối, vì gatekeeper chỉ chặn sau
-# VERDICTS_TO_BAN phán quyết trên cùng một IP. Ở K=5, FPR 0,4944% mỗi flow
-# tương ứng 4,30e-08 mỗi IP — thấp hơn kiến trúc cũ khoảng 8.400 lần.
+#     ngưỡng   FPR benign   bắt tấn công
+#      0,50      0,8581%       67,40%
+#      0,70      0,7864%       64,30%
+#      0,80      0,7403%       58,10%
+#      0,90      0,5149%        8,49%   <- vách
+#      0,95      0,3074%        2,46%
+#
+# Giữa 0,80 và 0,90 khả năng bắt sụp từ 58% xuống 8%, trong khi FPR chỉ giảm
+# 0,23 điểm. Mua 0,23 điểm FPR bằng 50 điểm recall là lỗ nặng.
+#
+# NGUỒN GỐC CỦA VÁCH: chênh lệch giữa hai buổi ghi hình, không phải model yếu.
+# Cùng model đó chấm Syn NGÀY 1 (phân bố nó đã học) cho trung vị 0,906 và
+# phân vị 75% là 0,9996; chấm Syn ngày 2 chỉ còn trung vị 0,844. Nguyên nhân
+# đã biết: Fwd Packet Length Mean của Syn là 0 ở ngày 1 và 6 ở ngày 2. Đây
+# chính là artifact đã buộc model multiclass phải trộn hai ngày.
+#
+# 0,01 chọn ra ngưỡng 0,50 — recall cao nhất (67,40%) trong ngân sách FPR 1%,
+# và cách vách đứng hai nấc. Mức 0,005 cũ chọn phải 0,95 và chỉ bắt 2,46%.
+#
+# VÌ SAO 67% MỖI FLOW LÀ ĐỦ. Gatekeeper chỉ chặn sau VERDICTS_TO_BAN=5 phán
+# quyết trên cùng một IP trong 60 giây. Một cuộc SYN flood ở 1000 pps sinh
+# khoảng 1000 flow mỗi giây (mỗi cặp SYN+RST là một flow), nên ở 67,4% nó tạo
+# ~674 phán quyết mỗi giây — đủ 5 phán quyết trong chưa tới 10 mili giây.
+# Ngược lại, một IP lành tính sinh 60 flow mỗi phút ở FPR 0,8581% chỉ có xác
+# suất 1,72e-04 mỗi phút bị đủ 5 phán quyết nhầm.
+#
+# Nói cách khác, recall mỗi flow không phải thứ quyết định — TỐC ĐỘ TÍCH LUỸ
+# phán quyết mới là. Kẻ tấn công tích luỹ nhanh gấp hàng vạn lần host lành tính.
 TARGET_FPR_TCP = float(
-    os.environ.get("TARGET_FPR_TCP", "0.005")
+    os.environ.get("TARGET_FPR_TCP", "0.01")
 )
+
+# Sàn recall cho nhánh TCP, để một lần hiệu chỉnh sai không âm thầm vô hiệu hoá
+# việc chặn SYN flood.
+#
+# Đây là chốt chặn cho một lỗi ĐÃ XẢY RA THẬT: quy tắc "lấy ngưỡng lỏng nhất còn
+# đạt mục tiêu FPR" là đúng khi TPR giảm đều theo ngưỡng, nhưng ở đây có vách
+# đứng. Với mục tiêu 0,005 thì 0,50/0,70/0,80 đều trượt FPR, và ngưỡng đầu tiên
+# lọt là 0,95 — nơi recall chỉ còn 2,46%. threshold.json ghi ra trông hoàn toàn
+# bình thường, cổng chất lượng vẫn báo ĐẠT, và hệ thống lặng lẽ ngừng chặn Syn.
+#
+# Khi recall rơi dưới sàn này, sweep() chọn lại theo recall cao nhất trong trần
+# FPR cứng bên dưới, và in cảnh báo thay vì im lặng.
+MIN_TPR_TCP = 0.40
+
+# Trần FPR cứng dùng khi phải chọn lại theo sàn recall
+MAX_FPR_TCP = 0.015
 
 
 # Chấm điểm một CSV theo chunk, trả về xác suất tách riêng benign / attack.
@@ -97,10 +135,15 @@ def score_csv(model, path):
     rows = 0
     t0 = time.time()
 
-    for chunk in pd.read_csv(path, chunksize=CHUNK_ROWS, low_memory=False):
-        if list(chunk.columns) != expected:
+    # Chỉ cần feature contract nằm TRONG header; cột thừa (ví dụ hai cột cổng
+    # đã gỡ ở FIX-52) được bỏ qua thay vì bắt chạy lại parser.py.
+    for chunk in pd.read_csv(path, chunksize=CHUNK_ROWS, low_memory=False,
+                             usecols=expected):
+        missing = [c for c in expected if c not in chunk.columns]
+
+        if missing:
             raise SystemExit(
-                f"\n[-] {os.path.basename(path)} không khớp feature contract.\n"
+                f"\n[-] {os.path.basename(path)} thiếu cột: {missing}\n"
                 f"[-] Chạy lại: python src/parser.py"
             )
 
@@ -133,7 +176,10 @@ def score_csv(model, path):
 
 
 # Quét lưới ngưỡng trên điểm số đã tính sẵn.
-def sweep(proba_benign, proba_attack, target_fpr=TARGET_FPR):
+#
+# min_tpr/max_fpr chỉ dùng cho nhánh TCP — xem MIN_TPR_TCP về lỗi mà chúng chặn.
+def sweep(proba_benign, proba_attack, target_fpr=TARGET_FPR,
+          min_tpr=None, max_fpr=None):
     print(f"\n{'ngưỡng':>10} {'FPR':>10} {'TPR':>10} "
           f"{'prec@1%':>10} {'prec@0.1%':>11}")
     print("    " + "-" * 51)
@@ -171,6 +217,27 @@ def sweep(proba_benign, proba_attack, target_fpr=TARGET_FPR):
               f"dùng ngưỡng chặt nhất ({threshold:.4f})")
 
     print(f"        FPR {fpr:.4%} / TPR {tpr:.4%}")
+
+    # Sàn recall: mục tiêu FPR mà rơi vào phía sau một vách đứng thì ngưỡng chọn
+    # ra tuy "đạt" nhưng gần như không chặn được gì. Chọn lại theo recall.
+    if min_tpr is not None and tpr < min_tpr:
+        ceiling = max_fpr if max_fpr is not None else target_fpr * 2.0
+
+        room = [r for r in results if r[1] <= ceiling]
+        best = max(room, key=lambda r: r[2]) if room else None
+
+        if best is not None and best[2] > tpr:
+            print(
+                f"\n    [!] TPR {tpr:.2%} dưới sàn {min_tpr:.0%} — "
+                f"ngưỡng {threshold:.4f} nằm sau vách đứng."
+            )
+
+            threshold, fpr, tpr = best
+
+            print(f"    [!] Chọn lại theo recall trong trần FPR {ceiling:.2%}: "
+                  f"ngưỡng {threshold:.4f}")
+
+            print(f"        FPR {fpr:.4%} / TPR {tpr:.4%}")
 
     return threshold, fpr, tpr
 
@@ -236,7 +303,11 @@ def main():
     print("\n[*] Hiệu chỉnh ngưỡng RIÊNG cho TCP (nơi chứa SYN flood)...")
 
     threshold_tcp, fpr_tcp, tpr_tcp = sweep(
-        benign_tcp, attack_tcp, target_fpr=TARGET_FPR_TCP
+        benign_tcp,
+        attack_tcp,
+        target_fpr=TARGET_FPR_TCP,
+        min_tpr=MIN_TPR_TCP,
+        max_fpr=MAX_FPR_TCP,
     )
 
     # Cùng cổng chất lượng mà trainer.py áp dụng

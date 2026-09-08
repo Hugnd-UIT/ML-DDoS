@@ -46,30 +46,59 @@ FEATURE_NAMES = [
     "Protocol",
     "SYN Flag Count",
     "ACK Flag Count",
-
-    # Cổng nguồn và cổng đích.
-    #
-    # Thiếu hai cột này là nguyên nhân chính khiến model không phân biệt được
-    # các họ tấn công phản xạ UDP. Toàn bộ DNS/LDAP/SNMP/SSDP/MSSQL/NetBIOS/NTP
-    # đều là phản xạ UDP, và thứ duy nhất phân biệt chúng ngoài đời là cổng
-    # dịch vụ bị lợi dụng. Đo trên 937.614 dòng, 12 lớp cân bằng:
-    #
-    #     18 feature (không cổng)          62,84%
-    #     + Source Port, Destination Port  75,24%    (+12,40 điểm)
-    #     + 9 thống kê khác nữa            75,42%    (+0,18 — không đáng)
-    #
-    # Riêng NetBIOS đi từ 8,70% lên 77,10%, DNS từ 36,02% lên 74,81%.
-    #
-    # Không phải bảng tra: dùng RIÊNG hai cột cổng chỉ đạt 47,59%, nên chúng
-    # mang thông tin bổ sung thật chứ không thay thế các feature còn lại.
-    #
-    # HẠN CHẾ PHẢI NÊU TRONG BÁO CÁO: CICDDoS2019 dùng cổng tổng hợp của phòng
-    # lab — DNS bắn từ 564/634 chứ không phải 53, LDAP từ 900 chứ không phải
-    # 389. Model học cổng theo dữ liệu này sẽ KHÔNG nhận ra tấn công phản xạ
-    # thật ngoài đời, vốn đến từ cổng dịch vụ chuẩn.
-    "Source Port",
-    "Destination Port",
 ]
+
+# ĐÃ GỠ BỎ: "Source Port" và "Destination Port".
+#
+# Hai cột này từng được thêm vào vì chúng nâng độ chính xác trên tập kiểm tra.
+# Chúng có nâng thật, và đó chính là cái bẫy: mức nâng đó là ARTIFACT của
+# CICDDoS2019, còn cái giá phải trả là hệ thống ngừng chặn được tấn công thật.
+#
+# CICDDoS2019 KHÔNG dùng cổng dịch vụ thật. Đo trên dữ liệu gốc, cổng nguồn
+# hay gặp nhất của mỗi lớp, kèm tỉ lệ phủ:
+#
+#     DNS     564  (8,9%)   — không phải 53
+#     LDAP    900 (12,8%)   — không phải 389
+#     NTP     634 (16,0%)   — không phải 123
+#     SNMP    672  (8,5%)   — không phải 161
+#     SSDP    672  (1,8%)   — không phải 1900
+#     UDP     672  (0,6%)   — TRÙNG cổng của SSDP
+#
+# Cổng "đặc trưng" nhất cũng chỉ phủ 8–16% số dòng, nên đây không phải một luật
+# mà là nhiễu. Với XGBoost, một cột gần như duy nhất trên mỗi dòng là mã định
+# danh để học thuộc. Trần lý thuyết đo bằng cách gom các vector trùng khít trên
+# 409.119 dòng cho thấy đúng điều đó:
+#
+#     18 feature hình dạng                    75,03%
+#     18 + 21 cột NFStream khác chưa dùng     75,04%   (+0,01 — vô nghĩa)
+#     có thêm 2 cột cổng                      99,96%   <- sức chứa để nhớ, không
+#                                                         phải thông tin
+#
+# HẬU QUẢ ĐO ĐƯỢC, và đây mới là lý do thật sự phải gỡ. Lấy 40.000 luồng tấn
+# công UDP THẬT trong dataset, chỉ đổi hai số cổng, mọi feature khác giữ
+# nguyên, rồi hỏi lại chính model đang deploy:
+#
+#     cổng nguồn                     model CHẶN     lọt lưới
+#     cổng giả của dataset              99,8%          0,2%
+#     53   (phản xạ DNS thật)           17,0%         83,0%
+#     123  (phản xạ NTP thật)           17,0%         83,0%
+#     161  (phản xạ SNMP thật)          17,0%         83,0%
+#     389  (phản xạ LDAP thật)          17,0%         83,0%
+#     137  (phản xạ NetBIOS thật)       17,0%         83,0%
+#     69   (phản xạ TFTP thật)          17,0%         83,0%
+#
+# Cùng một cuộc tấn công, chỉ khác số cổng, và IPS để lọt 83%. Model multiclass
+# còn gán thẳng nhãn BENIGN cho 41–52% số luồng đó. Nguyên nhân: cổng 53/123/389
+# chưa từng xuất hiện lúc huấn luyện nên rơi vào nhánh cây trống.
+#
+# Sau khi gỡ, dự đoán BẤT BIẾN theo cổng — đúng như phải thế, vì hình dạng luồng
+# có đổi đâu: cùng bộ luồng đó cho ra 53% nhãn UDP ở mọi giá trị cổng đã thử.
+#
+# Giá phải trả trên giấy: multiclass 73,44% -> 70,24% (-3,2 điểm). Đó là giá
+# đúng, vì 3,2 điểm kia mua bằng việc bỏ lọt 83% tấn công phản xạ thật.
+#
+# Việc "dịch vụ nào bị lợi dụng" được xử lý ở app.py bằng LUẬT TẤT ĐỊNH dựa trên
+# cổng nguồn, chứ không nhét vào model. Xem chú thích ở đó.
 
 N_FEATURES = len(FEATURE_NAMES)
 
@@ -241,11 +270,9 @@ def extract_features(flow):
 
     protocol = float(flow.protocol)
 
-    # Cổng, lấy thẳng từ NFStream. Xem chú thích ở FEATURE_NAMES về vì sao hai
-    # cột này quan trọng, và về hạn chế cổng tổng hợp của CICDDoS2019.
-    src_port = float(_get(flow, "src_port"))
-    dst_port = float(_get(flow, "dst_port"))
-
+    # Cổng KHÔNG nằm trong vector đặc trưng — xem khối "ĐÃ GỠ BỎ" ở trên. Nó
+    # vẫn được gatekeeper ghi vào log dưới dạng metadata để app.py chạy luật
+    # định danh dịch vụ, nhưng model không bao giờ nhìn thấy nó.
     features = np.array(
         [[
             duration_us,
@@ -266,8 +293,6 @@ def extract_features(flow):
             protocol,
             syn_count,
             ack_count,
-            src_port,
-            dst_port,
         ]],
         dtype=np.float32
     )

@@ -145,47 +145,55 @@ LABEL_ENCODER_PATH = os.path.join(
 FEATURE_COLUMNS = list(FEATURE_NAMES)
 
 
-# ── ĐẶT TÊN LOẠI TẤN CÔNG: BẰNG CHỨNG CỔNG + MÔ HÌNH ────────────────────────
+# ── ĐẶT TÊN LOẠI TẤN CÔNG ───────────────────────────────────────────────────
 #
-# Model học trên CICDDoS2019, nơi CIC dùng CỔNG TỔNG HỢP của phòng lab: tấn công
-# DNS bắn từ cổng 564/634 chứ không phải 53, LDAP từ 900 chứ không phải 389. Nên
-# khi gặp lưu lượng THẬT dùng cổng dịch vụ chuẩn, model không nhận ra.
+# Hệ thống trả lời HAI câu hỏi khác nhau, bằng hai cơ chế khác nhau, và việc
+# tách bạch chúng là điểm mấu chốt của thiết kế này:
 #
-# Đó là lý do `hping3 --udp -p 80` từng bị gán nhầm thành "DNS": model đoán mò
-# trong nhóm phản xạ chồng lấn.
+#   "Lưu lượng có hình dạng gì?"  -> MÔ HÌNH. Học được từ dữ liệu.
+#   "Dịch vụ nào bị lợi dụng?"    -> LUẬT TẤT ĐỊNH. Suy ra từ giao thức.
 #
-# Cách xử lý: tách hai câu hỏi vốn khác nhau.
+# VÌ SAO KHÔNG ĐỂ MÔ HÌNH HỌC CỔNG. Đã thử, và nó hỏng nặng. CICDDoS2019 dùng
+# cổng tổng hợp của phòng lab (DNS từ 564 chứ không phải 53, LDAP từ 900 chứ
+# không phải 389), nên model học cổng sẽ gặp toàn giá trị lạ khi ra thực tế. Đo
+# trên 40.000 luồng tấn công thật, chỉ đổi số cổng: model chặn tụt từ 99,8%
+# xuống 17,0%, tức BỎ LỌT 83% tấn công phản xạ. Chi tiết ở features.py.
 #
-#   "Dịch vụ nào bị lợi dụng?"  -> XÁC ĐỊNH được từ cổng, không cần đoán.
-#   "Lưu lượng có hình dạng gì?" -> việc của mô hình.
+# VÌ SAO LUẬT NÀY KHÔNG PHẢI "GIAN LẬN". Định nghĩa của tấn công khuếch đại DNS
+# CHÍNH LÀ lưu lượng đến từ cổng 53 của máy phản xạ. Cổng nguồn không phải một
+# manh mối thống kê để đoán, nó là bản thân định nghĩa. Ở tầng thống kê luồng,
+# DNS và LDAP đều là gói lấp đầy MTU 1472 byte và KHÔNG THỂ tách được:
 #
-# Mọi hệ thống phát hiện DDoS thực tế đều dùng cổng dịch vụ để định danh họ tấn
-# công. Dataset không dạy được điều đó vì cổng của nó là cổng giả.
+#     lớp      payload trung vị    gói/luồng
+#     DNS            1472              2
+#     LDAP           1472              2       <- trùng khít DNS
+#     SSDP            375              2
+#     UDP             375              4       <- trùng khít SSDP
+#
+# Không mô hình nào phân biệt nổi hai cặp đó, vì thông tin phân biệt không nằm
+# trong dữ liệu. Nó nằm ở cổng dịch vụ.
+#
+# CHỈ DÙNG CỔNG NGUỒN, KHÔNG DÙNG CỔNG ĐÍCH. Máy phản xạ TRẢ LỜI từ cổng dịch vụ
+# của nó, nên tấn công phản xạ đến nạn nhân luôn mang cổng nguồn = cổng dịch vụ.
+# Ngược lại, lưu lượng ĐI TỚI cổng 53 là UDP flood nhắm vào máy chủ DNS — đó là
+# UDP flood, không phải tấn công phản xạ DNS. Bản trước gộp chung hai chiều nên
+# gọi nhầm; nay chỉ xét cổng nguồn.
+#
+# HỆ QUẢ KHI THỬ BẰNG hping3: phải giả lập bằng `-s <cổng dịch vụ>` (đặt cổng
+# NGUỒN), không phải `-p`. `hping3 --udp -p 53` là flood nhắm vào cổng 53 và
+# ĐÚNG RA phải hiện là UDP flood.
 #
 # Cổng dịch vụ chuẩn (IANA) của các họ tấn công phản xạ/khuếch đại.
 REFLECTION_SERVICE_PORTS = {
     53: "DNS",
+    69: "TFTP",
     123: "NTP",
+    137: "NetBIOS",
     161: "SNMP",
     389: "LDAP",
     1434: "MSSQL",
     1900: "SSDP",
-    137: "NetBIOS",
-    69: "TFTP",
 }
-
-# Ngưỡng tự tin dưới mức này thì mô hình bị coi là đang đoán mò.
-#
-# Đo trên tập kiểm tra: tổng độ chính xác 89,79% (chỉ mô hình) -> 93,29% khi
-# thêm hai tầng bằng chứng cổng bên dưới.
-MULTICLASS_MIN_CONFIDENCE = float(
-    os.environ.get("DASHBOARD_MIN_CONFIDENCE", "0.60")
-)
-
-# Ranh giới cổng ephemeral. Cổng nguồn lớn hơn mức này thì KHÔNG THỂ là máy phản
-# xạ, vì máy phản xạ luôn trả lời từ cổng dịch vụ của nó (< 1024 với DNS, NTP,
-# SNMP, LDAP, NetBIOS, TFTP).
-SERVICE_PORT_MAX = 1024
 
 
 # Core color palette, shared by the CSS theme and the charts
@@ -362,69 +370,45 @@ def classify_attack_types(df, model, label_encoder):
 
     # Run multiclass prediction on the eligible rows only
     try:
-        # Dùng predict_proba để biết độ tự tin, không chỉ nhãn thắng cuộc.
-        # Đây là chỗ chặn việc in một tên loại cụ thể mà model đang đoán mò.
-        proba = model.predict_proba(X)
-
-        idx = proba.argmax(axis=1)
-        confidence = proba.max(axis=1)
+        idx = model.predict(X)
 
         # Convert numeric predictions back to attack names
         if label_encoder is not None:
-            preds = label_encoder.inverse_transform(idx.astype(int))
+            preds = label_encoder.inverse_transform(
+                np.asarray(idx).astype(int)
+            )
 
         else:
-            preds = idx.astype(str)
+            preds = np.asarray(idx).astype(str)
 
-        # Ba tầng, theo thứ tự bằng chứng mạnh dần xuống yếu dần.
+        # Nhãn của mô hình là điểm xuất phát; luật cổng chỉ GHI ĐÈ khi có bằng
+        # chứng xác định. Xem khối REFLECTION_SERVICE_PORTS ở đầu file.
+        df.loc[eligible, "attack_type"] = preds
+
         sub = df.loc[eligible]
 
-        src_port = pd.to_numeric(
-            sub["Source Port"], errors="coerce"
-        ).fillna(0).astype(int).to_numpy()
+        # Log cũ (trước khi thêm src_port) thì bỏ qua luật cổng, giữ nhãn model
+        if "src_port" not in sub.columns:
+            return df, skipped
 
-        dst_port = pd.to_numeric(
-            sub["Destination Port"], errors="coerce"
-        ).fillna(0).astype(int).to_numpy()
+        src_port = pd.to_numeric(
+            sub["src_port"], errors="coerce"
+        ).fillna(0).astype(int)
 
         protocol = pd.to_numeric(
             sub["Protocol"], errors="coerce"
-        ).fillna(0).astype(int).to_numpy()
+        ).fillna(0).astype(int)
 
-        labelled = []
+        # Chỉ UDP: mọi họ tấn công phản xạ đều chạy trên UDP, vì chỉ UDP mới
+        # giả mạo được địa chỉ nguồn để hướng phản hồi về nạn nhân.
+        service = src_port.map(REFLECTION_SERVICE_PORTS)
 
-        for name, conf, sp, dp, proto in zip(
-            preds, confidence, src_port, dst_port, protocol
-        ):
-            service = (
-                REFLECTION_SERVICE_PORTS.get(int(sp))
-                or REFLECTION_SERVICE_PORTS.get(int(dp))
+        identified = (protocol == 17) & service.notna()
+
+        if identified.any():
+            df.loc[identified[identified].index, "attack_type"] = (
+                service[identified]
             )
-
-            # TẦNG 1 — bằng chứng xác định. Một luồng UDP dính cổng dịch vụ
-            # phản xạ thì chính dịch vụ đó bị lợi dụng, không cần mô hình đoán.
-            if proto == 17 and service:
-                labelled.append(service)
-
-            # TẦNG 2 — mô hình đủ tự tin thì tin mô hình.
-            elif conf >= MULTICLASS_MIN_CONFIDENCE:
-                labelled.append(name)
-
-            # TẦNG 3 — luồng UDP, cổng nguồn ephemeral, mô hình đang đoán mò.
-            #
-            # Tấn công phản xạ BẮT BUỘC trả lời từ cổng dịch vụ của máy phản xạ.
-            # Cổng nguồn ephemeral thì loại trừ được toàn bộ họ phản xạ, chỉ còn
-            # lại UDP flood thường. Đây là suy luận theo giao thức, không phải
-            # đoán: nó sửa đúng ca `hping3 --udp -p 80` từng ra "DNS".
-            elif proto == 17 and sp > SERVICE_PORT_MAX:
-                labelled.append("UDP")
-
-            # Còn lại (chủ yếu TCP) thì giữ nguyên dự đoán của mô hình.
-            else:
-                labelled.append(name)
-
-        # Store the predicted attack types
-        df.loc[eligible, "attack_type"] = labelled
 
     # Keep the original labels only when prediction fails
     except Exception as exc:

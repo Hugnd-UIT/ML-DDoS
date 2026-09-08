@@ -181,8 +181,34 @@ AI_BATCH_MAX_WAIT_S = float(
 # Fastly CDN ở 1385 pps. Nhân với WINDOW_SECONDS=5 ra 6928 gói, vượt
 # TOTAL_THRESHOLD=3000, và 151.101.0.223 bị ban dù model đã phán đúng là BENIGN.
 # Mọi lượt tải nhanh hơn ~600 gói/giây đều dính lỗi này.
+#
+# ĐÃ ĐỔI MẶC ĐỊNH SANG TẮT (FIX-52). Hai lý do, cái thứ hai là lý do bắt buộc.
+#
+# 1. Lý do tồn tại của nó đã biến mất. Thủ phạm ban nhầm Fastly là RATE LIMITER
+#    với TOTAL_THRESHOLD, và tuyến đó đã bị gỡ bỏ hoàn toàn. Chính chú thích
+#    trên đã ghi: "model đã phán đúng là BENIGN". Mô hình chưa bao giờ là vấn
+#    đề, nên không cần miễn trừ cho nó.
+#
+# 2. Nó là một lỗ hổng mở toang trước ĐÚNG họ tấn công mà đồ án này nhắm tới.
+#    Điều kiện để được miễn — cổng nguồn là cổng dịch vụ, cổng đích ephemeral —
+#    chính là khuôn dạng của MỌI tấn công phản xạ/khuếch đại. Máy phản xạ trả
+#    lời từ cổng 53/123/161/389/1900 về một cổng ephemeral của nạn nhân. Nghĩa
+#    là DNS, NTP, SNMP, LDAP, SSDP, MSSQL, NetBIOS, TFTP — 8 trong 10 lớp tấn
+#    công của hệ thống — không bao giờ được đưa vào tuyến AI để chấm.
+#
+#    Nó cũng mâu thuẫn trực tiếp với kiến trúc đã chọn: "AI chấm MỌI flow đủ
+#    2 gói". Một luật âm thầm bỏ qua cả một họ lưu lượng thì AI không còn là
+#    bên duy nhất phát hiện nữa.
+#
+# Cái thay thế nó là bộ tích luỹ phán quyết (VERDICTS_TO_BAN): phải có 5 phán
+# quyết tấn công trong 60 giây mới ban, đưa xác suất ban nhầm mỗi IP xuống
+# 4,3e-08. Đó mới là chỗ đúng để chống báo động nhầm — chặn theo bằng chứng
+# tích luỹ, không phải bằng cách bịt mắt bộ phát hiện.
+#
+# Đặt TRUST_EPHEMERAL_REPLIES=1 để bật lại nếu thấy ban nhầm lượt tải ra ngoài,
+# nhưng phải biết rằng làm vậy là mở lại lỗ hổng phản xạ ở trên.
 TRUST_EPHEMERAL_REPLIES = os.environ.get(
-    "TRUST_EPHEMERAL_REPLIES", "1"
+    "TRUST_EPHEMERAL_REPLIES", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Dải cổng ephemeral, đọc từ kernel để khớp đúng máy đang chạy
@@ -594,7 +620,7 @@ def load_threshold():
                 "features.py — model đang được nạp sai vector."
             )
 
-            print("  [✗] Chạy lại: python3 src/parser.py && python3 src/trainer.py")
+            print("  [✗] Chạy lại: python3 src/trainer.py")
 
             import sys
 
@@ -1058,15 +1084,17 @@ def main():
 
     if TRUST_EPHEMERAL_REPLIES:
         print(
-            f"  [+] Bỏ qua lưu lượng trả về tới cổng ephemeral "
-            f"{eph_low}-{eph_high} (pip, apt, GCS...)"
+            f"  [!] BỎ QUA lưu lượng trả về tới cổng ephemeral "
+            f"{eph_low}-{eph_high}"
+        )
+
+        print(
+            "  [!] CẢNH BÁO: tấn công phản xạ (DNS/NTP/SNMP/LDAP/SSDP...) "
+            "cũng mang đúng khuôn dạng này và sẽ KHÔNG được AI chấm."
         )
 
     else:
-        print(
-            "  [!] TRUST_EPHEMERAL_REPLIES=0 — lượt tải ra ngoài "
-            "có thể bị ban nhầm"
-        )
+        print("  [+] AI chấm mọi flow, kể cả lưu lượng tới cổng ephemeral")
 
     # Nói rõ trạng thái IPv6 thay vì âm thầm bỏ qua như bản cũ
     has_global_v6 = any(
@@ -1173,6 +1201,7 @@ def main():
             sig = AttackSignature(
                 src_ip       = src_ip,
                 protocol     = item["protocol"],
+                src_port     = item.get("src_port", 0),
                 dst_port     = item["dst_port"],
                 fwd_len_mean = item["fwd_len_mean"],
                 pps          = item["pps"],
@@ -1301,6 +1330,7 @@ def main():
                         "src_ip":       flow.src_ip,
                         "protocol":     proto_name(flow.protocol),
                         "protocol_num": int(flow.protocol),
+                        "src_port":     int(getattr(flow, "src_port", 0)),
                         "dst_port":     int(getattr(flow, "dst_port", 0)),
                         "fwd_len_mean": float(getattr(flow, "src2dst_mean_ps", 0.0)),
                         "pps":          float(flow.bidirectional_packets) / duration_s,

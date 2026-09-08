@@ -1,18 +1,18 @@
 {
-  "threshold": 0.9999,
-  "threshold_tcp": 0.95,
-  "measured_fpr_tcp": 0.004559543021081483,
-  "measured_tpr_tcp": 0.9468346264922721,
-  "target_fpr_tcp": 0.005,
+  "threshold": 0.995,
+  "threshold_tcp": 0.5,
+  "measured_fpr_tcp": 0.008581162427316274,
+  "measured_tpr_tcp": 0.8145453284574273,
+  "target_fpr_tcp": 0.01,
   "model_file": "models/binary_eval.pkl",
   "calibrated_on": "deployed_model",
-  "measured_fpr": 0.0007459240578268746,
-  "measured_tpr": 0.8683658926313427,
-  "fpr_at_0.5": 0.010602777679110574,
-  "tpr_at_0.5": 0.998373834476597,
+  "measured_fpr": 3.552019322985117e-05,
+  "measured_tpr": 0.8260835253125346,
+  "fpr_at_0.5": 0.007494760771498597,
+  "tpr_at_0.5": 0.9674288038089061,
   "metrics_source": "models/binary_eval.pkl (day-1 fit, day-2 holdout)",
   "target_fpr": 0.001,
-  "n_features": 20,
+  "n_features": 18,
   "feature_names": [
     "Flow Duration",
     "Flow Bytes/s",
@@ -31,11 +31,9 @@
     "Fwd IAT Total",
     "Protocol",
     "SYN Flag Count",
-    "ACK Flag Count",
-    "Source Port",
-    "Destination Port"
+    "ACK Flag Count"
   ],
-  "binary_sha256": "d7a8f2d86d868a53992c6e5c772514c48eb77de3144c243c52cf009e6ad32b01",
-  "trained_at": "2026-09-06T05:07:34Z",
+  "binary_sha256": "d9be6c92fe5c7fe4e7aa615eb71a50769dcb47d2e64a8f9ad52b28b75f2361ae",
+  "trained_at": "2026-09-08T06:49:10Z",
   "recalibrated_without_retrain": true
 }
