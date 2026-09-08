@@ -1599,6 +1599,99 @@ phát hiện tấn công — vẫn ở mức 98,96%.
 
 ---
 
+## 7l. KẾT QUẢ ÂM — vì sao KHÔNG dùng thêm 48 cột còn lại của CICFlowMeter
+
+Phần phân loại là đóng góp chính của đồ án, nên phải trả lời được câu hỏi:
+*"CICFlowMeter có 88 cột, sao chỉ dùng 20?"* Mục này ghi lại toàn bộ phép đo.
+
+### Trần lý thuyết khi dùng tất cả
+
+```
+20 feature hien tai        : 80.45%
+TAT CA 68 cot dung duoc    : 89.48%   (+9.0 diem)
+```
+
+Chênh lệch 9 điểm là thật. Nhưng nó đến từ đâu?
+
+### Tách từng nhóm
+
+```
+them nhom                      TONG   NetBIOS
+(khong them gi)              80.9%    40.5%
+Init_Win (cua so TCP)        81.0%    41.1%   (+0.1%)
+Idle (khoang nghi)           80.9%    40.3%   (-0.0%)
+act_data_pkt_fwd             80.9%    40.4%   (+0.0%)
+min_seg_size_forward         89.7%    88.4%   (+8.8%)   <- toan bo do loi tu day
+```
+
+Bảy feature mà NFStream **có** cấp được (`Min/Max Packet Length`, `Packet Length
+Std/Mean`, `Fwd/Bwd Packet Length Std`, `Average Packet Size`) cộng lại chỉ
+**+0,1 điểm**. Toàn bộ 8,8 điểm nằm ở đúng một cột: `min_seg_size_forward`.
+
+### `min_seg_size_forward` là một LỖI của CICFlowMeter
+
+Cột này được cho là kích thước header tầng 4 nhỏ nhất theo chiều đi. Header UDP
+theo chuẩn **luôn luôn là 8 byte** — không có ngoại lệ. Nhưng đo trên dữ liệu:
+
+```
+Flow UDP (header L4 that su LUON = 8 byte):
+   min_seg_size_forward = 0    28.8%
+                        = 20   19.8%
+                        = -1   16.4%
+                        = 8    11.4%   <- chi 11.4% dung
+                        = 14    7.4%
+                        = 32    5.0%
+
+Flow TCP (header 20-60 byte):
+   min_seg_size_forward = 20   95.4%   <- dung
+```
+
+**88,6% flow UDP mang giá trị vật lý không thể tồn tại.** CICFlowMeter tính đúng
+cho TCP nhưng hỏng hoàn toàn với UDP.
+
+Vì mỗi file capture bị lỗi theo một kiểu khác nhau, cột này **gián tiếp lộ nhãn**.
+Model học nó sẽ đẹp trên giấy mà vô dụng khi chạy thật, vì không có thuộc tính gói
+nào ngoài đời sinh ra những con số đó.
+
+Kiểm chứng thêm — bỏ riêng các giá trị lỗi:
+
+```
+khong dung min_seg_size                     TONG 80.9%   NetBIOS 40.5%
+dung nguyen ban (co ca -1 va 0)             TONG 89.7%   NetBIOS 88.4%
+bo gia tri loi -1/0 -> NaN                  TONG 87.8%   NetBIOS 75.8%
+CHI giu co phai gia tri loi hay khong       TONG 82.1%   NetBIOS 47.4%
+```
+
+Ngay cả phần "sạch" cũng không đáng tin, vì với UDP thì mọi giá trị khác 8 đều sai.
+
+### Chặn cứng thứ hai: NFStream không cấp cột này
+
+Đọc mã nguồn NFStream 3.1.0, lớp `NFPacket` chỉ có:
+
+```
+time, capture_length, length, nfhash, ip_src, ip_dst, src_port,
+dst_port, protocol, vlan_id, version, tcpflags, raw, root_idx, direction
+```
+
+Không có `transport_size` lẫn `payload_size`. Có thể tự parse từ `raw`, nhưng làm
+vậy sẽ cho ra **giá trị đúng** (UDP = 8), trong khi model được huấn luyện trên
+**giá trị sai** của CICFlowMeter. Lệch train/serve còn nặng hơn hiện tại.
+
+### Kết luận
+
+**Không đưa thêm feature nào vào.** Đây là lỗi CICFlowMeter thứ hai được phát hiện
+trong đồ án, cùng loại với FIX-32 (cột cờ SYN/ACK không đúng nghĩa tên gọi).
+
+Đây cũng là lời giải thích cho việc nhiều bài báo công bố độ chính xác rất cao trên
+CICDDoS2019: dùng cả 88 cột mà không kiểm tra tính hợp lệ vật lý của chúng, nên vô
+tình huấn luyện trên dấu vết lỗi của công cụ trích xuất.
+
+**Điểm cần nêu khi bảo vệ:** bộ 20 feature được chọn có kiểm chứng — mỗi cột đều
+(1) NFStream tái tạo được khi chạy thật, và (2) mang giá trị hợp lệ về mặt giao
+thức. Đánh đổi khoảng 9 điểm trên giấy để lấy một hệ thống chạy được thật.
+
+---
+
 ## 8. GHI CHÚ CHO BÁO CÁO ĐỒ ÁN
 
 Sau FIX-31, **model được deploy chính là model đã đo** (`binary_eval.pkl`, fit ngày 1
