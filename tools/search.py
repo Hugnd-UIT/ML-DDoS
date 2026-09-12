@@ -46,10 +46,19 @@ def search_history(src_ip):
                         pps = entry.get("pps")
                         if pps:
                             pps_vals.append(float(pps))
-                        sz = entry.get("avg_packet_size", 128) or 128
-                        dur = entry.get("duration", 1.0) or 1.0
-                        p = entry.get("pps", 0) or 0
-                        bytes_total += int(float(p) * float(dur) * float(sz))
+                        sz = float(entry.get("avg_packet_size", 128) or 128)
+                        dur_ms = float(entry.get("flow_duration_ms", 1000.0) or 1000.0)
+                        dur = max(dur_ms / 1000.0, 0.001)
+                        fwd_p = entry.get("fwd_pkts", 0)
+                        bwd_p = entry.get("bwd_pkts", 0)
+                        flow_bs = entry.get("flow_bytes_s", 0)
+                        p = float(entry.get("pps", 0) or 0)
+                        if flow_bs:
+                            bytes_total += int(float(flow_bs) * dur)
+                        elif fwd_p or bwd_p:
+                            bytes_total += int((fwd_p + bwd_p) * sz)
+                        else:
+                            bytes_total += int(p * dur * sz)
                 except Exception:
                     pass
     except Exception as err:

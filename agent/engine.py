@@ -174,16 +174,36 @@ class Engine:
         for step in range(1, max_steps + 1):
             response = self.query("", messages=msgs)
 
+            match_action = re.search(r"Action:\s*[`'\"]?([a-zA-Z0-9_]+)[`'\"]?\s*(?:\((.*?)\)|:\s*([^\n]+))", response)
+            tool_calls_count = len([h for h in history if h.get("role") == "user" and h.get("content", "").startswith("Observation:")])
+
+            if match_action:
+                action_name = match_action.group(1).strip()
+                action_input = (match_action.group(2) or match_action.group(3) or "").strip()
+                obs = self.dispatch(action_name, action_input)
+
+                history.append({"role": "assistant", "content": response})
+                history.append({"role": "user", "content": f"Observation: {obs}"})
+                msgs.append({"role": "assistant", "content": response})
+                msgs.append({"role": "user", "content": f"Observation: {obs}"})
+                continue
+
             if "Final Answer:" in response:
+                if tool_calls_count < 2 and step < max_steps:
+                    msgs.append({"role": "assistant", "content": response})
+                    msgs.append({"role": "user", "content": "Observation: Rule violation - you must call at least 2 tools (e.g. read_alert, search_history) before issuing Final Answer. Please call a tool now."})
+                    continue
+
                 match_ans = re.search(r"Final Answer:\s*([A-Z_]+)", response)
                 if match_ans:
                     decision = match_ans.group(1).strip()
 
-                match_reason = re.search(r"Reason:\s*(.+)", response)
+                match_reason = re.search(r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Action|Thought)|$)", response)
                 if match_reason:
                     reason = match_reason.group(1).strip()
                 else:
-                    reason = response.split("Final Answer:")[0].strip()
+                    parts = response.split("Final Answer:")
+                    reason = parts[0].strip() if len(parts) > 1 else response.strip()
 
                 if decision == "UNBLOCK":
                     self.dispatch("execute_unban", alert.get("src_ip", ""))
@@ -195,29 +215,20 @@ class Engine:
                     "history": history
                 }
 
-            match_action = re.search(r"Action:\s*([a-zA-Z0-9_]+)\s*\((.*?)\)", response)
-            if not match_action:
-                break
-
-            action_name = match_action.group(1).strip()
-            action_input = match_action.group(2).strip()
-            obs = self.dispatch(action_name, action_input)
-
-            history.append({"role": "assistant", "content": response})
-            history.append({"role": "user", "content": f"Observation: {obs}"})
             msgs.append({"role": "assistant", "content": response})
-            msgs.append({"role": "user", "content": f"Observation: {obs}"})
+            msgs.append({"role": "user", "content": "Observation: Please proceed by specifying Thought: and Action: tool_name(argument), or Final Answer: and Reason:."})
 
-        msgs.append({"role": "user", "content": "Provide your Final Answer now:"})
+        msgs.append({"role": "user", "content": "Evidence gathering complete. Provide your Final Answer now (KEEP_BLOCK or UNBLOCK) with Reason:."})
         response = self.query("", messages=msgs)
-
         match_ans = re.search(r"Final Answer:\s*([A-Z_]+)", response)
         if match_ans:
             decision = match_ans.group(1).strip()
-
-        match_reason = re.search(r"Reason:\s*(.+)", response)
+        match_reason = re.search(r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Action|Thought)|$)", response)
         if match_reason:
             reason = match_reason.group(1).strip()
+        else:
+            parts = response.split("Final Answer:")
+            reason = parts[0].strip() if len(parts) > 1 else response.strip()
 
         if decision == "UNBLOCK":
             self.dispatch("execute_unban", alert.get("src_ip", ""))
