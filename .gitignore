@@ -59,14 +59,9 @@ data/divided/**/*
 *.h5
 *.hdf5
 
-models/**/*
-!models/**/
-!models/**/.gitkeep
-!models/**/README.md
+!models/
+!models/*
 
-*.pkl
-*.pickle
-*.joblib
 *.pt
 *.pth
 *.onnx
