@@ -49,7 +49,14 @@ class Signature:
         fwd_len_mean=0.0,
         pps=0.0,
         reason="AI_INFERENCE",
-        features=None
+        features=None,
+        fwd_pkts=0,
+        bwd_pkts=0,
+        syn_count=0,
+        ack_count=0,
+        rst_count=0,
+        flow_duration_ms=0.0,
+        flow_bytes_s=0.0
     ):
         self.src_ip = src_ip
         self.protocol = protocol
@@ -58,6 +65,13 @@ class Signature:
         self.pps = pps
         self.reason = reason
         self.features = features
+        self.fwd_pkts = fwd_pkts
+        self.bwd_pkts = bwd_pkts
+        self.syn_count = syn_count
+        self.ack_count = ack_count
+        self.rst_count = rst_count
+        self.flow_duration_ms = flow_duration_ms
+        self.flow_bytes_s = flow_bytes_s
 
     @property
     def signature(self):
@@ -551,7 +565,15 @@ class Enforcer:
                 "reason": sig.reason,
                 "pps": sig.pps,
                 "ttl_secs": ttl_secs,
-                "offense_count": count
+                "offense_count": count,
+                "avg_packet_size": round(sig.fwd_len_mean, 2),
+                "fwd_pkts": sig.fwd_pkts,
+                "bwd_pkts": sig.bwd_pkts,
+                "syn_count": sig.syn_count,
+                "ack_count": sig.ack_count,
+                "rst_count": sig.rst_count,
+                "flow_duration_ms": round(sig.flow_duration_ms, 3),
+                "flow_bytes_s": round(sig.flow_bytes_s, 2)
             }
             with open(log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(alert_entry) + '\n')

@@ -778,6 +778,10 @@ def main():
                 if is_ddos and is_suspect:
                     if not enforcer.check_whitelist(flow.src_ip):
                         features = extract_features(flow)
+                        _dur_s = max(float(getattr(flow, 'bidirectional_duration_ms', 1.0)) / 1000.0, 0.001)
+                        _fwd_pkts = float(getattr(flow, 'src2dst_packets', 0))
+                        _bwd_pkts = float(getattr(flow, 'dst2src_packets', 0))
+                        _total_bytes = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
                         sig = Signature(
                             src_ip=flow.src_ip,
                             protocol=proto_name(flow.protocol),
@@ -785,7 +789,14 @@ def main():
                             fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
                             pps=float(global_pkts) / GLOBAL_WINDOW,
                             reason=ddos_reason,
-                            features=features[0].tolist() if features is not None else None
+                            features=features[0].tolist() if features is not None else None,
+                            fwd_pkts=int(_fwd_pkts),
+                            bwd_pkts=int(_bwd_pkts),
+                            syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
+                            ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
+                            rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
+                            flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
+                            flow_bytes_s=_total_bytes / _dur_s
                         )
                         count, ttl_secs = enforcer.block_ip(sig)
                         if count > 0:
@@ -846,7 +857,9 @@ def main():
                                 float(flow.bidirectional_duration_ms) / 1000.0,
                                 0.001
                             )
-
+                            _fwd_pkts2 = float(getattr(flow, 'src2dst_packets', 0))
+                            _bwd_pkts2 = float(getattr(flow, 'dst2src_packets', 0))
+                            _total_bytes2 = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
                             sig = Signature(
                                 src_ip=flow.src_ip,
                                 protocol=proto_name(flow.protocol),
@@ -854,7 +867,14 @@ def main():
                                 fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
                                 pps=float(flow.bidirectional_packets) / duration_s,
                                 reason=reason,
-                                features=features[0].tolist()
+                                features=features[0].tolist(),
+                                fwd_pkts=int(_fwd_pkts2),
+                                bwd_pkts=int(_bwd_pkts2),
+                                syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
+                                ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
+                                rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
+                                flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
+                                flow_bytes_s=_total_bytes2 / duration_s
                             )
 
                             count, ttl_secs = enforcer.block_ip(sig)
