@@ -7,10 +7,13 @@ import sys
 import time
 import warnings
 
+warnings.filterwarnings('ignore')
+
 import joblib
 import numpy as np
 import xgboost as xgb
 
+from collections import deque
 from cachetools import TTLCache
 from nfstream import NFStreamer
 
@@ -104,6 +107,11 @@ WINDOW_SECONDS = 5
 SYN_THRESHOLD = 200
 UDP_ICMP_THRESHOLD = 1000
 TOTAL_THRESHOLD = 3000
+
+GLOBAL_WINDOW = 2
+GLOBAL_SYN_LIMIT = 500
+GLOBAL_UDP_LIMIT = 1000
+GLOBAL_TOTAL_LIMIT = 2000
 
 
 def parse_args():
@@ -264,7 +272,7 @@ def extract_features(flow):
 
     duration_s = max(
         duration_ms / 1000.0,
-        1e-9
+        0.001
     )
 
     fwd_pkts = float(
@@ -562,21 +570,21 @@ def main():
 
     print()
     print(
-        "  ╔" + "═" * 63 + "╗"
+        "  ╔" + "═" * 65 + "╗"
     )
     print(
-        "  ║   GATEKEEPER IPS  —  XGBoost + IsolationForest + eBPF/XDP   ║"
+        f"  ║{'XGBoost + IsolationForest + eBPF/XDP':^65}║"
     )
     print(
-        f"  ║   Interface : {interface:<47}║"
+        f"  ║{f'Interface : {interface}':^65}║"
     )
     print(
-        "  ╚" + "═" * 63 + "╝"
+        "  ╚" + "═" * 65 + "╝"
     )
     print()
 
     _banner(
-        "1/4  INITIALIZING DATA PLANE eBPF/XDP"
+        "1/4  INITIALIZING eBPF/XDP..."
     )
 
     enforcer = Enforcer(
@@ -588,24 +596,21 @@ def main():
         return
 
     _banner(
-        "WHITELIST SYNCHRONIZATION"
+        "WHITELIST"
     )
 
     enforcer.load_whitelist()
 
     _banner(
-        "2/4  INITIALIZING USER-SPACE MEMORY"
+        "2/4  INITIALIZING HISTORY..."
     )
 
     print(
-        "  [+] Offense History initialized TTLCache 24h"
-    )
-    print(
-        "  [+] Memory Manager daemon started"
+        "  [+] History initialized"
     )
 
     _banner(
-        "3/4  INITIALIZING AI DETECTION ENGINES"
+        "3/4  INITIALIZING MACHINE LEARNING..."
     )
 
     xgb_model, iso_model, label_encoder = load_models()
@@ -617,7 +622,7 @@ def main():
         )
 
     _banner(
-        "4/4  CONFIGURING EGRESS FILTER"
+        "4/4  CONFIGURING EGRESS..."
     )
 
     local_ips = get_ips(
@@ -625,10 +630,7 @@ def main():
     )
 
     print(
-        f"  [+] Local IPs detected: {', '.join(sorted(local_ips))}"
-    )
-    print(
-        "  [+] Traffic originating from these addresses will be ignored"
+        f"  [+] IPs: {', '.join(sorted(local_ips))}"
     )
 
     packet_window = TTLCache(
@@ -636,15 +638,21 @@ def main():
         ttl=60
     )
 
+    global_queue = deque()
+    global_syn = 0
+    global_udp = 0
+    global_pkts = 0
+    last_log = 0.0
+
     print()
     print(
-        "  ╔" + "═" * 63 + "╗"
+        "  ╔" + "═" * 65 + "╗"
     )
     print(
-        "  ║   GATEKEEPER READY — MONITORING INGRESS TRAFFIC             ║"
+        "  ║                         MONITORING...                           ║"
     )
     print(
-        "  ╚" + "═" * 63 + "╝"
+        "  ╚" + "═" * 65 + "╝"
     )
     print()
 
@@ -661,7 +669,7 @@ def main():
                 if ":" in flow.src_ip:
                     continue
 
-                if flow.src_ip in local_ips:
+                if interface != 'lo' and flow.src_ip in local_ips:
                     continue
 
                 if enforcer.check_blacklist(flow.src_ip):
@@ -675,6 +683,24 @@ def main():
                     udp_icmp_count = total_count
                 else:
                     udp_icmp_count = 0
+
+                global_queue.append(
+                    (
+                        now,
+                        syn_count,
+                        udp_icmp_count,
+                        total_count
+                    )
+                )
+                global_syn += syn_count
+                global_udp += udp_icmp_count
+                global_pkts += total_count
+
+                while global_queue and now - global_queue[0][0] > GLOBAL_WINDOW:
+                    old_ts, old_syn, old_udp, old_pkts = global_queue.popleft()
+                    global_syn -= old_syn
+                    global_udp -= old_udp
+                    global_pkts -= old_pkts
 
                 if flow.src_ip not in packet_window:
                     packet_window[flow.src_ip] = []
@@ -729,6 +755,60 @@ def main():
                     for _, _, _, pkts in filtered
                 )
 
+                is_ddos = False
+                ddos_reason = ""
+
+                if global_syn > GLOBAL_SYN_LIMIT:
+                    is_ddos = True
+                    ddos_reason = "SYN Flood"
+                elif global_udp > GLOBAL_UDP_LIMIT:
+                    is_ddos = True
+                    ddos_reason = "UDP Flood"
+                elif global_pkts > GLOBAL_TOTAL_LIMIT:
+                    is_ddos = True
+                    ddos_reason = "Volumetric"
+
+                is_suspect = (
+                    total_syn >= 10
+                    or total_udp_icmp >= 20
+                    or total_pkts >= 30
+                    or (flow.src2dst_packets >= 5 and flow.dst2src_packets == 0)
+                )
+
+                if is_ddos and is_suspect:
+                    if not enforcer.check_whitelist(flow.src_ip):
+                        features = extract_features(flow)
+                        sig = Signature(
+                            src_ip=flow.src_ip,
+                            protocol=proto_name(flow.protocol),
+                            dst_port=int(getattr(flow, "dst_port", 0)),
+                            fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
+                            pps=float(global_pkts) / GLOBAL_WINDOW,
+                            reason=ddos_reason,
+                            features=features[0].tolist() if features is not None else None
+                        )
+                        count, ttl_secs = enforcer.block_ip(sig)
+                        if count > 0:
+                            ttl_label = (
+                                f"{ttl_secs // 3600}h"
+                                if ttl_secs >= 3600
+                                else f"{ttl_secs // 60}m"
+                            )
+                            if now - last_log >= 0.05:
+                                last_log = now
+                                prefix = "[BLOCK]"
+                                print(
+                                    f"  {prefix:<10} {flow.src_ip:<16} "
+                                    f"{ddos_reason:<16} "
+                                    f"│ ban {ttl_label:<4} "
+                                    f"│ offense #{count}"
+                                )
+                    packet_window.pop(
+                        flow.src_ip,
+                        None
+                    )
+                    continue
+
                 if flow.bidirectional_packets >= 2:
                     features = extract_features(flow)
 
@@ -749,22 +829,22 @@ def main():
                     if benign_idx is not None and pred_val != benign_idx:
                         is_attack = True
                         class_name = label_encoder.inverse_transform([pred_val])[0]
-                        reason = f"XGBoost ({class_name})"
+                        reason = str(class_name)
                     elif benign_idx is None and pred_val != 0:
                         is_attack = True
-                        reason = f"XGBoost (Class {pred_val})"
+                        reason = f"Class {pred_val}"
 
                     if not is_attack:
                         anomaly_pred = iso_model.predict(features)
                         if anomaly_pred[0] == -1:
                             is_attack = True
-                            reason = "IsolationForest (Zero-Day Anomaly)"
+                            reason = "Zero-Day"
 
                     if is_attack:
                         if not enforcer.check_whitelist(flow.src_ip):
                             duration_s = max(
                                 float(flow.bidirectional_duration_ms) / 1000.0,
-                                1e-9
+                                0.001
                             )
 
                             sig = Signature(
@@ -785,11 +865,11 @@ def main():
                                 else f"{ttl_secs // 60}m"
                             )
 
-                            prefix = "[ZERO-DAY]" if "Zero-Day" in reason else "[BLOCK]"
+                            prefix = "[ZERO-DAY]" if reason == "Zero-Day" else "[BLOCK]"
 
                             print(
-                                f"  {prefix} {flow.src_ip:<20} "
-                                f"{reason:<35} "
+                                f"  {prefix:<10} {flow.src_ip:<16} "
+                                f"{reason:<16} "
                                 f"│ ban {ttl_label:<4} "
                                 f"│ offense #{count}"
                             )
@@ -800,6 +880,16 @@ def main():
                         )
                         continue
 
+                    else:
+                        if now - last_log >= 0.2:
+                            last_log = now
+                            prefix = "[PASS]"
+                            print(
+                                f"  {prefix:<10} {flow.src_ip:<16} "
+                                f"{'Benign':<16} "
+                                f"│ allow"
+                            )
+
                 threshold_exceeded = (
                     total_syn > SYN_THRESHOLD
                     or total_udp_icmp > UDP_ICMP_THRESHOLD
@@ -808,7 +898,7 @@ def main():
 
                 if threshold_exceeded:
                     if not enforcer.check_whitelist(flow.src_ip):
-                        rule_reason = "RATE_LIMIT (Volumetric)"
+                        rule_reason = "Rate limit"
                         rl_features = extract_features(flow)
 
                         sig = Signature(
@@ -834,9 +924,11 @@ def main():
                             else f"{ttl_secs // 60}m"
                         )
 
+                        prefix = "[BLOCK]"
+
                         print(
-                            f"  [BLOCK] {flow.src_ip:<20} "
-                            f"{rule_reason:<35} "
+                            f"  {prefix:<10} {flow.src_ip:<16} "
+                            f"{rule_reason:<16} "
                             f"│ ban {ttl_label:<4} "
                             f"│ offense #{count}"
                         )
@@ -848,7 +940,7 @@ def main():
 
     except KeyboardInterrupt:
         print(
-            "\n  [~] Ctrl+C received — cleaning up..."
+            "\n  [~] Cleaning up..."
         )
 
     except Exception as exc:

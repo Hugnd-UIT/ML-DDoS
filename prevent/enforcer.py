@@ -93,7 +93,7 @@ class Enforcer:
             ttl=86400
         )
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
         threading.Thread(
             target=self._memory_manager,
@@ -557,12 +557,6 @@ class Enforcer:
                 f.write(json.dumps(alert_entry) + '\n')
         except Exception:
             pass
-
-        print(
-            f"  [+] BLOCKED {ip_str} "
-            f"for {ttl_secs}s "
-            f"offense #{count}"
-        )
 
         return count, ttl_secs
 
