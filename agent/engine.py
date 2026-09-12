@@ -194,22 +194,54 @@ class Engine:
                     msgs.append({"role": "user", "content": "Observation: Rule violation - you must call at least 2 tools (e.g. read_alert, search_history) before issuing Final Answer. Please call a tool now."})
                     continue
 
-                match_ans = re.search(r"Final Answer:\s*([A-Z_]+)", response)
+                match_ans = re.search(
+                    r"Final Answer:\s*([A-Z_]+)",
+                    response
+                )
                 if match_ans:
                     decision = match_ans.group(1).strip()
 
-                match_reason = re.search(r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Action|Thought)|$)", response)
+                classification = "TRUE_POSITIVE" if decision == "KEEP_BLOCK" else "FALSE_POSITIVE"
+                match_class = re.search(
+                    r"Classification:\s*([A-Z_]+)",
+                    response
+                )
+                if match_class:
+                    classification = match_class.group(1).strip()
+
+                corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "DDoS")
+                match_attack = re.search(
+                    r"Corrected_Attack:\s*([^\n]+)",
+                    response
+                )
+                if match_attack:
+                    val = match_attack.group(1).strip()
+                    if val.upper() != "NONE":
+                        corrected_attack = val
+
+                match_reason = re.search(
+                    r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Classification|Corrected_Attack|Action|Thought)|$)",
+                    response
+                )
                 if match_reason:
                     reason = match_reason.group(1).strip()
                 else:
                     parts = response.split("Final Answer:")
                     reason = parts[0].strip() if len(parts) > 1 else response.strip()
 
+                if "misclass" in reason.lower() and classification == "TRUE_POSITIVE":
+                    classification = "MISCLASSIFIED_ATTACK"
+
                 if decision == "UNBLOCK":
-                    self.dispatch("execute_unban", alert.get("src_ip", ""))
+                    self.dispatch(
+                        "execute_unban",
+                        alert.get("src_ip", "")
+                    )
 
                 return {
                     "decision": decision,
+                    "classification": classification,
+                    "corrected_attack": corrected_attack,
                     "reason": reason,
                     "steps": step,
                     "history": history
@@ -218,23 +250,57 @@ class Engine:
             msgs.append({"role": "assistant", "content": response})
             msgs.append({"role": "user", "content": "Observation: Please proceed by specifying Thought: and Action: tool_name(argument), or Final Answer: and Reason:."})
 
-        msgs.append({"role": "user", "content": "Evidence gathering complete. Provide your Final Answer now (KEEP_BLOCK or UNBLOCK) with Reason:."})
+        msgs.append({"role": "user", "content": "Evidence gathering complete. Provide your Final Answer now (KEEP_BLOCK or UNBLOCK), Classification, Corrected_Attack, with Reason:."})
         response = self.query("", messages=msgs)
-        match_ans = re.search(r"Final Answer:\s*([A-Z_]+)", response)
+
+        match_ans = re.search(
+            r"Final Answer:\s*([A-Z_]+)",
+            response
+        )
         if match_ans:
             decision = match_ans.group(1).strip()
-        match_reason = re.search(r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Action|Thought)|$)", response)
+
+        classification = "TRUE_POSITIVE" if decision == "KEEP_BLOCK" else "FALSE_POSITIVE"
+        match_class = re.search(
+            r"Classification:\s*([A-Z_]+)",
+            response
+        )
+        if match_class:
+            classification = match_class.group(1).strip()
+
+        corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "DDoS")
+        match_attack = re.search(
+            r"Corrected_Attack:\s*([^\n]+)",
+            response
+        )
+        if match_attack:
+            val = match_attack.group(1).strip()
+            if val.upper() != "NONE":
+                corrected_attack = val
+
+        match_reason = re.search(
+            r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Classification|Corrected_Attack|Action|Thought)|$)",
+            response
+        )
         if match_reason:
             reason = match_reason.group(1).strip()
         else:
             parts = response.split("Final Answer:")
             reason = parts[0].strip() if len(parts) > 1 else response.strip()
 
+        if "misclass" in reason.lower() and classification == "TRUE_POSITIVE":
+            classification = "MISCLASSIFIED_ATTACK"
+
         if decision == "UNBLOCK":
-            self.dispatch("execute_unban", alert.get("src_ip", ""))
+            self.dispatch(
+                "execute_unban",
+                alert.get("src_ip", "")
+            )
 
         return {
             "decision": decision,
+            "classification": classification,
+            "corrected_attack": corrected_attack,
             "reason": reason,
             "steps": max_steps,
             "history": history

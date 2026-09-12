@@ -1231,6 +1231,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({
                     "status": "ok",
                     "decision": res.get("decision"),
+                    "classification": res.get("classification"),
+                    "corrected_attack": res.get("corrected_attack"),
                     "reason": res.get("reason"),
                     "steps": res.get("steps"),
                     "history": res.get("history")

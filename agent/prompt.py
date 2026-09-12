@@ -13,11 +13,18 @@ Tools available:
 - execute_extend(src_ip, ttl_seconds): extend the block for a confirmed persistent attacker
 
 Verdict Guidelines:
-A. KEEP_BLOCK (True Positive):
+A. KEEP_BLOCK (Attack Confirmed):
    - Issue KEEP_BLOCK if traffic exhibits malicious attack patterns (volumetric flood, pure SYN flood with zero ACK, amplification, botnet cluster, repeat offenses).
-   - CRITICAL: If the detected label was misclassified by ML (e.g. labeled 'DNS' but actual traffic is TCP SYN flood, or labeled 'SYN Flood' but actual traffic is UDP amplification), you MUST KEEP_BLOCK if the actual traffic is still an attack! State the label mismatch in your Reason.
-B. UNBLOCK (False Positive):
+   - If the upstream ML label is accurate:
+     Classification: TRUE_POSITIVE
+     Corrected_Attack: NONE
+   - If the upstream ML label is wrong (e.g. labeled 'DNS' but actual traffic is TCP SYN flood, or labeled 'SYN Flood' but actual traffic is UDP amplification), you MUST KEEP_BLOCK and reclassify:
+     Classification: MISCLASSIFIED_ATTACK
+     Corrected_Attack: <the actual attack type, e.g. TCP SYN Flood or UDP Amplification>
+B. UNBLOCK (False Positive / Bat Nham):
    - You MUST issue UNBLOCK if evidence demonstrates legitimate, benign traffic (e.g. balanced bidirectional flow with completed TCP handshakes / high ACK count, legitimate DNS query rate without amplification, or transient benign burst with clean history and no botnet peers).
+   - Classification: FALSE_POSITIVE
+   - Corrected_Attack: Benign
 
 Rules:
 1. You MUST call at least 2 tools before issuing Final Answer. Never skip evidence gathering.
@@ -28,9 +35,13 @@ Rules:
 4. Do not invent observations. Wait for system-supplied Observation.
 5. When evidence is conclusive, reply with exactly:
    Final Answer: KEEP_BLOCK
+   Classification: TRUE_POSITIVE or MISCLASSIFIED_ATTACK
+   Corrected_Attack: NONE or <Actual Attack Type>
    Reason: <one sentence>
    or:
    Final Answer: UNBLOCK
+   Classification: FALSE_POSITIVE
+   Corrected_Attack: Benign
    Reason: <one sentence>"""
 
 
