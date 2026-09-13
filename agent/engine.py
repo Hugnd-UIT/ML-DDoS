@@ -31,28 +31,68 @@ ENV_PATH = os.path.join(
     '.env'
 )
 
-def normalize_attack_label(val, fallback="SYN"):
+def normalize_attack_label(
+    val,
+    fallback="SYN"
+):
     if not val:
         return fallback
-    clean = str(val).replace('*', '')
-    clean = re.sub(
-        r'\s*\([^)]*\)',
-        '',
+    clean = str(val).replace('*', '').replace('`', '').strip()
+    paren_match = re.search(
+        r'\(([^)]+)\)',
         clean
+    )
+    if paren_match:
+        inner = paren_match.group(1).upper()
+        if "UDPLAG" in inner or "LAG" in inner:
+            return "UDP-Lag"
+        if "NTP" in inner:
+            return "NTP"
+        if "DNS" in inner:
+            return "DNS"
+        if "SNMP" in inner:
+            return "SNMP"
+        if "SSDP" in inner:
+            return "SSDP"
+        if "LDAP" in inner:
+            return "LDAP"
+        if "MSSQL" in inner or "SQL" in inner:
+            return "MSSQL"
+        if "NETBIOS" in inner or "BIOS" in inner:
+            return "NetBIOS"
+        if "PORTMAP" in inner:
+            return "Portmap"
+        if "TFTP" in inner:
+            return "TFTP"
+        if "HTTP" in inner:
+            return "HTTP"
+        if "ICMP" in inner or "PING" in inner:
+            return "ICMP"
+        if "SCAN" in inner:
+            return "Port Scan"
+        if "BRUTE" in inner:
+            return "Brute Force"
+        if "WEB" in inner:
+            return "Web Attack"
+        if "BOT" in inner:
+            return "Botnet"
+        if "SYN" in inner:
+            return "SYN"
+        if "UDP" in inner:
+            return "UDP"
+    clean_no_prefix = re.sub(
+        r'^(?:DDOS|ATTACK|TRAFFIC)[\s:\-_/]+',
+        '',
+        clean,
+        flags=re.IGNORECASE
     ).strip()
-    up = clean.upper().replace('-', '').replace('_', '').replace(' ', '')
+    up = clean_no_prefix.upper().replace('-', '').replace('_', '').replace(' ', '')
     if "UDPLAG" in up or "LAG" in up:
         return "UDP-Lag"
-    if "SYN" in up:
-        return "SYN"
-    if "UDP" in up:
-        return "UDP"
-    if "ICMP" in up or "PING" in up:
-        return "ICMP"
-    if "DNS" in up:
-        return "DNS"
     if "NTP" in up:
         return "NTP"
+    if "DNS" in up:
+        return "DNS"
     if "SNMP" in up:
         return "SNMP"
     if "SSDP" in up:
@@ -69,14 +109,22 @@ def normalize_attack_label(val, fallback="SYN"):
         return "TFTP"
     if "HTTP" in up:
         return "HTTP"
+    if "ICMP" in up or "PING" in up:
+        return "ICMP"
+    if "SCAN" in up:
+        return "Port Scan"
     if "BRUTE" in up:
         return "Brute Force"
     if "WEB" in up:
         return "Web Attack"
     if "BOT" in up:
         return "Botnet"
-    if "SCAN" in up:
-        return "Port Scan"
+    if "SYN" in up:
+        return "SYN"
+    if "UDP" in up:
+        return "UDP"
+    if "DDOS" in up:
+        return "DDoS"
     if "BENIGN" in up or "NORMAL" in up:
         return "Benign"
     return fallback
@@ -246,7 +294,7 @@ class Engine:
                     continue
 
                 match_ans = re.search(
-                    r"Final Answer:\s*([A-Z_]+)",
+                    r"Final Answer:\s*[*_]*([A-Z_]+)",
                     response
                 )
                 if match_ans:
@@ -254,7 +302,7 @@ class Engine:
 
                 classification = "TRUE_POSITIVE" if decision == "KEEP_BLOCK" else "FALSE_POSITIVE"
                 match_class = re.search(
-                    r"Classification:\s*([A-Z_]+)",
+                    r"Classification:\s*[*_]*([A-Z_]+)",
                     response
                 )
                 if match_class:
@@ -262,11 +310,11 @@ class Engine:
 
                 corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "SYN")
                 match_attack = re.search(
-                    r"Corrected_Attack:\s*([^\n]+)",
+                    r"Corrected_Attack:\s*[*_]*([^\n*]+)",
                     response
                 )
                 if match_attack:
-                    val = match_attack.group(1).strip().replace('*', '')
+                    val = match_attack.group(1).strip().replace('*', '').strip()
                     if val.upper() != "NONE":
                         corrected_attack = val
 
@@ -320,7 +368,7 @@ class Engine:
         response = self.query("", messages=msgs)
 
         match_ans = re.search(
-            r"Final Answer:\s*([A-Z_]+)",
+            r"Final Answer:\s*[*_]*([A-Z_]+)",
             response
         )
         if match_ans:
@@ -328,7 +376,7 @@ class Engine:
 
         classification = "TRUE_POSITIVE" if decision == "KEEP_BLOCK" else "FALSE_POSITIVE"
         match_class = re.search(
-            r"Classification:\s*([A-Z_]+)",
+            r"Classification:\s*[*_]*([A-Z_]+)",
             response
         )
         if match_class:
@@ -336,11 +384,11 @@ class Engine:
 
         corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "SYN")
         match_attack = re.search(
-            r"Corrected_Attack:\s*([^\n]+)",
+            r"Corrected_Attack:\s*[*_]*([^\n*]+)",
             response
         )
         if match_attack:
-            val = match_attack.group(1).strip().replace('*', '')
+            val = match_attack.group(1).strip().replace('*', '').strip()
             if val.upper() != "NONE":
                 corrected_attack = val
 
