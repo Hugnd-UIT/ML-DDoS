@@ -535,15 +535,16 @@ class Enforcer:
                 ttl_index
             ]
 
-            key = self.blacklist_map.Key(
-                ip_to_int(ip_str)
-            )
-
-            self.blacklist_map[key] = (
-                self.blacklist_map.Leaf(
-                    ttl_secs
+            if not ip_str.startswith("127."):
+                key = self.blacklist_map.Key(
+                    ip_to_int(ip_str)
                 )
-            )
+
+                self.blacklist_map[key] = (
+                    self.blacklist_map.Leaf(
+                        ttl_secs
+                    )
+                )
 
             self.ban_registry[
                 ip_str
@@ -607,9 +608,36 @@ class Enforcer:
         )
 
     def _memory_manager(self):
+        log_file = os.path.join(
+            os.path.dirname(__file__),
+            '..',
+            'logs',
+            'alerts.log'
+        )
         while True:
             try:
                 now = time.time()
+
+                if os.path.exists(log_file):
+                    try:
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                entry = json.loads(line)
+                                ip = entry.get("src_ip")
+                                audit = entry.get("audit")
+                                if ip and audit and ip in self.ban_registry:
+                                    decision = audit.get("decision")
+                                    cls = audit.get("classification")
+                                    if decision == "UNBLOCK" or cls in ("FALSE_POSITIVE", "BENIGN"):
+                                        print(
+                                            f"  [AUDIT] UNBANNED {ip} (LLM decision: FALSE_POSITIVE)"
+                                        )
+                                        self.unban_ip(ip)
+                    except Exception:
+                        pass
 
                 expired = [
                     ip
@@ -631,4 +659,4 @@ class Enforcer:
                     f"  [-] Memory Manager error: {exc}"
                 )
 
-            time.sleep(5)
+            time.sleep(2)

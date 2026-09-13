@@ -29,6 +29,12 @@ AUDITED_KEYS = set()
 AUDIT_LOCK = threading.Lock()
 ALERTS_LOCK = threading.Lock()
 
+try:
+    from agent.engine import normalize_attack_label
+except Exception:
+    def normalize_attack_label(val, fallback="SYN"):
+        return str(val) if val else fallback
+
 def get_engine():
     global _ENGINE
     if _ENGINE is None:
@@ -57,9 +63,10 @@ def update_alert_audit_in_log(src_ip, timestamp, audit_res):
                         target_ts = float(timestamp or 0)
                         if entry.get("src_ip") == src_ip and abs(ts - target_ts) < 0.001:
                             if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
-                                ca = str(audit_res["corrected_attack"]).replace('*', '')
-                                ca = re.sub(r'\s*\([^)]*\)', '', ca).strip()
-                                audit_res["corrected_attack"] = ca
+                                audit_res["corrected_attack"] = normalize_attack_label(
+                                    audit_res["corrected_attack"],
+                                    fallback=entry.get("reason", "SYN")
+                                )
                             entry["audit"] = audit_res
                             lines.append(json.dumps(entry) + '\n')
                             updated = True
@@ -140,13 +147,25 @@ def get_metrics():
                 reclassified_count += 1
                 corr = str(audit.get("corrected_attack") or "").strip()
                 if corr and not corr.lower().startswith("none"):
-                    r = corr
+                    r = normalize_attack_label(
+                        corr,
+                        fallback=a.get("reason", "SYN")
+                    )
                 else:
-                    r = a.get("reason") or "Unknown"
+                    r = normalize_attack_label(
+                        a.get("reason") or "SYN",
+                        fallback="SYN"
+                    )
             else:
-                r = a.get("reason") or "Unknown"
+                r = normalize_attack_label(
+                    a.get("reason") or "SYN",
+                    fallback="SYN"
+                )
         else:
-            r = a.get("reason") or "Unknown"
+            r = normalize_attack_label(
+                a.get("reason") or "SYN",
+                fallback="SYN"
+            )
 
         reasons[r] = reasons.get(r, 0) + 1
 
@@ -1318,9 +1337,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function cleanAttackLabel(str) {
             if (!str) return 'Unknown';
-            let s = String(str).replace(/[*_~`]/g, '');
-            s = s.replace(/\s*\([^)]*\)/g, '');
-            return s.trim() || 'Unknown';
+            let s = String(str).replace(/[*~`]/g, '');
+            s = s.replace(/\s*\([^)]*\)/g, '').trim();
+            const up = s.toUpperCase().replace(/[-_ ]/g, '');
+            if (up.includes('UDPLAG') || up.includes('LAG')) return 'UDP-Lag';
+            if (up.includes('SYN')) return 'SYN';
+            if (up.includes('UDP')) return 'UDP';
+            if (up.includes('ICMP') || up.includes('PING')) return 'ICMP';
+            if (up.includes('DNS')) return 'DNS';
+            if (up.includes('NTP')) return 'NTP';
+            if (up.includes('SNMP')) return 'SNMP';
+            if (up.includes('SSDP')) return 'SSDP';
+            if (up.includes('LDAP')) return 'LDAP';
+            if (up.includes('MSSQL') || up.includes('SQL')) return 'MSSQL';
+            if (up.includes('NETBIOS') || up.includes('BIOS')) return 'NetBIOS';
+            if (up.includes('PORTMAP')) return 'Portmap';
+            if (up.includes('TFTP')) return 'TFTP';
+            if (up.includes('HTTP')) return 'HTTP';
+            if (up.includes('BRUTE')) return 'Brute Force';
+            if (up.includes('WEB')) return 'Web Attack';
+            if (up.includes('BOT')) return 'Botnet';
+            if (up.includes('SCAN')) return 'Port Scan';
+            if (up.includes('BENIGN') || up.includes('NORMAL')) return 'Benign';
+            return s || 'Unknown';
         }
 
         function setTimeFilter(filterType, btn) {

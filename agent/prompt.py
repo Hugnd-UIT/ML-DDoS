@@ -12,15 +12,24 @@ Tools available:
 - execute_unban(src_ip): lift the block for a confirmed FP
 - execute_extend(src_ip, ttl_seconds): extend the block for a confirmed persistent attacker
 
+Allowed Attack Types:
+You MUST strictly classify traffic using ONLY one of the exact project labels below. You are STRICTLY FORBIDDEN from inventing or fabricating any other attack names (such as 'SYN+ACK Fragment Attack', etc.):
+- 14 DDoS attack types:
+  SYN, UDP, UDP-Lag, ICMP, DNS, NTP, SNMP, SSDP, LDAP, MSSQL, NetBIOS, Portmap, TFTP, HTTP
+- Other model labels:
+  Brute Force, Web Attack, Botnet, Port Scan
+- Legitimate / Benign traffic:
+  Benign
+
 Verdict Guidelines:
 A. KEEP_BLOCK (Attack Confirmed):
-   - Issue KEEP_BLOCK if traffic exhibits malicious attack patterns (volumetric flood, pure SYN flood with zero ACK, amplification, botnet cluster, repeat offenses).
+   - Issue KEEP_BLOCK if traffic exhibits malicious attack patterns (volumetric flood, pure SYN flood, reflection amplification, botnet cluster, repeat offenses).
    - If the upstream ML label is accurate:
      Classification: TRUE_POSITIVE
      Corrected_Attack: NONE
-   - If the upstream ML label is wrong (e.g. labeled 'DNS' but actual traffic is TCP SYN flood, or labeled 'SYN Flood' but actual traffic is UDP amplification), you MUST KEEP_BLOCK and reclassify:
+   - If the upstream ML label is wrong (e.g. labeled 'DNS' but actual traffic is SYN flood, or labeled 'SYN' but actual traffic is UDP), you MUST KEEP_BLOCK and reclassify strictly into one of the allowed labels:
      Classification: MISCLASSIFIED_ATTACK
-     Corrected_Attack: <the actual attack type, e.g. TCP SYN Flood or UDP Amplification>
+     Corrected_Attack: <MUST be one of: SYN, UDP, UDP-Lag, ICMP, DNS, NTP, SNMP, SSDP, LDAP, MSSQL, NetBIOS, Portmap, TFTP, HTTP, Brute Force, Web Attack, Botnet, Port Scan>
 B. UNBLOCK (False Positive / Bat Nham):
    - You MUST issue UNBLOCK if evidence demonstrates legitimate, benign traffic (e.g. balanced bidirectional flow with completed TCP handshakes / high ACK count, legitimate DNS query rate without amplification, or transient benign burst with clean history and no botnet peers).
    - Classification: FALSE_POSITIVE
@@ -36,13 +45,14 @@ Rules:
 5. When evidence is conclusive, reply with exactly:
    Final Answer: KEEP_BLOCK
    Classification: TRUE_POSITIVE or MISCLASSIFIED_ATTACK
-   Corrected_Attack: NONE or <Actual Attack Type>
+   Corrected_Attack: NONE or <one of the allowed attack names>
    Reason: <one sentence>
    or:
    Final Answer: UNBLOCK
    Classification: FALSE_POSITIVE
    Corrected_Attack: Benign
-   Reason: <one sentence>"""
+   Reason: <one sentence>
+CRITICAL: Corrected_Attack MUST strictly be either 'NONE', 'Benign', or one of: SYN, UDP, UDP-Lag, ICMP, DNS, NTP, SNMP, SSDP, LDAP, MSSQL, NetBIOS, Portmap, TFTP, HTTP, Brute Force, Web Attack, Botnet, Port Scan. Never invent custom names!"""
 
 
 def _tc_block(alert, packets=None):

@@ -760,13 +760,13 @@ def main():
 
                 if global_syn > GLOBAL_SYN_LIMIT:
                     is_ddos = True
-                    ddos_reason = "SYN Flood"
+                    ddos_reason = "SYN"
                 elif global_udp > GLOBAL_UDP_LIMIT:
                     is_ddos = True
-                    ddos_reason = "UDP Flood"
+                    ddos_reason = "UDP"
                 elif global_pkts > GLOBAL_TOTAL_LIMIT:
                     is_ddos = True
-                    ddos_reason = "Volumetric Flood"
+                    ddos_reason = "HTTP"
 
                 is_suspect = (
                     total_syn >= 10
@@ -901,14 +901,7 @@ def main():
                         continue
 
                     else:
-                        if now - last_log >= 0.2:
-                            last_log = now
-                            prefix = "[PASS]"
-                            print(
-                                f"  {prefix:<10} {flow.src_ip:<16} "
-                                f"{'Benign':<16} "
-                                f"│ allow"
-                            )
+                        pass
 
                 threshold_exceeded = (
                     total_syn > SYN_THRESHOLD
@@ -918,7 +911,12 @@ def main():
 
                 if threshold_exceeded:
                     if not enforcer.check_whitelist(flow.src_ip):
-                        rule_reason = "Rate limit"
+                        if total_syn > SYN_THRESHOLD:
+                            rule_reason = "SYN"
+                        elif total_udp_icmp > UDP_ICMP_THRESHOLD:
+                            rule_reason = "UDP" if flow.protocol == 17 else "ICMP"
+                        else:
+                            rule_reason = "HTTP"
                         rl_features = extract_features(flow)
 
                         sig = Signature(

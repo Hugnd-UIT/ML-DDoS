@@ -31,6 +31,57 @@ ENV_PATH = os.path.join(
     '.env'
 )
 
+def normalize_attack_label(val, fallback="SYN"):
+    if not val:
+        return fallback
+    clean = str(val).replace('*', '')
+    clean = re.sub(
+        r'\s*\([^)]*\)',
+        '',
+        clean
+    ).strip()
+    up = clean.upper().replace('-', '').replace('_', '').replace(' ', '')
+    if "UDPLAG" in up or "LAG" in up:
+        return "UDP-Lag"
+    if "SYN" in up:
+        return "SYN"
+    if "UDP" in up:
+        return "UDP"
+    if "ICMP" in up or "PING" in up:
+        return "ICMP"
+    if "DNS" in up:
+        return "DNS"
+    if "NTP" in up:
+        return "NTP"
+    if "SNMP" in up:
+        return "SNMP"
+    if "SSDP" in up:
+        return "SSDP"
+    if "LDAP" in up:
+        return "LDAP"
+    if "MSSQL" in up or "SQL" in up:
+        return "MSSQL"
+    if "NETBIOS" in up or "BIOS" in up:
+        return "NetBIOS"
+    if "PORTMAP" in up:
+        return "Portmap"
+    if "TFTP" in up:
+        return "TFTP"
+    if "HTTP" in up:
+        return "HTTP"
+    if "BRUTE" in up:
+        return "Brute Force"
+    if "WEB" in up:
+        return "Web Attack"
+    if "BOT" in up:
+        return "Botnet"
+    if "SCAN" in up:
+        return "Port Scan"
+    if "BENIGN" in up or "NORMAL" in up:
+        return "Benign"
+    return fallback
+
+
 class Engine:
 
     def __init__(self, config_file=None):
@@ -209,15 +260,23 @@ class Engine:
                 if match_class:
                     classification = match_class.group(1).strip()
 
-                corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "DDoS")
+                corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "SYN")
                 match_attack = re.search(
                     r"Corrected_Attack:\s*([^\n]+)",
                     response
                 )
                 if match_attack:
-                    val = match_attack.group(1).strip()
+                    val = match_attack.group(1).strip().replace('*', '')
                     if val.upper() != "NONE":
                         corrected_attack = val
+
+                if decision == "UNBLOCK":
+                    corrected_attack = "Benign"
+                else:
+                    corrected_attack = normalize_attack_label(
+                        corrected_attack,
+                        fallback=alert.get("reason", "SYN")
+                    )
 
                 match_reason = re.search(
                     r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Classification|Corrected_Attack|Action|Thought)|$)",
@@ -268,15 +327,23 @@ class Engine:
         if match_class:
             classification = match_class.group(1).strip()
 
-        corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "DDoS")
+        corrected_attack = "Benign" if decision == "UNBLOCK" else alert.get("reason", "SYN")
         match_attack = re.search(
             r"Corrected_Attack:\s*([^\n]+)",
             response
         )
         if match_attack:
-            val = match_attack.group(1).strip()
+            val = match_attack.group(1).strip().replace('*', '')
             if val.upper() != "NONE":
                 corrected_attack = val
+
+        if decision == "UNBLOCK":
+            corrected_attack = "Benign"
+        else:
+            corrected_attack = normalize_attack_label(
+                corrected_attack,
+                fallback=alert.get("reason", "SYN")
+            )
 
         match_reason = re.search(
             r"Reason:\s*([\s\S]+?)(?=\n\s*(?:Final Answer|Classification|Corrected_Attack|Action|Thought)|$)",

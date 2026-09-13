@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+if [ "$EUID" -ne 0 ]; then
+    exec sudo bash "$0" "$@"
+fi
+
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
 C_RED='\033[0;31m'
