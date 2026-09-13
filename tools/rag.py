@@ -176,28 +176,56 @@ KNOWLEDGE = {
 def _resolve_entry(attack):
     key = str(attack).strip()
     if key in KNOWLEDGE:
-        return KNOWLEDGE[key]
+        return key, KNOWLEDGE[key]
     clean_key = key.lower().replace(" ", "").replace("_", "").replace("-", "")
     for name, data in KNOWLEDGE.items():
         clean_name = name.lower().replace(" ", "").replace("_", "").replace("-", "")
-        if clean_name == clean_key or clean_name in clean_key or clean_key in clean_name:
-            return data
-    return KNOWLEDGE["Zero-Day"]
+        if clean_name == clean_key:
+            return name, data
+    import re
+    port_match = re.search(
+        r'\b(\d{1,5})\b',
+        key
+    )
+    if port_match:
+        target_port = int(port_match.group(1))
+        if target_port > 0 and target_port != 80:
+            for name, data in KNOWLEDGE.items():
+                if data.get("port") == target_port:
+                    return name, data
+    for name, data in KNOWLEDGE.items():
+        clean_name = name.lower().replace(" ", "").replace("_", "").replace("-", "")
+        if clean_name in clean_key:
+            return name, data
+    for name, data in KNOWLEDGE.items():
+        if key.lower() in data.get("mechanism", "").lower():
+            return name, data
+    return "Zero-Day", KNOWLEDGE["Zero-Day"]
 
-def lookup_mechanism(attack):
-    entry = _resolve_entry(attack)
-    return json.dumps(entry)
+def lookup_mechanism(
+    attack,
+    *extra
+):
+    query = f"{attack} {' '.join(str(x) for x in extra)}".strip()
+    name, entry = _resolve_entry(query)
+    payload = dict(entry)
+    payload["label"] = name
+    return json.dumps(payload)
 
 def lookup_mitigation(
     attack,
     device="ebpf"
 ):
-    entry = _resolve_entry(attack)
+    name, entry = _resolve_entry(attack)
     dev = device.lower()
     if dev in entry:
         return entry[dev]
     return entry.get("ebpf", "")
 
-def lookup_description(attack):
-    entry = _resolve_entry(attack)
-    return entry.get("mechanism", "")
+def lookup_description(
+    attack,
+    *extra
+):
+    query = f"{attack} {' '.join(str(x) for x in extra)}".strip()
+    name, entry = _resolve_entry(query)
+    return f"[{name}] {entry.get('mechanism', '')}"
