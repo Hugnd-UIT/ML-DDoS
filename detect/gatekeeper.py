@@ -13,8 +13,6 @@ import joblib
 import numpy as np
 import xgboost as xgb
 
-from collections import deque
-from cachetools import TTLCache
 from nfstream import NFStreamer
 
 FEATURES = [
@@ -102,16 +100,6 @@ XDP_PATH = os.path.join(
     'xdp.c'
 )
 
-
-WINDOW_SECONDS = 5
-SYN_THRESHOLD = 200
-UDP_ICMP_THRESHOLD = 1000
-TOTAL_THRESHOLD = 3000
-
-GLOBAL_WINDOW = 2
-GLOBAL_SYN_LIMIT = 500
-GLOBAL_UDP_LIMIT = 1000
-GLOBAL_TOTAL_LIMIT = 2000
 
 
 def parse_args():
@@ -633,17 +621,6 @@ def main():
         f"  [+] IPs: {', '.join(sorted(local_ips))}"
     )
 
-    packet_window = TTLCache(
-        maxsize=100_000,
-        ttl=60
-    )
-
-    global_queue = deque()
-    global_syn = 0
-    global_udp = 0
-    global_pkts = 0
-    last_log = 0.0
-
     print()
     print(
         "  ╔" + "═" * 65 + "╗"
@@ -675,110 +652,45 @@ def main():
                 if enforcer.check_blacklist(flow.src_ip):
                     continue
 
-                now = time.time()
-                syn_count = flow.bidirectional_syn_packets
-                total_count = flow.bidirectional_packets
+                features = extract_features(flow)
 
-                if flow.protocol in (1, 17):
-                    udp_icmp_count = total_count
+                if hasattr(xgb_model, 'predict') and 'Booster' in type(xgb_model).__name__:
+                    dmat = xgb.DMatrix(
+                        features,
+                        feature_names=FEATURES
+                    )
+                    probs = xgb_model.predict(dmat)
+                    pred_val = int(np.argmax(probs, axis=1)[0])
                 else:
-                    udp_icmp_count = 0
+                    prediction = xgb_model.predict(features)
+                    if isinstance(prediction, (list, np.ndarray)):
+                        pred_val = int(prediction[0])
+                    else:
+                        pred_val = int(prediction)
 
-                global_queue.append(
-                    (
-                        now,
-                        syn_count,
-                        udp_icmp_count,
-                        total_count
-                    )
-                )
-                global_syn += syn_count
-                global_udp += udp_icmp_count
-                global_pkts += total_count
+                is_attack = False
+                reason = ""
 
-                while global_queue and now - global_queue[0][0] > GLOBAL_WINDOW:
-                    old_ts, old_syn, old_udp, old_pkts = global_queue.popleft()
-                    global_syn -= old_syn
-                    global_udp -= old_udp
-                    global_pkts -= old_pkts
+                if benign_idx is not None and pred_val != benign_idx:
+                    is_attack = True
+                    class_name = label_encoder.inverse_transform([pred_val])[0]
+                    reason = str(class_name)
+                elif benign_idx is None and pred_val != 0:
+                    is_attack = True
+                    reason = f"Class {pred_val}"
 
-                if flow.src_ip not in packet_window:
-                    packet_window[flow.src_ip] = []
+                if not is_attack:
+                    anomaly_pred = iso_model.predict(features)
+                    if anomaly_pred[0] == -1:
+                        is_attack = True
+                        reason = "Zero-Day"
 
-                window = packet_window[flow.src_ip]
-                window.append(
-                    (
-                        now,
-                        syn_count,
-                        udp_icmp_count,
-                        total_count
-                    )
-                )
-
-                filtered = [
-                    (
-                        ts,
-                        syn,
-                        u_i,
-                        pkts
-                    )
-                    for (
-                        ts,
-                        syn,
-                        u_i,
-                        pkts
-                    ) in window
-                    if now - ts <= WINDOW_SECONDS
-                ]
-
-                if not filtered:
-                    packet_window.pop(
-                        flow.src_ip,
-                        None
-                    )
-                    continue
-
-                packet_window[flow.src_ip] = filtered
-
-                total_syn = sum(
-                    syn
-                    for _, syn, _, _ in filtered
-                )
-
-                total_udp_icmp = sum(
-                    u_i
-                    for _, _, u_i, _ in filtered
-                )
-
-                total_pkts = sum(
-                    pkts
-                    for _, _, _, pkts in filtered
-                )
-
-                is_ddos = False
-                ddos_reason = ""
-
-                if global_syn > GLOBAL_SYN_LIMIT:
-                    is_ddos = True
-                    ddos_reason = "SYN"
-                elif global_udp > GLOBAL_UDP_LIMIT:
-                    is_ddos = True
-                    ddos_reason = "UDP"
-                elif global_pkts > GLOBAL_TOTAL_LIMIT:
-                    is_ddos = True
-                    ddos_reason = "HTTP"
-
-                is_suspect = (
-                    total_syn >= 10
-                    or total_udp_icmp >= 20
-                    or total_pkts >= 30
-                    or (flow.src2dst_packets >= 5 and flow.dst2src_packets == 0)
-                )
-
-                if is_ddos and is_suspect:
+                if is_attack:
                     if not enforcer.check_whitelist(flow.src_ip):
-                        features = extract_features(flow)
-                        _dur_s = max(float(getattr(flow, 'bidirectional_duration_ms', 1.0)) / 1000.0, 0.001)
+                        duration_s = max(
+                            float(getattr(flow, 'bidirectional_duration_ms', 1.0)) / 1000.0,
+                            0.001
+                        )
                         _fwd_pkts = float(getattr(flow, 'src2dst_packets', 0))
                         _bwd_pkts = float(getattr(flow, 'dst2src_packets', 0))
                         _total_bytes = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
@@ -787,154 +699,19 @@ def main():
                             protocol=proto_name(flow.protocol),
                             dst_port=int(getattr(flow, "dst_port", 0)),
                             fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                            pps=float(global_pkts) / GLOBAL_WINDOW,
-                            reason=ddos_reason,
-                            features=features[0].tolist() if features is not None else None,
+                            pps=float(getattr(flow, 'bidirectional_packets', 1)) / duration_s,
+                            reason=reason,
+                            features=features[0].tolist(),
                             fwd_pkts=int(_fwd_pkts),
                             bwd_pkts=int(_bwd_pkts),
                             syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
                             ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
                             rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
                             flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
-                            flow_bytes_s=_total_bytes / _dur_s
-                        )
-                        count, ttl_secs = enforcer.block_ip(sig)
-                        if count > 0:
-                            ttl_label = (
-                                f"{ttl_secs // 3600}h"
-                                if ttl_secs >= 3600
-                                else f"{ttl_secs // 60}m"
-                            )
-                            if now - last_log >= 0.05:
-                                last_log = now
-                                prefix = "[BLOCK]"
-                                print(
-                                    f"  {prefix:<10} {flow.src_ip:<16} "
-                                    f"{ddos_reason:<16} "
-                                    f"│ ban {ttl_label:<4} "
-                                    f"│ offense #{count}"
-                                )
-                    packet_window.pop(
-                        flow.src_ip,
-                        None
-                    )
-                    continue
-
-                if flow.bidirectional_packets >= 2:
-                    features = extract_features(flow)
-
-                    if hasattr(xgb_model, 'predict') and 'Booster' in type(xgb_model).__name__:
-                        dmat = xgb.DMatrix(features, feature_names=FEATURES)
-                        probs = xgb_model.predict(dmat)
-                        pred_val = int(np.argmax(probs, axis=1)[0])
-                    else:
-                        prediction = xgb_model.predict(features)
-                        if isinstance(prediction, (list, np.ndarray)):
-                            pred_val = int(prediction[0])
-                        else:
-                            pred_val = int(prediction)
-
-                    is_attack = False
-                    reason = ""
-
-                    if benign_idx is not None and pred_val != benign_idx:
-                        is_attack = True
-                        class_name = label_encoder.inverse_transform([pred_val])[0]
-                        reason = str(class_name)
-                    elif benign_idx is None and pred_val != 0:
-                        is_attack = True
-                        reason = f"Class {pred_val}"
-
-                    if not is_attack:
-                        anomaly_pred = iso_model.predict(features)
-                        if anomaly_pred[0] == -1:
-                            is_attack = True
-                            reason = "Zero-Day"
-
-                    if is_attack:
-                        if not enforcer.check_whitelist(flow.src_ip):
-                            duration_s = max(
-                                float(flow.bidirectional_duration_ms) / 1000.0,
-                                0.001
-                            )
-                            _fwd_pkts2 = float(getattr(flow, 'src2dst_packets', 0))
-                            _bwd_pkts2 = float(getattr(flow, 'dst2src_packets', 0))
-                            _total_bytes2 = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
-                            sig = Signature(
-                                src_ip=flow.src_ip,
-                                protocol=proto_name(flow.protocol),
-                                dst_port=int(getattr(flow, "dst_port", 0)),
-                                fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                                pps=float(flow.bidirectional_packets) / duration_s,
-                                reason=reason,
-                                features=features[0].tolist(),
-                                fwd_pkts=int(_fwd_pkts2),
-                                bwd_pkts=int(_bwd_pkts2),
-                                syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
-                                ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
-                                rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
-                                flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
-                                flow_bytes_s=_total_bytes2 / duration_s
-                            )
-
-                            count, ttl_secs = enforcer.block_ip(sig)
-
-                            ttl_label = (
-                                f"{ttl_secs // 3600}h"
-                                if ttl_secs >= 3600
-                                else f"{ttl_secs // 60}m"
-                            )
-
-                            prefix = "[ZERO-DAY]" if reason == "Zero-Day" else "[BLOCK]"
-
-                            print(
-                                f"  {prefix:<10} {flow.src_ip:<16} "
-                                f"{reason:<16} "
-                                f"│ ban {ttl_label:<4} "
-                                f"│ offense #{count}"
-                            )
-
-                        packet_window.pop(
-                            flow.src_ip,
-                            None
-                        )
-                        continue
-
-                    else:
-                        pass
-
-                threshold_exceeded = (
-                    total_syn > SYN_THRESHOLD
-                    or total_udp_icmp > UDP_ICMP_THRESHOLD
-                    or total_pkts > TOTAL_THRESHOLD
-                )
-
-                if threshold_exceeded:
-                    if not enforcer.check_whitelist(flow.src_ip):
-                        if total_syn > SYN_THRESHOLD:
-                            rule_reason = "SYN"
-                        elif total_udp_icmp > UDP_ICMP_THRESHOLD:
-                            rule_reason = "UDP" if flow.protocol == 17 else "ICMP"
-                        else:
-                            rule_reason = "HTTP"
-                        rl_features = extract_features(flow)
-
-                        sig = Signature(
-                            src_ip=flow.src_ip,
-                            protocol=proto_name(flow.protocol),
-                            dst_port=int(getattr(flow, "dst_port", 0)),
-                            fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                            pps=total_pkts / WINDOW_SECONDS,
-                            reason=rule_reason,
-                            features=rl_features[0].tolist() if rl_features is not None else None
+                            flow_bytes_s=_total_bytes / duration_s
                         )
 
                         count, ttl_secs = enforcer.block_ip(sig)
-
-                        packet_window.pop(
-                            flow.src_ip,
-                            None
-                        )
 
                         ttl_label = (
                             f"{ttl_secs // 3600}h"
@@ -942,11 +719,11 @@ def main():
                             else f"{ttl_secs // 60}m"
                         )
 
-                        prefix = "[BLOCK]"
+                        prefix = "[ZERO-DAY]" if reason == "Zero-Day" else "[BLOCK]"
 
                         print(
                             f"  {prefix:<10} {flow.src_ip:<16} "
-                            f"{rule_reason:<16} "
+                            f"{reason:<16} "
                             f"│ ban {ttl_label:<4} "
                             f"│ offense #{count}"
                         )

@@ -335,16 +335,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         .metric-pill {
-            background: var(--surface-card);
-            border: 1px solid var(--border-default);
+            background: linear-gradient(135deg, rgba(16, 26, 46, 0.65) 0%, rgba(8, 14, 26, 0.8) 100%);
+            backdrop-filter: blur(16px) saturate(180%);
+            -webkit-backdrop-filter: blur(16px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-top: 1px solid rgba(255, 255, 255, 0.22);
+            border-left: 1px solid rgba(255, 255, 255, 0.14);
             border-radius: var(--radius-md);
             padding: 16px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 12px;
-            box-shadow: var(--shadow-card);
-            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 20px rgba(255, 255, 255, 0.015);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
             white-space: nowrap;
             min-width: 0;
             position: relative;
@@ -358,26 +362,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             top: 0;
             left: 0;
             right: 0;
+            height: 52%;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.015) 70%, transparent 100%);
+            border-radius: var(--radius-md) var(--radius-md) 0 0;
+            pointer-events: none;
+        }
+
+        .metric-pill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -130%;
+            width: 75%;
             height: 100%;
-            background: radial-gradient(circle at 50% 0%, var(--mp-glow, rgba(255, 255, 255, 0.08)) 0%, transparent 70%);
-            opacity: 0;
-            transition: opacity 0.3s ease;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+            transform: skewX(-25deg);
+            transition: left 0.75s cubic-bezier(0.16, 1, 0.3, 1);
             pointer-events: none;
         }
 
         .metric-pill:hover {
-            transform: translateY(-5px) scale(1.015);
+            transform: translateY(-5px) scale(1.018);
             border-color: var(--mp-accent, var(--brand-primary)) !important;
-            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 0 24px var(--mp-glow, rgba(255, 74, 20, 0.3));
+            border-top-color: rgba(255, 255, 255, 0.45) !important;
+            box-shadow: 0 18px 42px rgba(0, 0, 0, 0.7), 0 0 28px var(--mp-glow, rgba(255, 74, 20, 0.35)), inset 0 1px 1px rgba(255, 255, 255, 0.35);
         }
 
-        .metric-pill:hover::before {
-            opacity: 1;
+        .metric-pill:hover::after {
+            left: 160%;
         }
 
         .metric-pill:hover .mp-value {
             transform: scale(1.05);
-            filter: drop-shadow(0 0 10px var(--mp-accent, var(--brand-primary)));
+            filter: drop-shadow(0 0 12px var(--mp-accent, var(--brand-primary)));
         }
 
         .metric-pill:nth-child(1) {
@@ -436,15 +453,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         .telemetry-card {
-            background: var(--surface-card);
-            border: 1px solid var(--border-default);
+            background: linear-gradient(135deg, rgba(16, 26, 46, 0.65) 0%, rgba(8, 14, 26, 0.8) 100%);
+            backdrop-filter: blur(16px) saturate(180%);
+            -webkit-backdrop-filter: blur(16px) saturate(180%);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-top: 1px solid rgba(255, 255, 255, 0.22);
+            border-left: 1px solid rgba(255, 255, 255, 0.14);
             border-radius: var(--radius-md);
             padding: 16px 20px;
             display: flex;
             flex-direction: column;
             gap: 4px;
-            box-shadow: var(--shadow-card);
-            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 20px rgba(255, 255, 255, 0.015);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
             position: relative;
             overflow: hidden;
             cursor: pointer;
@@ -456,25 +477,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             top: 0;
             left: 0;
             right: 0;
+            height: 52%;
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.015) 70%, transparent 100%);
+            border-radius: var(--radius-md) var(--radius-md) 0 0;
+            pointer-events: none;
+        }
+
+        .telemetry-card::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -130%;
+            width: 75%;
             height: 100%;
-            background: radial-gradient(circle at 50% 0%, var(--card-glow, rgba(255, 255, 255, 0.08)) 0%, transparent 70%);
-            opacity: 0;
-            transition: opacity 0.3s ease;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+            transform: skewX(-25deg);
+            transition: left 0.75s cubic-bezier(0.16, 1, 0.3, 1);
             pointer-events: none;
         }
 
         .telemetry-card:hover {
-            transform: translateY(-6px) scale(1.015);
+            transform: translateY(-5px) scale(1.018);
             border-color: var(--card-accent, #38bdf8) !important;
-            box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 0 26px var(--card-glow, rgba(56, 189, 248, 0.25));
+            border-top-color: rgba(255, 255, 255, 0.45) !important;
+            box-shadow: 0 18px 42px rgba(0, 0, 0, 0.7), 0 0 28px var(--card-glow, rgba(56, 189, 248, 0.35)), inset 0 1px 1px rgba(255, 255, 255, 0.35);
         }
 
-        .telemetry-card:hover::before {
-            opacity: 1;
+        .telemetry-card:hover::after {
+            left: 160%;
         }
 
         .telemetry-card:hover .tc-value {
-            filter: drop-shadow(0 0 10px var(--card-accent, #38bdf8));
+            filter: drop-shadow(0 0 12px var(--card-accent, #38bdf8));
             transform: scale(1.05);
         }
 

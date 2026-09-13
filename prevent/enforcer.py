@@ -632,9 +632,6 @@ class Enforcer:
                                     decision = audit.get("decision")
                                     cls = audit.get("classification")
                                     if decision == "UNBLOCK" or cls in ("FALSE_POSITIVE", "BENIGN"):
-                                        print(
-                                            f"  [AUDIT] UNBANNED {ip} (LLM decision: FALSE_POSITIVE)"
-                                        )
                                         self.unban_ip(ip)
                     except Exception:
                         pass
