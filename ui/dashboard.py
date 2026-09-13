@@ -45,7 +45,11 @@ def get_engine():
             _ENGINE = None
     return _ENGINE
 
-def update_alert_audit_in_log(src_ip, timestamp, audit_res):
+def update_alert_audit_in_log(
+    src_ip,
+    timestamp,
+    audit_res
+):
     if not os.path.exists(LOG_PATH):
         return
     with ALERTS_LOCK:
@@ -53,27 +57,34 @@ def update_alert_audit_in_log(src_ip, timestamp, audit_res):
             lines = []
             updated = False
             with open(LOG_PATH, 'r', encoding='utf-8') as f:
-                for line in f:
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        entry = json.loads(text)
-                        ts = float(entry.get("timestamp", 0) or 0)
-                        target_ts = float(timestamp or 0)
-                        if entry.get("src_ip") == src_ip and abs(ts - target_ts) < 0.001:
-                            if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
-                                audit_res["corrected_attack"] = normalize_attack_label(
-                                    audit_res["corrected_attack"],
-                                    fallback=entry.get("reason", "SYN")
-                                )
-                            entry["audit"] = audit_res
-                            lines.append(json.dumps(entry) + '\n')
-                            updated = True
-                        else:
-                            lines.append(text + '\n')
-                    except Exception:
-                        lines.append(line)
+                raw_lines = f.readlines()
+            target_ts = float(timestamp or 0)
+            for line in raw_lines:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    entry = json.loads(text)
+                    ts = float(entry.get("timestamp", 0) or 0)
+                    matches = False
+                    if entry.get("src_ip") == src_ip:
+                        if target_ts > 0:
+                            matches = abs(ts - target_ts) < 0.05
+                        elif not entry.get("audit"):
+                            matches = True
+                    if matches and not updated:
+                        if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
+                            audit_res["corrected_attack"] = normalize_attack_label(
+                                audit_res["corrected_attack"],
+                                fallback=entry.get("reason", "SYN")
+                            )
+                        entry["audit"] = audit_res
+                        lines.append(json.dumps(entry) + '\n')
+                        updated = True
+                    else:
+                        lines.append(text + '\n')
+                except Exception:
+                    lines.append(line)
             if updated:
                 with open(LOG_PATH, 'w', encoding='utf-8') as f:
                     f.writelines(lines)
@@ -1079,121 +1090,358 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .reason-cell {
             position: relative;
             cursor: pointer;
-            overflow: visible !important;
             text-align: left !important;
+            padding: 7px 12px !important;
+        }
+
+        .reason-box {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+            cursor: pointer;
+            box-sizing: border-box;
+            max-width: 100%;
+        }
+
+        .reason-cell:hover .reason-box,
+        .reason-box:hover {
+            background: rgba(255, 74, 20, 0.09);
+            border-color: rgba(255, 74, 20, 0.45);
+            box-shadow: 0 0 16px rgba(255, 74, 20, 0.2), inset 0 0 10px rgba(255, 74, 20, 0.06);
+            transform: translateX(2px);
         }
 
         .reason-text-truncate {
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            color: var(--text-secondary);
-            font-size: 13px;
+            color: #cbd5e1;
+            font-size: 12.5px;
             font-family: var(--font-sans);
             transition: color 0.15s ease;
-            width: 100%;
+            flex: 1;
+            min-width: 0;
             display: block;
             text-align: left;
         }
 
-        .reason-cell:hover .reason-text-truncate {
-            color: #f8fafc;
+        .reason-cell:hover .reason-text-truncate,
+        .reason-box:hover .reason-text-truncate {
+            color: #ffffff;
         }
 
-        .reason-tooltip {
-            visibility: hidden;
-            opacity: 0;
-            position: absolute;
-            bottom: calc(100% + 10px);
-            right: 0;
-            width: 480px;
-            background: linear-gradient(180deg, rgba(13, 20, 36, 0.98) 0%, rgba(6, 10, 18, 0.98) 100%);
+        .reason-arrow-icon {
+            color: #64748b;
+            flex-shrink: 0;
+            transition: transform 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+            opacity: 0.7;
+        }
+
+        .reason-cell:hover .reason-arrow-icon,
+        .reason-box:hover .reason-arrow-icon {
+            color: #ff6b3d;
+            transform: translateX(3px);
+            opacity: 1;
+        }
+
+
+        .tao-timeline {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 8px;
+        }
+
+        .tao-step-card {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            position: relative;
+        }
+
+        .tao-step-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 11px;
+            font-weight: 700;
+            color: #94a3b8;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            padding-bottom: 4px;
+        }
+
+        .tao-step-num {
+            color: #ff6b3d;
+            font-family: var(--font-mono);
+            letter-spacing: 0.5px;
+            font-weight: 800;
+        }
+
+        .tao-thought-block {
+            background: rgba(168, 85, 247, 0.07);
+            border-left: 3px solid #a855f7;
+            border-radius: 4px;
+            padding: 8px 10px;
+        }
+
+        .tao-thought-label {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            color: #c084fc;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-bottom: 4px;
+        }
+
+        .tao-thought-text {
+            font-size: 12px;
+            line-height: 1.55;
+            color: #e2e8f0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            text-align: justify;
+            text-justify: inter-word;
+        }
+
+        .tao-action-block {
+            background: rgba(6, 182, 212, 0.07);
+            border-left: 3px solid #06b6d4;
+            border-radius: 4px;
+            padding: 8px 10px;
+        }
+
+        .tao-action-label {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            color: #22d3ee;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-bottom: 4px;
+        }
+
+        .tao-action-code {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: #67e8f9;
+            background: rgba(0, 0, 0, 0.35);
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(6, 182, 212, 0.2);
+            display: inline-block;
+            word-break: break-all;
+        }
+
+        .tao-obs-block {
+            background: rgba(16, 185, 129, 0.07);
+            border-left: 3px solid #10b981;
+            border-radius: 4px;
+            padding: 8px 10px;
+        }
+
+        .tao-obs-label {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            color: #34d399;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-bottom: 4px;
+        }
+
+        .tao-obs-text {
+            font-family: var(--font-mono);
+            font-size: 11.5px;
+            color: #cbd5e1;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 6px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            max-height: 120px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .tao-verdict-card {
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.9) 100%);
+            border: 1px solid rgba(255, 74, 20, 0.35);
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .tao-verdict-title {
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            color: var(--brand-primary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .tao-verdict-badges {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .tao-verdict-reason {
+            font-size: 12.5px;
+            line-height: 1.6;
+            color: #f1f5f9;
+            background: rgba(0, 0, 0, 0.25);
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            text-align: justify;
+            text-justify: inter-word;
+        }
+
+        .tao-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            z-index: 999999;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            animation: fadeInModal 0.18s ease;
+        }
+
+        .tao-modal-overlay.active {
+            display: flex;
+        }
+
+        @keyframes fadeInModal {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .tao-modal-container {
+            background: linear-gradient(180deg, rgba(13, 20, 36, 0.98) 0%, rgba(6, 10, 18, 0.99) 100%);
             border: 1px solid rgba(255, 74, 20, 0.45);
-            box-shadow: 0 20px 48px rgba(0, 0, 0, 0.9), 0 0 30px rgba(255, 74, 20, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(20px);
-            border-radius: 10px;
-            padding: 14px 18px;
-            z-index: 9999;
-            pointer-events: none;
-            transition: opacity 0.22s cubic-bezier(0.16, 1, 0.3, 1), transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.22s ease;
-            transform: translateY(10px) scale(0.97);
+            box-shadow: 0 25px 70px rgba(0, 0, 0, 0.95), 0 0 35px rgba(255, 74, 20, 0.25);
+            width: 720px;
+            max-width: 95vw;
+            max-height: 85vh;
+            border-radius: 14px;
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            animation: scaleInModal 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
         }
 
-        .reason-tooltip::before {
+        @keyframes scaleInModal {
+            from { transform: scale(0.95) translateY(10px); opacity: 0; }
+            to { transform: scale(1) translateY(0); opacity: 1; }
+        }
+
+        .tao-modal-container::before {
             content: '';
             position: absolute;
             top: 0;
             left: 0;
             right: 0;
-            height: 2px;
-            background: linear-gradient(90deg, #ff4a14, #ff6b3d, #f59e0b, #10b981);
-            box-shadow: 0 0 10px rgba(255, 74, 20, 0.8);
+            height: 3px;
+            background: linear-gradient(90deg, #ff4a14, #ff6b3d, #818cf8, #06b6d4, #10b981);
+            box-shadow: 0 0 12px rgba(255, 74, 20, 0.8);
         }
 
-        .reason-cell:hover .reason-tooltip {
-            visibility: visible;
-            opacity: 1;
-            transform: translateY(0) scale(1);
-        }
-
-        tr:nth-child(-n+2) .reason-tooltip {
-            bottom: auto;
-            top: calc(100% + 10px);
-            transform: translateY(-10px) scale(0.97);
-        }
-        tr:nth-child(-n+2):hover .reason-tooltip {
-            transform: translateY(0) scale(1);
-        }
-
-        .reason-tooltip-header {
+        .tao-modal-header {
+            padding: 16px 22px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            margin-bottom: 8px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.02);
         }
 
-        .reason-tooltip-title {
-            font-size: 11px;
+        .tao-modal-title {
+            font-size: 13px;
             font-weight: 800;
             text-transform: uppercase;
             letter-spacing: 0.8px;
             color: var(--brand-primary);
             display: flex;
             align-items: center;
-            gap: 7px;
+            gap: 8px;
         }
 
-        .reason-tooltip-title svg {
-            animation: pulseRadar 2.2s infinite ease-in-out;
-        }
-        @keyframes pulseRadar {
-            0%, 100% { transform: scale(1); filter: drop-shadow(0 0 3px #ff4a14); }
-            50% { transform: scale(1.18); filter: drop-shadow(0 0 8px #ff4a14); }
-        }
-
-        .reason-tooltip-meta {
-            font-size: 11px;
-            color: #ff6b3d;
+        .tao-modal-subtitle {
+            font-size: 11.5px;
+            color: #94a3b8;
             font-family: var(--font-mono);
-            background: rgba(255, 74, 20, 0.12);
-            border: 1px solid rgba(255, 74, 20, 0.3);
-            border-radius: 4px;
-            padding: 2px 8px;
+            margin-top: 4px;
         }
 
-        .reason-tooltip-body {
-            font-size: 12.5px;
-            line-height: 1.65;
+        .tao-modal-close {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.12);
             color: #e2e8f0;
-            font-family: var(--font-sans);
-            white-space: normal;
-            word-break: break-word;
-            text-align: justify;
-            text-justify: inter-word;
-            padding-top: 2px;
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 700;
+            transition: all 0.2s ease;
+        }
+
+        .tao-modal-close:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: #ef4444;
+            color: #ef4444;
+            transform: scale(1.08);
+        }
+
+        .tao-modal-body {
+            padding: 18px 22px;
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .tao-modal-body::-webkit-scrollbar {
+            width: 6px;
+        }
+        .tao-modal-body::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.3);
+        }
+        .tao-modal-body::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 4px;
+        }
+        .tao-modal-body::-webkit-scrollbar-thumb:hover {
+            background: #ff4a14;
         }
     </style>
 </head>
@@ -1368,6 +1616,126 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let barChart = null;
         let pieChart = null;
         let pieOtherBreakdown = [];
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function buildTaoTooltipHtml(a) {
+            const proto = (a.protocol || 'TCP').toUpperCase();
+            const port = a.dst_port || 0;
+            const pps = a.pps ? Number(a.pps).toFixed(1) : '0';
+            const audit = a.audit;
+
+            if (!audit) {
+                return `
+                    <div class="tao-pending-box" style="margin-top: 0;">
+                        <span class="status-dot-pulse"></span>
+                        <div style="font-weight: 700; color: #f8fafc; font-size: 13px;">Analyzing Incursion...</div>
+                        <div style="font-size: 11.5px; color: #94a3b8;">Waiting for forensic analysis result...</div>
+                    </div>
+                `;
+            }
+
+            const history = Array.isArray(audit.history) ? audit.history : [];
+            const steps = [];
+            let cur = { thought: '', action: '', observation: '' };
+
+            for (let i = 0; i < history.length; i++) {
+                const item = history[i] || {};
+                const role = item.role || '';
+                const content = (item.content || '').trim();
+
+                if (role === 'assistant') {
+                    const tm = content.match(/(?:Thought|Suy nghĩ):\s*([\s\S]+?)(?=(?:\n\s*(?:Action|Hành động|Final Answer|Kết luận|Classification|Corrected_Attack|Reason))|$)/i);
+                    const am = content.match(/(?:Action|Hành động):\s*([^\n]+)/i);
+                    if (tm) cur.thought = tm[1].trim();
+                    if (am) cur.action = am[1].trim();
+                    if (!am && !tm && content) {
+                        cur.thought = content;
+                    }
+                } else if (role === 'user') {
+                    const obs = content.replace(/^(?:Observation|Quan sát):\s*/i, '').trim();
+                    cur.observation = obs;
+                    steps.push({ ...cur, stepNum: steps.length + 1 });
+                    cur = { thought: '', action: '', observation: '' };
+                }
+            }
+            if (cur.thought || cur.action) {
+                steps.push({ ...cur, stepNum: steps.length + 1 });
+            }
+
+            const dec = audit.decision || (audit.classification === 'FALSE_POSITIVE' ? 'UNBLOCK' : 'KEEP_BLOCK');
+            const cls = audit.classification || (dec === 'UNBLOCK' ? 'FALSE_POSITIVE' : 'TRUE_POSITIVE');
+            const corr = audit.corrected_attack || (dec === 'UNBLOCK' ? 'Benign' : (a.reason || 'DDoS'));
+            const reasonClean = (audit.reason || '').replace(/<[^>]*>/g, '').trim();
+
+            let stepsHtml = '';
+            if (steps.length > 0) {
+                stepsHtml = steps.map(s => `
+                    <div class="tao-step-card">
+                        <div class="tao-step-header">
+                            <span class="tao-step-num">STEP ${s.stepNum}</span>
+                        </div>
+                        ${s.thought ? `
+                            <div class="tao-thought-block">
+                                <div class="tao-thought-label">🧠 Thought</div>
+                                <div class="tao-thought-text">${escapeHtml(s.thought)}</div>
+                            </div>
+                        ` : ''}
+                        ${s.action ? `
+                            <div class="tao-action-block">
+                                <div class="tao-action-label">⚡ Action</div>
+                                <div class="tao-action-code">${escapeHtml(s.action)}</div>
+                            </div>
+                        ` : ''}
+                        ${s.observation ? `
+                            <div class="tao-obs-block">
+                                <div class="tao-obs-label">👁️ Observation</div>
+                                <div class="tao-obs-text">${escapeHtml(s.observation)}</div>
+                            </div>
+                        ` : ''}
+                    </div>
+                `).join('');
+            } else {
+                stepsHtml = `
+                    <div class="tao-step-card">
+                        <div class="tao-step-header">
+                            <span class="tao-step-num">DIRECT AUDIT</span>
+                            <span>Telemetry Phase</span>
+                        </div>
+                        <div class="tao-thought-block">
+                            <div class="tao-thought-label">🧠 Thought</div>
+                            <div class="tao-thought-text">Cross-referenced flow telemetry metrics and RFC mechanics against trained intrusion profiles.</div>
+                        </div>
+                        <div class="tao-action-block">
+                            <div class="tao-action-label">⚡ Action</div>
+                            <div class="tao-action-code">read_flow(${a.src_ip})</div>
+                        </div>
+                        <div class="tao-obs-block">
+                            <div class="tao-obs-label">👁️ Observation</div>
+                            <div class="tao-obs-text">${proto} :${port} │ ${pps} PPS │ Reason: ${a.reason || 'DDoS'}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            return `
+                <div class="tao-timeline" style="margin-top: 0;">
+                    ${stepsHtml}
+                    <div class="tao-verdict-card">
+                        <div class="tao-verdict-title">🎯 Final</div>
+                        ${reasonClean ? `<div class="tao-verdict-reason">${escapeHtml(reasonClean)}</div>` : ''}
+                    </div>
+                </div>
+            `;
+        }
 
         function cleanAttackLabel(str) {
             if (!str) return 'Unknown';
@@ -1766,7 +2134,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return;
             }
 
-            tbody.innerHTML = alerts.map(a => {
+            tbody.innerHTML = alerts.map((a, idx) => {
                 const proto = (a.protocol || 'TCP').toUpperCase();
                 const rawReason = a.reason || 'Unknown';
                 const pps = a.pps ? Number(a.pps).toFixed(1) : '0';
@@ -1814,17 +2182,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td style="color: var(--brand-primary); font-weight: 700; text-align: center;">${pps}</td>
                         <td style="text-align: center;">${labelDisplay}</td>
                         <td style="text-align: center;">${aiBadge}</td>
-                        <td class="reason-cell" style="text-align: left;">
-                            <div class="reason-text-truncate" style="text-align: left;">${reasonClean}</div>
-                            <div class="reason-tooltip">
-                                <div class="reason-tooltip-header">
-                                    <span class="reason-tooltip-title">
-                                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
-                                        Forensic Analysis
-                                    </span>
-                                    <span class="reason-tooltip-meta">${proto} :${a.dst_port || 0} │ ${pps} PPS</span>
-                                </div>
-                                <div class="reason-tooltip-body" style="text-align: justify; text-justify: inter-word; line-height: 1.65;">${reasonClean}</div>
+                        <td class="reason-cell" style="text-align: left;"
+                            onclick="openTaoModal(${idx})"
+                            title="Click to view full forensic analysis!">
+                            <div class="reason-box">
+                                <span class="reason-text-truncate">${reasonClean}</span>
+                                <svg class="reason-arrow-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18l6-6-6-6"/></svg>
                             </div>
                         </td>
                     </tr>
@@ -1832,12 +2195,66 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }).join('');
         }
 
+        function openTaoModal(idx) {
+            const alerts = getFilteredAlerts();
+            const a = alerts[idx];
+            if (!a) return;
+
+            const proto = (a.protocol || 'TCP').toUpperCase();
+            const port = a.dst_port || 0;
+            const pps = a.pps ? Number(a.pps).toFixed(1) : '0';
+            const rawReason = a.reason || 'Unknown';
+
+            const history = Array.isArray((a.audit || {}).history) ? a.audit.history : [];
+            let stepsCount = 0;
+            for (let i = 0; i < history.length; i++) {
+                if ((history[i] || {}).role === 'user') stepsCount++;
+            }
+            if (stepsCount === 0 && (a.audit || {}).history) stepsCount = 1;
+            const stepsMeta = stepsCount > 0 ? ` │ ${stepsCount} Step(s)` : '';
+
+            document.getElementById('tao-modal-meta').textContent = `IP: ${a.src_ip} │ ${proto} :${port} │ ${pps} PPS │ Initial Detection: ${cleanAttackLabel(rawReason)}${stepsMeta}`;
+            document.getElementById('tao-modal-content').innerHTML = buildTaoTooltipHtml(a);
+            document.getElementById('tao-modal-overlay').classList.add('active');
+        }
+
+        function closeTaoModal(e) {
+            if (e && e.target && e.target.id !== 'tao-modal-overlay' && !e.target.classList.contains('tao-modal-close')) return;
+            document.getElementById('tao-modal-overlay').classList.remove('active');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const overlay = document.getElementById('tao-modal-overlay');
+                if (overlay && overlay.classList.contains('active')) {
+                    overlay.classList.remove('active');
+                }
+            }
+        });
+
         window.onload = () => {
             initCharts();
             refreshData();
             setInterval(refreshData, 3000);
         };
     </script>
+
+
+    <div id="tao-modal-overlay" class="tao-modal-overlay" onclick="closeTaoModal(event)">
+        <div class="tao-modal-container" onclick="event.stopPropagation()">
+            <div class="tao-modal-header">
+                <div>
+                    <div class="tao-modal-title">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                        Forensic Analysis
+                    </div>
+                    <div class="tao-modal-subtitle" id="tao-modal-meta">...</div>
+                </div>
+                <button class="tao-modal-close" onclick="closeTaoModal()">✕</button>
+            </div>
+            <div class="tao-modal-body" id="tao-modal-content"></div>
+        </div>
+    </div>
 </body>
 </html>
 """

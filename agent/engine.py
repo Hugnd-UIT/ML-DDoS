@@ -297,6 +297,13 @@ class Engine:
                         alert.get("src_ip", "")
                     )
 
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": response
+                    }
+                )
+
                 return {
                     "decision": decision,
                     "classification": classification,
@@ -363,6 +370,13 @@ class Engine:
                 "execute_unban",
                 alert.get("src_ip", "")
             )
+
+        history.append(
+            {
+                "role": "assistant",
+                "content": response
+            }
+        )
 
         return {
             "decision": decision,
