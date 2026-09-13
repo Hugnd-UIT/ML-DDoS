@@ -160,38 +160,44 @@ KNOWLEDGE = {
         "iptables": "iptables -A INPUT -s <SRC_IP> -j ACCEPT",
         "cisco": "access-list 101 permit ip host <SRC_IP> any",
         "tc": "tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 match ip src <SRC_IP> flowid 1:1"
+    },
+    "PortScan": {
+        "mechanism": "Port Scanning (Reconnaissance, RFC 793, RFC 768) is a network probing technique used by adversaries or automated scanners to discover active listening services, open ports, and firewall filtering rules. Scanners transmit sequential or randomized probes across multiple destination ports (vertical scan) or across multiple subnet hosts (horizontal scan). Characteristics include single-packet or low-packet probes (fwd_pkts=1, bwd_pkts=0 or TCP RST/ICMP Port Unreachable), negligible flow duration (0.0 ms), absence of application session payloads, and rapid probing across diverse port targets. Individual probes to service ports (such as UDP port 111 or port 161) without sustained volume or handshake completion indicate port reconnaissance rather than volumetric reflection DDoS.",
+        "port": 0,
+        "protocol": "ANY",
+        "factor": "N/A",
+        "ebpf": "bpf_table_insert(blacklist_map, src_ip, ttl);",
+        "iptables": "iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP\niptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP\niptables -A INPUT -m recent --name portscan --set\niptables -A INPUT -m recent --name portscan --rcheck --seconds 60 --hitcount 10 -j DROP",
+        "cisco": "ip access-list extended RECON_BLOCK\ndeny ip host <SRC_IP> any\nrate-limit input 100000 1000 2000 conform-action transmit exceed-action drop",
+        "tc": "tc filter add dev eth0 protocol ip parent 1:0 prio 1 u32 match ip src <SRC_IP> flowid 1:10"
     }
 }
 
-def lookup_mechanism(attack):
+def _resolve_entry(attack):
     key = str(attack).strip()
     if key in KNOWLEDGE:
-        return json.dumps(KNOWLEDGE[key])
+        return KNOWLEDGE[key]
+    clean_key = key.lower().replace(" ", "").replace("_", "").replace("-", "")
     for name, data in KNOWLEDGE.items():
-        if name.lower() in key.lower():
-            return json.dumps(data)
-    return json.dumps(KNOWLEDGE["Zero-Day"])
+        clean_name = name.lower().replace(" ", "").replace("_", "").replace("-", "")
+        if clean_name == clean_key or clean_name in clean_key or clean_key in clean_name:
+            return data
+    return KNOWLEDGE["Zero-Day"]
 
-def lookup_mitigation(attack, device="ebpf"):
-    key = str(attack).strip()
-    target = KNOWLEDGE.get("Zero-Day")
-    if key in KNOWLEDGE:
-        target = KNOWLEDGE[key]
-    else:
-        for name, data in KNOWLEDGE.items():
-            if name.lower() in key.lower():
-                target = data
-                break
+def lookup_mechanism(attack):
+    entry = _resolve_entry(attack)
+    return json.dumps(entry)
+
+def lookup_mitigation(
+    attack,
+    device="ebpf"
+):
+    entry = _resolve_entry(attack)
     dev = device.lower()
-    if dev in target:
-        return target[dev]
-    return target.get("ebpf", "")
+    if dev in entry:
+        return entry[dev]
+    return entry.get("ebpf", "")
 
 def lookup_description(attack):
-    key = str(attack).strip()
-    if key in KNOWLEDGE:
-        return KNOWLEDGE[key].get("mechanism", "")
-    for name, data in KNOWLEDGE.items():
-        if name.lower() in key.lower():
-            return data.get("mechanism", "")
-    return KNOWLEDGE["Zero-Day"].get("mechanism", "")
+    entry = _resolve_entry(attack)
+    return entry.get("mechanism", "")

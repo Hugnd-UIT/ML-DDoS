@@ -271,6 +271,84 @@ select_http() {
     send_stream "$TARGET_IP" "$TARGET_PORT" tcp "$pkt" "$DURATION"
 }
 
+select_portscan() {
+    log_info "Traffic: Port Scan [Reconnaissance] -> $TARGET_IP (Probing ports across 1-65535, $DURATION s)"
+    local bots="${BOT_POOL[*]}"
+    python3 - "$TARGET_IP" "$DURATION" "$THREADS" "$bots" <<'EOF'
+import sys, socket, struct, threading, time, random
+
+ip = sys.argv[1]
+dur = int(sys.argv[2])
+thr = int(sys.argv[3])
+bots = sys.argv[4].split()
+
+common_ports = [
+    21, 22, 23, 25, 53, 69, 80, 88, 110, 111, 123, 135, 137, 139, 143,
+    161, 389, 443, 445, 465, 587, 993, 995, 1080, 1433, 1434, 1521,
+    1900, 2049, 2082, 2083, 2222, 3128, 3306, 3389, 5432, 5900, 6379,
+    8000, 8080, 8443, 8888, 9000, 9200, 11211, 27017
+]
+
+end_time = time.time() + dur
+stats = [0]
+lock = threading.Lock()
+
+def worker():
+    cnt = 0
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        use_raw = True
+    except Exception:
+        use_raw = False
+        raw_sock = None
+
+    dst_bytes = socket.inet_aton(ip)
+
+    while time.time() < end_time:
+        try:
+            bot_ip = random.choice(bots) if bots else '127.0.0.1'
+            target_port = random.choice(common_ports) if random.random() < 0.75 else random.randint(1, 65535)
+            src_port = random.randint(1024, 65535)
+            ttl = random.choice([54, 64, 112, 128, 255])
+
+            if use_raw:
+                src_bytes = socket.inet_aton(bot_ip)
+                ihl_ver = (4 << 4) + 5
+                ip_len = 40
+                ip_hdr = struct.pack('!BBHHHBBH4s4s', ihl_ver, 0, ip_len, random.randint(1000, 65000), 0, ttl, socket.IPPROTO_TCP, 0, src_bytes, dst_bytes)
+                tcp_hdr = struct.pack('!HHIIBBHHH', src_port, target_port, random.randint(1000, 4000000000), 0, (5 << 4), 0x02, 1024, 0, 0)
+                raw_sock.sendto(ip_hdr + tcp_hdr, (ip, target_port))
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.05)
+                s.connect_ex((ip, target_port))
+                s.close()
+            cnt += 1
+            if cnt % 25 == 0:
+                time.sleep(0.001)
+        except Exception:
+            pass
+
+    with lock:
+        stats[0] += cnt
+
+workers = [threading.Thread(target=worker, daemon=True) for _ in range(thr)]
+for w in workers: w.start()
+
+start = time.time()
+while time.time() < end_time:
+    elapsed = time.time() - start
+    pps = stats[0] / elapsed if elapsed > 0 else 0
+    rem = max(0, dur - int(elapsed))
+    print(f"\r  {stats[0]:>8,} ports probed  |  {pps:>8,.0f} pps  |  {rem:>3}s remaining", end='', flush=True)
+    time.sleep(0.5)
+
+for w in workers: w.join(timeout=1.5)
+print(f"\r  Finished: {stats[0]:,} port scan probes sent over {dur}s                                ")
+EOF
+}
+
 select_normal() {
     log_info "Traffic: Normal [Benign] -> http://$TARGET_IP:$TARGET_PORT/ ($DURATION s)"
     python3 - "$TARGET_IP" "$TARGET_PORT" "$DURATION" <<'EOF'
@@ -315,6 +393,7 @@ LABELS=(
     "Portmap"
     "TFTP"
     "HTTP"
+    "Port Scan"
     "Normal"
 )
 
@@ -334,41 +413,43 @@ PORTS=(
     111
     69
     80
+    0
     80
 )
 
 show_menu() {
     echo -e "${C_BOLD}  Select Traffic Type:${C_RESET}"
     echo -e "  ┌────┬───────────────────────┬────┬───────────────────────┐"
-    echo -e "  │ ${C_CYAN} 1${C_RESET} │ SYN [Port 80]         │ ${C_CYAN} 8${C_RESET} │ SSDP [Port 1900]      │"
-    echo -e "  │ ${C_CYAN} 2${C_RESET} │ UDP [Port 80]         │ ${C_CYAN} 9${C_RESET} │ LDAP [Port 389]       │"
-    echo -e "  │ ${C_CYAN} 3${C_RESET} │ UDP-Lag [Port 80]     │ ${C_CYAN}10${C_RESET} │ MSSQL [Port 1434]     │"
-    echo -e "  │ ${C_CYAN} 4${C_RESET} │ ICMP [Ping]           │ ${C_CYAN}11${C_RESET} │ NetBIOS [Port 137]    │"
-    echo -e "  │ ${C_CYAN} 5${C_RESET} │ DNS [Port 53]         │ ${C_CYAN}12${C_RESET} │ Portmap [Port 111]    │"
-    echo -e "  │ ${C_CYAN} 6${C_RESET} │ NTP [Port 123]        │ ${C_CYAN}13${C_RESET} │ TFTP [Port 69]        │"
-    echo -e "  │ ${C_CYAN} 7${C_RESET} │ SNMP [Port 161]       │ ${C_CYAN}14${C_RESET} │ HTTP [Port 80]        │"
-    echo -e "  │    │                       │ ${C_CYAN}15${C_RESET} │ Normal [Benign]       │"
+    echo -e "  │ ${C_CYAN} 1${C_RESET} │ SYN [Port 80]         │ ${C_CYAN} 9${C_RESET} │ LDAP [Port 389]       │"
+    echo -e "  │ ${C_CYAN} 2${C_RESET} │ UDP [Port 80]         │ ${C_CYAN}10${C_RESET} │ MSSQL [Port 1434]     │"
+    echo -e "  │ ${C_CYAN} 3${C_RESET} │ UDP-Lag [Port 80]     │ ${C_CYAN}11${C_RESET} │ NetBIOS [Port 137]    │"
+    echo -e "  │ ${C_CYAN} 4${C_RESET} │ ICMP [Ping]           │ ${C_CYAN}12${C_RESET} │ Portmap [Port 111]    │"
+    echo -e "  │ ${C_CYAN} 5${C_RESET} │ DNS [Port 53]         │ ${C_CYAN}13${C_RESET} │ TFTP [Port 69]        │"
+    echo -e "  │ ${C_CYAN} 6${C_RESET} │ NTP [Port 123]        │ ${C_CYAN}14${C_RESET} │ HTTP [Port 80]        │"
+    echo -e "  │ ${C_CYAN} 7${C_RESET} │ SNMP [Port 161]       │ ${C_CYAN}15${C_RESET} │ Port Scan [Recon]     │"
+    echo -e "  │ ${C_CYAN} 8${C_RESET} │ SSDP [Port 1900]      │ ${C_CYAN}16${C_RESET} │ Normal [Benign]       │"
     echo -e "  └────┴───────────────────────┴────┴───────────────────────┘"
 }
 
 run_selection() {
     local choice="$1"
     case "$choice" in
-        1)  select_syn     ;;
-        2)  select_udp     ;;
-        3)  select_udplag  ;;
-        4)  select_icmp    ;;
-        5)  select_dns     ;;
-        6)  select_ntp     ;;
-        7)  select_snmp    ;;
-        8)  select_ssdp    ;;
-        9)  select_ldap    ;;
-        10) select_mssql   ;;
-        11) select_netbios ;;
-        12) select_portmap ;;
-        13) select_tftp    ;;
-        14) select_http    ;;
-        15) select_normal  ;;
+        1)  select_syn      ;;
+        2)  select_udp      ;;
+        3)  select_udplag   ;;
+        4)  select_icmp     ;;
+        5)  select_dns      ;;
+        6)  select_ntp      ;;
+        7)  select_snmp     ;;
+        8)  select_ssdp     ;;
+        9)  select_ldap     ;;
+        10) select_mssql    ;;
+        11) select_netbios  ;;
+        12) select_portmap  ;;
+        13) select_tftp     ;;
+        14) select_http     ;;
+        15) select_portscan ;;
+        16) select_normal   ;;
         *)  log_err "Invalid selection: $choice"; exit 1 ;;
     esac
 }
@@ -388,10 +469,10 @@ main() {
     else
         show_menu
         echo ""
-        read -rp "  Option [1-15]: " choice
+        read -rp "  Option [1-16]: " choice
         
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt 15 ]; then
-            log_err "Lựa chọn không hợp lệ (1-15)."
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt 16 ]; then
+            log_err "Lựa chọn không hợp lệ (1-16)."
             exit 1
         fi
 
@@ -410,7 +491,7 @@ main() {
     echo -e "  Duration : ${C_BOLD}${DURATION}s${C_RESET} | Threads: ${C_BOLD}${THREADS}${C_RESET}"
     echo ""
 
-    if [ "$choice" -ne 15 ] && [ "$EUID" -ne 0 ]; then
+    if [ "$choice" -ne 16 ] && [ "$EUID" -ne 0 ]; then
         sudo -v || exit 1
     fi
 

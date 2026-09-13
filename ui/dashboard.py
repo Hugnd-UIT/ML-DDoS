@@ -1637,7 +1637,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return `
                     <div class="tao-pending-box" style="margin-top: 0;">
                         <span class="status-dot-pulse"></span>
-                        <div style="font-weight: 700; color: #f8fafc; font-size: 13px;">Analyzing Incursion...</div>
                         <div style="font-size: 11.5px; color: #94a3b8;">Waiting for forensic analysis result...</div>
                     </div>
                 `;
@@ -2161,7 +2160,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         isFp = true;
                         aiBadge = '<span class="badge tag-false"><span class="badge-dot dot-red"></span>False Positive</span>';
                         labelDisplay = `<span style="color: #ef4444; font-weight: 600;">Benign</span>`;
-                    } else if (cls === 'MISCLASSIFIED_ATTACK') {
+                    } else if (cls === 'MISCLASSIFIED_ATTACK' || (corr && !corr.toLowerCase().startsWith('none') && cleanAttackLabel(corr).toLowerCase() !== cleanAttackLabel(rawReason).toLowerCase())) {
                         aiBadge = '<span class="badge tag-true"><span class="badge-dot dot-green"></span>True Positive</span>';
                         const corrStr = cleanAttackLabel(corr || '');
                         const correctedName = (corrStr && !corrStr.toLowerCase().startsWith('none')) ? corrStr : cleanAttackLabel(rawReason);
