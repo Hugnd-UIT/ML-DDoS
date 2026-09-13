@@ -116,7 +116,7 @@ GLOBAL_TOTAL_LIMIT = 2000
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Gatekeeper IPS — XGBoost Multiclass + IsolationForest + eBPF/XDP',
+        description='XGBoost + IsolationForest + eBPF/XDP',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
@@ -766,7 +766,7 @@ def main():
                     ddos_reason = "UDP Flood"
                 elif global_pkts > GLOBAL_TOTAL_LIMIT:
                     is_ddos = True
-                    ddos_reason = "Volumetric"
+                    ddos_reason = "Volumetric Flood"
 
                 is_suspect = (
                     total_syn >= 10
