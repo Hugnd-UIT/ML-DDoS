@@ -601,7 +601,7 @@ class Enforcer:
             )
 
         print(
-            f"  [−] UNBANNED {ip_str}"
+            f"  [-] UNBANNED {ip_str}"
         )
 
     def _memory_manager(self):

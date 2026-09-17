@@ -8,9 +8,9 @@ import requests
 
 from agent.prompt import (
     SYSTEM_PROMPT,
-    build_react_prompt,
-    build_explain_prompt,
-    build_mitigation_prompt
+    react_prompt,
+    explain_prompt,
+    mitigate_prompt
 )
 
 from tools.read import read_alert, read_flow, read_metrics
@@ -31,7 +31,7 @@ ENV_PATH = os.path.join(
     '.env'
 )
 
-def normalize_attack_label(
+def normalize(
     val,
     fallback="SYN"
 ):
@@ -80,13 +80,13 @@ def normalize_attack_label(
             return "SYN"
         if "UDP" in inner:
             return "UDP"
-    clean_no_prefix = re.sub(
+    cleaned = re.sub(
         r'^(?:DDOS|ATTACK|TRAFFIC)[\s:\-_/]+',
         '',
         clean,
         flags=re.IGNORECASE
     ).strip()
-    up = clean_no_prefix.upper().replace('-', '').replace('_', '').replace(' ', '')
+    up = cleaned.upper().replace('-', '').replace('_', '').replace(' ', '')
     if "UDPLAG" in up or "LAG" in up:
         return "UDP-Lag"
     if "NTP" in up:
@@ -213,17 +213,25 @@ class Engine:
         }
 
         resp = None
+        last_err = None
         for attempt in range(5):
             try:
-                resp = requests.post(self.url, headers=headers, json=payload, timeout=self.timeout)
+                resp = requests.post(
+                    self.url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout
+                )
                 if resp.status_code == 200:
                     break
-            except Exception:
-                pass
+                if resp.status_code in (409, 429):
+                    time.sleep(4)
+            except Exception as exc:
+                last_err = exc
             time.sleep(2)
 
         if not resp or resp.status_code != 200:
-            err_msg = resp.text if resp else "No response"
+            err_msg = resp.text if resp else str(last_err or "No response")
             code = resp.status_code if resp else 0
             raise RuntimeError(f"LLM API request failed [{code}]: {err_msg}")
 
@@ -264,7 +272,7 @@ class Engine:
         reason = ""
         history = []
 
-        user_prompt = build_react_prompt(alert)
+        user_prompt = react_prompt(alert)
         msgs = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
@@ -274,7 +282,7 @@ class Engine:
             response = self.query("", messages=msgs)
 
             match_action = re.search(r"Action:\s*[`'\"]?([a-zA-Z0-9_]+)[`'\"]?\s*(?:\((.*?)\)|:\s*([^\n]+))", response)
-            tool_calls_count = len([h for h in history if h.get("role") == "user" and h.get("content", "").startswith("Observation:")])
+            tools_count = len([h for h in history if h.get("role") == "user" and h.get("content", "").startswith("Observation:")])
 
             if match_action:
                 action_name = match_action.group(1).strip()
@@ -288,7 +296,7 @@ class Engine:
                 continue
 
             if "Final Answer:" in response:
-                if tool_calls_count < 2 and step < max_steps:
+                if tools_count < 2 and step < max_steps:
                     msgs.append({"role": "assistant", "content": response})
                     msgs.append({"role": "user", "content": "Observation: Rule violation - you must call at least 2 tools (e.g. read_alert, search_history) before issuing Final Answer. Please call a tool now."})
                     continue
@@ -321,7 +329,7 @@ class Engine:
                 if decision == "UNBLOCK":
                     corrected_attack = "Benign"
                 else:
-                    corrected_attack = normalize_attack_label(
+                    corrected_attack = normalize(
                         corrected_attack,
                         fallback=alert.get("reason", "SYN")
                     )
@@ -395,7 +403,7 @@ class Engine:
         if decision == "UNBLOCK":
             corrected_attack = "Benign"
         else:
-            corrected_attack = normalize_attack_label(
+            corrected_attack = normalize(
                 corrected_attack,
                 fallback=alert.get("reason", "SYN")
             )
@@ -438,11 +446,11 @@ class Engine:
     def explain(self, alert, packets=None):
         attack = alert.get("reason", "DDoS")
         desc = lookup_description(attack)
-        prompt = build_explain_prompt(alert, description=desc, packets=packets)
+        prompt = explain_prompt(alert, description=desc, packets=packets)
         return self.query(prompt)
 
     def mitigate(self, alert, device="iptables", packets=None):
         attack = alert.get("reason", "DDoS")
         desc = lookup_description(attack)
-        prompt = build_mitigation_prompt(alert, description=desc, device=device, packets=packets)
+        prompt = mitigate_prompt(alert, description=desc, device=device, packets=packets)
         return self.query(prompt)

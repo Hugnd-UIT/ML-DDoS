@@ -82,6 +82,8 @@ RULES
    Reason: <one sentence>
 """
 
+import time
+
 
 def _tc_block(alert, packets=None):
     ip = alert.get("src_ip", "?")
@@ -144,19 +146,21 @@ def _tc_block(alert, packets=None):
     return "\n".join(lines)
 
 
-def build_react_prompt(alert):
+def react_prompt(alert):
     tc = _tc_block(alert)
     ip = alert.get("src_ip", "?")
+    ts = alert.get("timestamp", time.time())
 
     return (
-        f"{tc}\n\n"
+        f"{tc}\n"
+        f"[Audit Session: {ts}]\n\n"
         f"Task: determine whether the automated block of {ip} is a TP or FP.\n"
         f"Required: call read_alert and search_history at minimum before issuing Final Answer.\n"
         f"Use additional tools if findings are ambiguous. Then issue Final Answer."
     )
 
 
-def build_explain_prompt(alert, description="", packets=None):
+def explain_prompt(alert, description="", packets=None):
     tc = _tc_block(alert, packets)
     attack = alert.get("reason", "DDoS")
     desc = description or "High-rate anomalous traffic exhausting server resources."
@@ -171,7 +175,7 @@ def build_explain_prompt(alert, description="", packets=None):
     )
 
 
-def build_mitigation_prompt(alert, description="", device="iptables", packets=None):
+def mitigate_prompt(alert, description="", device="iptables", packets=None):
     tc = _tc_block(alert, packets)
     attack = alert.get("reason", "DDoS")
     desc = description or "High-rate anomalous traffic exhausting server resources."

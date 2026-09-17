@@ -38,9 +38,9 @@ AUDIT_LOCK = threading.Lock()
 ALERTS_LOCK = threading.Lock()
 
 try:
-    from agent.engine import normalize_attack_label
+    from agent.engine import normalize
 except Exception:
-    def normalize_attack_label(val, fallback="SYN"):
+    def normalize(val, fallback="SYN"):
         return str(val) if val else fallback
 
 def get_engine():
@@ -71,7 +71,7 @@ def update_alerts(
                 return
 
         if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
-            audit_res["corrected_attack"] = normalize_attack_label(
+            audit_res["corrected_attack"] = normalize(
                 audit_res["corrected_attack"],
                 fallback="SYN"
             )
@@ -147,22 +147,22 @@ def get_metrics():
                 reclassified_count += 1
                 corr = str(audit.get("corrected_attack") or "").strip()
                 if corr and not corr.lower().startswith("none"):
-                    r = normalize_attack_label(
+                    r = normalize(
                         corr,
                         fallback=a.get("reason", "SYN")
                     )
                 else:
-                    r = normalize_attack_label(
+                    r = normalize(
                         a.get("reason") or "SYN",
                         fallback="SYN"
                     )
             else:
-                r = normalize_attack_label(
+                r = normalize(
                     a.get("reason") or "SYN",
                     fallback="SYN"
                 )
         else:
-            r = normalize_attack_label(
+            r = normalize(
                 a.get("reason") or "SYN",
                 fallback="SYN"
             )
