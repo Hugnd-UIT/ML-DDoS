@@ -63,7 +63,7 @@ class Signature:
         src_ip,
         protocol="UNKNOWN",
         dst_port=0,
-        fwd_len_mean=0.0,
+        fwd_mean=0.0,
         pps=0.0,
         reason="AI_INFERENCE",
         features=None,
@@ -72,13 +72,14 @@ class Signature:
         syn_count=0,
         ack_count=0,
         rst_count=0,
-        flow_duration_ms=0.0,
-        flow_bytes_s=0.0
+        dur_ms=0.0,
+        bytes_s=0.0,
+        **kwargs
     ):
         self.src_ip = src_ip
         self.protocol = protocol
         self.dst_port = dst_port
-        self.fwd_len_mean = fwd_len_mean
+        self.fwd_mean = kwargs.get("fwd_len_mean", fwd_mean)
         self.pps = pps
         self.reason = reason
         self.features = features
@@ -87,15 +88,15 @@ class Signature:
         self.syn_count = syn_count
         self.ack_count = ack_count
         self.rst_count = rst_count
-        self.flow_duration_ms = flow_duration_ms
-        self.flow_bytes_s = flow_bytes_s
+        self.dur_ms = kwargs.get("flow_duration_ms", dur_ms)
+        self.bytes_s = kwargs.get("flow_bytes_s", bytes_s)
 
     @property
     def signature(self):
         return (
             f"PROTO:{self.protocol}"
             f"_PORT:{self.dst_port}"
-            f"_LEN:{round(self.fwd_len_mean, -1)}"
+            f"_LEN:{round(self.fwd_mean, -1)}"
         )
 
 
@@ -301,15 +302,15 @@ class Enforcer:
                     f"{hostname}: {exc}"
                 )
 
-        canonical_static_cidrs = [
+        static_cidrs = [
             "91.189.88.0/21"
         ]
 
-        resolved += canonical_static_cidrs
+        resolved += static_cidrs
 
         print(
             "  [+] Canonical static CIDR fallback: "
-            f"{', '.join(canonical_static_cidrs)}"
+            f"{', '.join(static_cidrs)}"
         )
 
         return resolved
@@ -560,14 +561,14 @@ class Enforcer:
             "pps": sig.pps,
             "ttl_secs": ttl_secs,
             "offense_count": count,
-            "avg_packet_size": round(sig.fwd_len_mean, 2),
+            "avg_packet_size": round(sig.fwd_mean, 2),
             "fwd_pkts": sig.fwd_pkts,
             "bwd_pkts": sig.bwd_pkts,
             "syn_count": sig.syn_count,
             "ack_count": sig.ack_count,
             "rst_count": sig.rst_count,
-            "flow_duration_ms": round(sig.flow_duration_ms, 3),
-            "flow_bytes_s": round(sig.flow_bytes_s, 2)
+            "flow_duration_ms": round(sig.dur_ms, 3),
+            "flow_bytes_s": round(sig.bytes_s, 2)
         }
 
         try:

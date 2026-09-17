@@ -32,8 +32,8 @@ from common.storage import (
 
 _ENGINE = None
 AUDIT_CACHE = {}
-AUDITED_KEYS = TTLCache(maxsize=50_000, ttl=3600)
-SIGNATURE_AUDIT_CACHE = {}
+AUDIT_KEYS = TTLCache(maxsize=50_000, ttl=3600)
+SIG_CACHE = {}
 AUDIT_LOCK = threading.Lock()
 ALERTS_LOCK = threading.Lock()
 
@@ -97,7 +97,7 @@ def get_alerts(limit=1000):
             if entry.get("audit"):
                 with AUDIT_LOCK:
                     AUDIT_CACHE[key] = entry["audit"]
-                    AUDITED_KEYS.add(key)
+                    AUDIT_KEYS.add(key)
             else:
                 with AUDIT_LOCK:
                     if key in AUDIT_CACHE:
@@ -118,7 +118,7 @@ def get_metrics():
     total_pps = 0
 
     audited_count = 0
-    fp_unbanned_count = 0
+    fp_count = 0
     reclassified_count = 0
 
     timeline = []
@@ -141,7 +141,7 @@ def get_metrics():
         if audit:
             audited_count += 1
             if audit.get("decision") == "UNBLOCK" or audit.get("classification") in ("FALSE_POSITIVE", "BENIGN"):
-                fp_unbanned_count += 1
+                fp_count += 1
                 r = "False Positive"
             elif audit.get("classification") == "MISCLASSIFIED_ATTACK":
                 reclassified_count += 1
@@ -197,7 +197,7 @@ def get_metrics():
         "unique_blocked_ips": len(unique_ips),
         "avg_pps": avg_pps,
         "audited_count": audited_count,
-        "fp_unbanned_count": fp_unbanned_count,
+        "fp_unbanned_count": fp_count,
         "reclassified_count": reclassified_count,
         "top_ips": sorted_ips,
         "reasons": reasons,
@@ -213,7 +213,7 @@ def sig_key(entry):
     reason = str(entry.get("reason", "")).strip()
     return f"{proto}:{port}:SIZE{bucket}:{reason}"
 
-def run_auto_auditor():
+def run_auditor():
     while True:
         try:
             eng = get_engine()
@@ -225,13 +225,13 @@ def run_auto_auditor():
                     key = f"{ip}_{ts}"
 
                     with AUDIT_LOCK:
-                        if key in AUDITED_KEYS or entry.get("audit"):
+                        if key in AUDIT_KEYS or entry.get("audit"):
                             continue
-                        AUDITED_KEYS.add(key)
+                        AUDIT_KEYS.add(key)
 
                     try:
                         k = sig_key(entry)
-                        hit = SIGNATURE_AUDIT_CACHE.get(k)
+                        hit = SIG_CACHE.get(k)
                         now = time.time()
 
                         if hit and (now - hit[1] < 600):
@@ -254,7 +254,7 @@ def run_auto_auditor():
 
                         else:
                             res = eng.react(entry)
-                            SIGNATURE_AUDIT_CACHE[k] = (
+                            SIG_CACHE[k] = (
                                 res,
                                 now
                             )
@@ -289,11 +289,11 @@ def run_auto_auditor():
 
 AUDITOR_THREAD = None
 
-def start_auto_auditor():
+def start_auditor():
     global AUDITOR_THREAD
     if AUDITOR_THREAD is None or not AUDITOR_THREAD.is_alive():
         AUDITOR_THREAD = threading.Thread(
-            target=run_auto_auditor,
+            target=run_auditor,
             daemon=True
         )
         AUDITOR_THREAD.start()
@@ -2333,12 +2333,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.send_error(404, "Action not found")
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+class ThreadServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 def run_server(port=8080):
-    start_auto_auditor()
-    server = ThreadedHTTPServer(('0.0.0.0', port), DashboardHandler)
+    start_auditor()
+    server = ThreadServer(('0.0.0.0', port), DashboardHandler)
     print(f"[*] Dashboard running at: http://localhost:{port}")
     try:
         server.serve_forever()

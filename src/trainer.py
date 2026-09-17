@@ -192,7 +192,7 @@ def train_xgboost(num_class):
     return booster
 
 
-def train_isolation_forest():
+def train_iso():
     print("\n" + "=" * 60)
     print("[*] Training: Isolation Forest")
     print("=" * 60)
@@ -328,7 +328,7 @@ def main():
     xgb_model = train_xgboost(num_class)
     evaluate(xgb_model, name='XGBoost')
 
-    iso_model = train_isolation_forest()
+    iso_model = train_iso()
     evaluate(iso_model, name='Isolation Forest')
 
     print("\n" + "=" * 60)

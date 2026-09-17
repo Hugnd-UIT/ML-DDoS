@@ -11,7 +11,7 @@ TOOLS
 - read_alert(src_ip): recorded alert entries
 - read_flow(src_ip): live flow stats (protocol, port, pps, reason)
 - search_history(src_ip): repeat-offense count and timeline
-- search_subnet(ip_or_cidr): check /24 peers for botnet signal
+- search_subnet(target): check /24 peers for botnet signal
 - lookup_mechanism(query) / lookup_description(query): RFC attack mechanics by attack name or destination port
 - execute_unban(src_ip): lift block for confirmed FP
 - execute_extend(src_ip, ttl_seconds): extend block for confirmed persistent attacker
@@ -95,7 +95,7 @@ def _tc_block(alert, packets=None):
     avg_sz = float(alert.get("avg_packet_size", 128))
     dur_ms = float(alert.get("flow_duration_ms", 0))
     dur_s = max(dur_ms / 1000.0, 0.001)
-    flow_bytes_s = float(alert.get("flow_bytes_s", 0))
+    bytes_s = float(alert.get("flow_bytes_s", 0))
 
     fwd_pkts = alert.get("fwd_pkts", None)
     bwd_pkts = alert.get("bwd_pkts", None)
@@ -110,8 +110,8 @@ def _tc_block(alert, packets=None):
 
     total_bytes = (
         int(total_pkts * avg_sz)
-        if flow_bytes_s == 0
-        else int(flow_bytes_s * dur_s)
+        if bytes_s == 0
+        else int(bytes_s * dur_s)
     )
 
     interval = round(1.0 / pps, 6) if pps > 0 else 0.0
@@ -125,7 +125,7 @@ def _tc_block(alert, packets=None):
         f"Average packet size: {avg_sz:.1f} bytes",
         f"Average packet interval: {interval} s",
         f"Flow duration: {dur_ms:.1f} ms",
-        f"Packet rate: {pps:.1f} PPS  Flow bytes/s: {flow_bytes_s:.1f}",
+        f"Packet rate: {pps:.1f} PPS  Flow bytes/s: {bytes_s:.1f}",
         f"Offense count: {count}",
         f"Detected label: {reason}",
     ]

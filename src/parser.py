@@ -31,27 +31,27 @@ DATA_DIR = os.path.join(
     'data'
 )
 
-DOS2017_DIR = os.path.join(
+DOS_DIR = os.path.join(
     DATA_DIR,
     'raw',
     'CIC-DoS2017'
 )
 
-DDOS2019_DIR = os.path.join(
+DDOS_DIR = os.path.join(
     DATA_DIR,
     'raw',
     'CIC-DDoS2019'
 )
 
-if not os.path.exists(DOS2017_DIR):
+if not os.path.exists(DOS_DIR):
     fallback_dos = os.path.join(DATA_DIR, 'CIC-DoS2017')
     if os.path.exists(fallback_dos):
-        DOS2017_DIR = fallback_dos
+        DOS_DIR = fallback_dos
 
-if not os.path.exists(DDOS2019_DIR):
+if not os.path.exists(DDOS_DIR):
     fallback_ddos = os.path.join(DATA_DIR, 'CIC-DDoS2019')
     if os.path.exists(fallback_ddos):
-        DDOS2019_DIR = fallback_ddos
+        DDOS_DIR = fallback_ddos
 
 DIVIDED_DIR = os.path.join(
     DATA_DIR,
@@ -344,9 +344,9 @@ def split(df):
                 for k, v in chunk['Label'].value_counts().items():
                     label_counts[k] += v
 
-            valid_labels_list = sorted([lbl for lbl, cnt in label_counts.items() if cnt >= 2])
+            labels_list = sorted([lbl for lbl, cnt in label_counts.items() if cnt >= 2])
             le = LabelEncoder()
-            le.fit(valid_labels_list)
+            le.fit(labels_list)
             valid_labels = set(le.classes_)
 
             joblib.dump(le, le_path)
@@ -448,8 +448,8 @@ def main():
         df = out_file
     else:
         df = merge(
-            DOS2017_DIR,
-            DDOS2019_DIR
+            DOS_DIR,
+            DDOS_DIR
         )
 
     if df is None:

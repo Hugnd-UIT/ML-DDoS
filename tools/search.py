@@ -141,11 +141,11 @@ def search_history(
 
 
 def search_subnet(
-    ip_or_cidr
+    target
 ):
     try:
         res = subnet(
-            cidr=ip_or_cidr
+            cidr=target
         )
 
         if res and res.get("total_packets_recorded", 0) > 0:
@@ -157,14 +157,14 @@ def search_subnet(
         pass
 
     try:
-        if "/" in ip_or_cidr:
+        if "/" in target:
             net = ipaddress.ip_network(
-                ip_or_cidr,
+                target,
                 strict=False
             )
         else:
             net = ipaddress.ip_network(
-                f"{ip_or_cidr}/24",
+                f"{target}/24",
                 strict=False
             )
 

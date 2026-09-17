@@ -299,7 +299,7 @@ def extract_features(flow):
 
     total_bytes = fwd_bytes + bwd_bytes
 
-    fwd_len_max = float(
+    fwd_max = float(
         getattr(
             flow,
             'src2dst_max_ps',
@@ -307,7 +307,7 @@ def extract_features(flow):
         )
     )
 
-    fwd_len_min = float(
+    fwd_min = float(
         getattr(
             flow,
             'src2dst_min_ps',
@@ -315,7 +315,7 @@ def extract_features(flow):
         )
     )
 
-    fwd_len_mean = float(
+    fwd_mean = float(
         getattr(
             flow,
             'src2dst_mean_ps',
@@ -323,7 +323,7 @@ def extract_features(flow):
         )
     )
 
-    bwd_len_max = float(
+    bwd_max = float(
         getattr(
             flow,
             'dst2src_max_ps',
@@ -331,7 +331,7 @@ def extract_features(flow):
         )
     )
 
-    bwd_len_mean = float(
+    bwd_mean = float(
         getattr(
             flow,
             'dst2src_mean_ps',
@@ -339,10 +339,10 @@ def extract_features(flow):
         )
     )
 
-    flow_bytes_s = total_bytes / duration_s
-    flow_packets_s = total_pkts / duration_s
+    byte_rate = total_bytes / duration_s
+    pkt_rate = total_pkts / duration_s
 
-    flow_iat_mean = (
+    iat_mean = (
         float(
             getattr(
                 flow,
@@ -353,10 +353,10 @@ def extract_features(flow):
         * 1000.0
     )
 
-    if flow_iat_mean == 0.0 and total_pkts > 1:
-        flow_iat_mean = duration_us / (total_pkts - 1)
+    if iat_mean == 0.0 and total_pkts > 1:
+        iat_mean = duration_us / (total_pkts - 1)
 
-    flow_iat_std = (
+    iat_std = (
         float(
             getattr(
                 flow,
@@ -367,7 +367,7 @@ def extract_features(flow):
         * 1000.0
     )
 
-    fwd_iat_mean = (
+    fwd_iat = (
         float(
             getattr(
                 flow,
@@ -378,17 +378,17 @@ def extract_features(flow):
         * 1000.0
     )
 
-    if fwd_iat_mean == 0.0 and fwd_pkts > 1:
-        fwd_duration_ms = float(
+    if fwd_iat == 0.0 and fwd_pkts > 1:
+        fwd_dur = float(
             getattr(
                 flow,
                 'src2dst_duration_ms',
                 0.0
             )
         )
-        fwd_iat_mean = (fwd_duration_ms * 1000.0) / (fwd_pkts - 1)
+        fwd_iat = (fwd_dur * 1000.0) / (fwd_pkts - 1)
 
-    bwd_iat_mean = (
+    bwd_iat = (
         float(
             getattr(
                 flow,
@@ -399,15 +399,15 @@ def extract_features(flow):
         * 1000.0
     )
 
-    if bwd_iat_mean == 0.0 and bwd_pkts > 1:
-        bwd_duration_ms = float(
+    if bwd_iat == 0.0 and bwd_pkts > 1:
+        bwd_dur = float(
             getattr(
                 flow,
                 'dst2src_duration_ms',
                 0.0
             )
         )
-        bwd_iat_mean = (bwd_duration_ms * 1000.0) / (bwd_pkts - 1)
+        bwd_iat = (bwd_dur * 1000.0) / (bwd_pkts - 1)
 
     syn_count = float(
         getattr(
@@ -449,7 +449,7 @@ def extract_features(flow):
         )
     )
 
-    init_win_fwd = float(
+    win_fwd = float(
         getattr(
             flow,
             'src2dst_init_win',
@@ -457,7 +457,7 @@ def extract_features(flow):
         )
     )
 
-    init_win_bwd = float(
+    win_bwd = float(
         getattr(
             flow,
             'dst2src_init_win',
@@ -502,24 +502,24 @@ def extract_features(flow):
             bwd_pkts,
             fwd_bytes,
             bwd_bytes,
-            fwd_len_max,
-            fwd_len_min,
-            fwd_len_mean,
-            bwd_len_max,
-            bwd_len_mean,
-            flow_bytes_s,
-            flow_packets_s,
-            flow_iat_mean,
-            flow_iat_std,
-            fwd_iat_mean,
-            bwd_iat_mean,
+            fwd_max,
+            fwd_min,
+            fwd_mean,
+            bwd_max,
+            bwd_mean,
+            byte_rate,
+            pkt_rate,
+            iat_mean,
+            iat_std,
+            fwd_iat,
+            bwd_iat,
             syn_count,
             rst_count,
             psh_count,
             ack_count,
             fin_count,
-            init_win_fwd,
-            init_win_bwd,
+            win_fwd,
+            win_bwd,
             active_mean,
             idle_mean,
             dst_port
@@ -729,7 +729,7 @@ def main():
                             src_ip=flow.src_ip,
                             protocol=proto_name(flow.protocol),
                             dst_port=int(getattr(flow, "dst_port", 0)),
-                            fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
+                            fwd_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
                             pps=float(getattr(flow, 'bidirectional_packets', 1)) / dur,
                             reason=reason,
                             features=features[0].tolist(),
@@ -738,8 +738,8 @@ def main():
                             syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
                             ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
                             rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
-                            flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
-                            flow_bytes_s=bytes_total / dur
+                            dur_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
+                            bytes_s=bytes_total / dur
                         )
 
                         count, ttl_secs = enforcer.block_ip(sig)
