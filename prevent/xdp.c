@@ -9,7 +9,7 @@ struct lpm_key_v4 {
 };
 
 BPF_LPM_TRIE(whitelist_map, struct lpm_key_v4, u8, 2000);
-BPF_TABLE("lru_hash", u32, u8, blacklist_map, 500000);
+BPF_TABLE("lru_hash", u32, u64, blacklist_map, 500000);
 
 int xdp(struct xdp_md *ctx) {
     void *data_end = (void *)(long)ctx->data_end;

@@ -7,6 +7,7 @@ import ipaddress
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from cachetools import TTLCache
 
 PROJECT_ROOT = os.path.abspath(
     os.path.join(
@@ -23,9 +24,16 @@ LOG_PATH = os.path.join(
     'alerts.log'
 )
 
+from common.storage import (
+    alerts as db_alerts,
+    audit as db_audit,
+    DB_PATH
+)
+
 _ENGINE = None
 AUDIT_CACHE = {}
-AUDITED_KEYS = set()
+AUDITED_KEYS = TTLCache(maxsize=50_000, ttl=3600)
+SIGNATURE_AUDIT_CACHE = {}
 AUDIT_LOCK = threading.Lock()
 ALERTS_LOCK = threading.Lock()
 
@@ -45,80 +53,61 @@ def get_engine():
             _ENGINE = None
     return _ENGINE
 
-def update_alert_audit_in_log(
+def update_alerts(
     src_ip,
     timestamp,
     audit_res
 ):
-    if not os.path.exists(LOG_PATH):
-        return
-    with ALERTS_LOCK:
-        try:
-            lines = []
-            updated = False
-            with open(LOG_PATH, 'r', encoding='utf-8') as f:
-                raw_lines = f.readlines()
-            target_ts = float(timestamp or 0)
-            for line in raw_lines:
-                text = line.strip()
-                if not text:
-                    continue
-                try:
-                    entry = json.loads(text)
-                    ts = float(entry.get("timestamp", 0) or 0)
-                    matches = False
-                    if entry.get("src_ip") == src_ip:
-                        if target_ts > 0:
-                            matches = abs(ts - target_ts) < 0.05
-                        elif not entry.get("audit"):
-                            matches = True
-                    if matches and not updated:
-                        if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
-                            audit_res["corrected_attack"] = normalize_attack_label(
-                                audit_res["corrected_attack"],
-                                fallback=entry.get("reason", "SYN")
-                            )
-                        entry["audit"] = audit_res
-                        lines.append(json.dumps(entry) + '\n')
-                        updated = True
-                    else:
-                        lines.append(text + '\n')
-                except Exception:
-                    lines.append(line)
-            if updated:
-                with open(LOG_PATH, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-        except Exception as err:
-            print(f"[!] Error updating alerts.log: {err}")
+    try:
+        existing = db_alerts(limit=1000, pending=False)
+        key = f"{src_ip}_{timestamp}"
+        for row in existing:
+            if (
+                str(row.get("src_ip")) == str(src_ip)
+                and str(row.get("timestamp")) == str(timestamp)
+                and row.get("audit")
+                and row["audit"].get("decision")
+            ):
+                return
+
+        if "corrected_attack" in audit_res and audit_res["corrected_attack"]:
+            audit_res["corrected_attack"] = normalize_attack_label(
+                audit_res["corrected_attack"],
+                fallback="SYN"
+            )
+
+        db_audit(
+            ip=src_ip,
+            ts=timestamp,
+            data=audit_res
+        )
+
+    except Exception as err:
+        print(f"[!] Error updating audit storage: {err}")
 
 def get_alerts(limit=1000):
-    if not os.path.exists(LOG_PATH):
-        return []
-    records = []
     try:
-        with ALERTS_LOCK:
-            with open(LOG_PATH, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        k = f"{entry.get('src_ip')}_{entry.get('timestamp')}"
-                        if entry.get("audit"):
-                            with AUDIT_LOCK:
-                                AUDIT_CACHE[k] = entry["audit"]
-                                AUDITED_KEYS.add(k)
-                        else:
-                            with AUDIT_LOCK:
-                                if k in AUDIT_CACHE:
-                                    entry["audit"] = AUDIT_CACHE[k]
-                        records.append(entry)
-                    except Exception:
-                        pass
+        records = db_alerts(
+            limit=limit,
+            pending=False
+        )
+
+        for entry in records:
+            key = f"{entry.get('src_ip')}_{entry.get('timestamp')}"
+            if entry.get("audit"):
+                with AUDIT_LOCK:
+                    AUDIT_CACHE[key] = entry["audit"]
+                    AUDITED_KEYS.add(key)
+            else:
+                with AUDIT_LOCK:
+                    if key in AUDIT_CACHE:
+                        entry["audit"] = AUDIT_CACHE[key]
+
+        return records
+
     except Exception as err:
-        print(f"[!] Error reading alerts.log: {err}")
-    return records[-limit:][::-1]
+        print(f"[!] Error reading alerts from storage: {err}")
+        return []
 
 def get_metrics():
     alerts = get_alerts(limit=1000)
@@ -216,47 +205,99 @@ def get_metrics():
         "protocols": protocols
     }
 
+def sig_key(entry):
+    proto = str(entry.get("protocol", "UNKNOWN")).upper()
+    port = int(entry.get("dst_port", 0) or 0)
+    sz = float(entry.get("avg_packet_size", 0.0) or 0.0)
+    bucket = round(sz / 20.0) * 20
+    reason = str(entry.get("reason", "")).strip()
+    return f"{proto}:{port}:SIZE{bucket}:{reason}"
+
 def run_auto_auditor():
     while True:
         try:
             eng = get_engine()
             if eng:
                 records = get_alerts(limit=50)
-                for a in records:
-                    k = f"{a.get('src_ip')}_{a.get('timestamp')}"
+                for entry in records:
+                    ip = entry.get("src_ip")
+                    ts = entry.get("timestamp")
+                    key = f"{ip}_{ts}"
+
                     with AUDIT_LOCK:
-                        if k in AUDITED_KEYS or a.get("audit"):
+                        if key in AUDITED_KEYS or entry.get("audit"):
                             continue
-                        AUDITED_KEYS.add(k)
+                        AUDITED_KEYS.add(key)
+
                     try:
-                        res = eng.react(a)
-                        with AUDIT_LOCK:
-                            AUDIT_CACHE[k] = res
-                        update_alert_audit_in_log(
-                            a.get("src_ip"),
-                            a.get("timestamp"),
-                            res
-                        )
-                        print(
-                            f"[+] Audit: {a.get('src_ip')} -> "
-                            f"{res.get('decision')} ({res.get('classification')})",
-                            flush=True
-                        )
+                        k = sig_key(entry)
+                        hit = SIGNATURE_AUDIT_CACHE.get(k)
+                        now = time.time()
+
+                        if hit and (now - hit[1] < 600):
+                            res = dict(hit[0])
+                            res["reason"] = f"[Cluster Inferred] {res.get('reason', '')}"
+                            with AUDIT_LOCK:
+                                AUDIT_CACHE[key] = res
+
+                            update_alerts(
+                                ip,
+                                ts,
+                                res
+                            )
+
+                            print(
+                                f"[+] Audit (Clustered): {ip} -> "
+                                f"{res.get('decision')} ({res.get('classification')})",
+                                flush=True
+                            )
+
+                        else:
+                            res = eng.react(entry)
+                            SIGNATURE_AUDIT_CACHE[k] = (
+                                res,
+                                now
+                            )
+
+                            with AUDIT_LOCK:
+                                AUDIT_CACHE[key] = res
+
+                            update_alerts(
+                                ip,
+                                ts,
+                                res
+                            )
+
+                            print(
+                                f"[+] Audit: {ip} -> "
+                                f"{res.get('decision')} ({res.get('classification')})",
+                                flush=True
+                            )
+
                     except Exception as err:
                         print(
-                            f"[!] Audit error {a.get('src_ip')}: {err}"
+                            f"[!] Audit error {ip}: {err}"
                         )
+
         except Exception as err:
             print(
                 f"[!] Error: {err}",
                 flush=True
             )
+
         time.sleep(2)
 
-threading.Thread(
-    target=run_auto_auditor,
-    daemon=True
-).start()
+AUDITOR_THREAD = None
+
+def start_auto_auditor():
+    global AUDITOR_THREAD
+    if AUDITOR_THREAD is None or not AUDITOR_THREAD.is_alive():
+        AUDITOR_THREAD = threading.Thread(
+            target=run_auto_auditor,
+            daemon=True
+        )
+        AUDITOR_THREAD.start()
+    return AUDITOR_THREAD
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -2296,6 +2337,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 def run_server(port=8080):
+    start_auto_auditor()
     server = ThreadedHTTPServer(('0.0.0.0', port), DashboardHandler)
     print(f"[*] Dashboard running at: http://localhost:{port}")
     try:

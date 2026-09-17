@@ -9,6 +9,23 @@ import time
 import requests
 from cachetools import TTLCache
 
+ROOT_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        '..'
+    )
+)
+
+import sys
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from common.storage import (
+    record,
+    unbans,
+    unbanned
+)
+
 try:
     from bcc import BPF
     BCC_AVAILABLE = True
@@ -23,14 +40,14 @@ BAN_TTL = [
 ]
 
 
-def ip_to_int(ip_str):
+def ip2int(ip_str):
     return struct.unpack(
         "I",
         socket.inet_aton(ip_str)
     )[0]
 
 
-def int_to_ip(ip_int):
+def int2ip(ip_int):
     return socket.inet_ntoa(
         struct.pack(
             "I",
@@ -101,6 +118,7 @@ class Enforcer:
 
         self.py_whitelist = []
         self.ban_registry = {}
+        self._offense_counts = {}
 
         self.offense_history = TTLCache(
             maxsize=100_000,
@@ -417,7 +435,7 @@ class Enforcer:
 
                 key = self.whitelist_map.Key(
                     net.prefixlen,
-                    ip_to_int(
+                    ip2int(
                         str(net.network_address)
                     )
                 )
@@ -463,7 +481,7 @@ class Enforcer:
     ) -> bool:
         try:
             key = self.blacklist_map.Key(
-                ip_to_int(ip_str)
+                ip2int(ip_str)
             )
 
             self.blacklist_map[key]
@@ -501,26 +519,9 @@ class Enforcer:
                 count = 1
 
             else:
-                count = (
-                    getattr(
-                        self,
-                        "_offense_counts",
-                        {}
-                    ).get(
-                        ip_str,
-                        0
-                    ) + 1
-                )
+                count = self._offense_counts.get(ip_str, 0) + 1
 
-            if not hasattr(
-                self,
-                "_offense_counts"
-            ):
-                self._offense_counts = {}
-
-            self._offense_counts[
-                ip_str
-            ] = count
+            self._offense_counts[ip_str] = count
 
             self.offense_history[
                 ip_str
@@ -537,7 +538,7 @@ class Enforcer:
 
             if not ip_str.startswith("127."):
                 key = self.blacklist_map.Key(
-                    ip_to_int(ip_str)
+                    ip2int(ip_str)
                 )
 
                 self.blacklist_map[key] = (
@@ -550,34 +551,29 @@ class Enforcer:
                 ip_str
             ] = now + ttl_secs
 
+        alert_entry = {
+            "timestamp": now,
+            "src_ip": ip_str,
+            "protocol": sig.protocol,
+            "dst_port": sig.dst_port,
+            "reason": sig.reason,
+            "pps": sig.pps,
+            "ttl_secs": ttl_secs,
+            "offense_count": count,
+            "avg_packet_size": round(sig.fwd_len_mean, 2),
+            "fwd_pkts": sig.fwd_pkts,
+            "bwd_pkts": sig.bwd_pkts,
+            "syn_count": sig.syn_count,
+            "ack_count": sig.ack_count,
+            "rst_count": sig.rst_count,
+            "flow_duration_ms": round(sig.flow_duration_ms, 3),
+            "flow_bytes_s": round(sig.flow_bytes_s, 2)
+        }
+
         try:
-            log_dir = os.path.join(
-                os.path.dirname(__file__),
-                '..',
-                'logs'
+            record(
+                alert_entry
             )
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, 'alerts.log')
-            alert_entry = {
-                "timestamp": now,
-                "src_ip": ip_str,
-                "protocol": sig.protocol,
-                "dst_port": sig.dst_port,
-                "reason": sig.reason,
-                "pps": sig.pps,
-                "ttl_secs": ttl_secs,
-                "offense_count": count,
-                "avg_packet_size": round(sig.fwd_len_mean, 2),
-                "fwd_pkts": sig.fwd_pkts,
-                "bwd_pkts": sig.bwd_pkts,
-                "syn_count": sig.syn_count,
-                "ack_count": sig.ack_count,
-                "rst_count": sig.rst_count,
-                "flow_duration_ms": round(sig.flow_duration_ms, 3),
-                "flow_bytes_s": round(sig.flow_bytes_s, 2)
-            }
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(alert_entry) + '\n')
         except Exception:
             pass
 
@@ -587,15 +583,16 @@ class Enforcer:
         self,
         ip_str: str
     ):
-        try:
-            key = self.blacklist_map.Key(
-                ip_to_int(ip_str)
-            )
+        if self.blacklist_map is not None:
+            try:
+                key = self.blacklist_map.Key(
+                    ip2int(ip_str)
+                )
 
-            del self.blacklist_map[key]
+                del self.blacklist_map[key]
 
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         with self.lock:
             self.ban_registry.pop(
@@ -608,48 +605,38 @@ class Enforcer:
         )
 
     def _memory_manager(self):
-        log_file = os.path.join(
-            os.path.dirname(__file__),
-            '..',
-            'logs',
-            'alerts.log'
-        )
         while True:
             try:
                 now = time.time()
 
-                if os.path.exists(log_file):
-                    try:
-                        with open(log_file, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                entry = json.loads(line)
-                                ip = entry.get("src_ip")
-                                audit = entry.get("audit")
-                                if ip and audit and ip in self.ban_registry:
-                                    decision = audit.get("decision")
-                                    cls = audit.get("classification")
-                                    if decision == "UNBLOCK" or cls in ("FALSE_POSITIVE", "BENIGN"):
-                                        self.unban_ip(ip)
-                    except Exception:
-                        pass
+                items = unbans()
 
-                expired = [
-                    ip
-                    for ip, expiry in self.ban_registry.items()
-                    if expiry <= now
-                ]
+                with self.lock:
+                    need_unban = [
+                        ip for ip in items
+                        if ip in self.ban_registry
+                    ]
+                    stale = [
+                        ip for ip in items
+                        if ip not in self.ban_registry
+                    ]
 
-                if expired:
-                    with self.lock:
-                        for ip in expired:
-                            if (
-                                ip in self.ban_registry
-                                and self.ban_registry[ip] <= now
-                            ):
-                                self.unban_ip(ip)
+                for ip in need_unban:
+                    self.unban_ip(ip)
+                    unbanned(ip)
+
+                for ip in stale:
+                    unbanned(ip)
+
+                with self.lock:
+                    expired = [
+                        ip
+                        for ip, expiry in self.ban_registry.items()
+                        if expiry <= now
+                    ]
+
+                for ip in expired:
+                    self.unban_ip(ip)
 
             except Exception as exc:
                 print(

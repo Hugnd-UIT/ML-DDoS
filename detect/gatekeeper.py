@@ -679,36 +679,67 @@ def main():
                     is_attack = True
                     reason = f"Class {pred_val}"
 
-                if not is_attack:
-                    anomaly_pred = iso_model.predict(features)
-                    if anomaly_pred[0] == -1:
+                if not is_attack and iso_model is not None:
+                    score = float(
+                        iso_model.score_samples(features)[0]
+                    )
+
+                    offset = float(
+                        getattr(
+                            iso_model,
+                            'offset_',
+                            -0.5
+                        )
+                    )
+
+                    dur = max(
+                        float(getattr(flow, 'bidirectional_duration_ms', 1.0)) / 1000.0,
+                        0.001
+                    )
+
+                    rate = (
+                        float(getattr(flow, 'bidirectional_packets', 1))
+                        / dur
+                    )
+
+                    is_deep = bool(
+                        score < (offset - 0.08)
+                    )
+
+                    has_flood = bool(
+                        (getattr(flow, 'bidirectional_syn_packets', 0) > 10 and getattr(flow, 'bidirectional_ack_packets', 0) == 0)
+                        or (getattr(flow, 'bidirectional_rst_packets', 0) > 20)
+                        or (rate > 1500.0)
+                    )
+
+                    if is_deep and has_flood:
                         is_attack = True
                         reason = "Zero-Day"
 
                 if is_attack:
                     if not enforcer.check_whitelist(flow.src_ip):
-                        duration_s = max(
+                        dur = max(
                             float(getattr(flow, 'bidirectional_duration_ms', 1.0)) / 1000.0,
                             0.001
                         )
-                        _fwd_pkts = float(getattr(flow, 'src2dst_packets', 0))
-                        _bwd_pkts = float(getattr(flow, 'dst2src_packets', 0))
-                        _total_bytes = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
+                        fwd = float(getattr(flow, 'src2dst_packets', 0))
+                        bwd = float(getattr(flow, 'dst2src_packets', 0))
+                        bytes_total = float(getattr(flow, 'src2dst_bytes', 0)) + float(getattr(flow, 'dst2src_bytes', 0))
                         sig = Signature(
                             src_ip=flow.src_ip,
                             protocol=proto_name(flow.protocol),
                             dst_port=int(getattr(flow, "dst_port", 0)),
                             fwd_len_mean=float(getattr(flow, "src2dst_mean_ps", 0.0)),
-                            pps=float(getattr(flow, 'bidirectional_packets', 1)) / duration_s,
+                            pps=float(getattr(flow, 'bidirectional_packets', 1)) / dur,
                             reason=reason,
                             features=features[0].tolist(),
-                            fwd_pkts=int(_fwd_pkts),
-                            bwd_pkts=int(_bwd_pkts),
+                            fwd_pkts=int(fwd),
+                            bwd_pkts=int(bwd),
                             syn_count=int(getattr(flow, 'bidirectional_syn_packets', 0)),
                             ack_count=int(getattr(flow, 'bidirectional_ack_packets', 0)),
                             rst_count=int(getattr(flow, 'bidirectional_rst_packets', 0)),
                             flow_duration_ms=float(getattr(flow, 'bidirectional_duration_ms', 0.0)),
-                            flow_bytes_s=_total_bytes / duration_s
+                            flow_bytes_s=bytes_total / dur
                         )
 
                         count, ttl_secs = enforcer.block_ip(sig)
